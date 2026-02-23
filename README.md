@@ -1,0 +1,108 @@
+# mstransfer
+
+Transfer mass spectrometry files (mzML / MSZ) between machines over HTTP. Files are always transported in compressed MSZ format using [mscompress](https://github.com/chrisagrams/mscompress) — mzML sources are compressed on-the-fly without temp files, and the receiving end can optionally decompress back to mzML.
+
+## Install
+
+```bash
+pip install .
+# or with uv
+uv pip install .
+```
+
+## Quick start
+
+Start a listener on the receiving machine:
+
+```bash
+mstransfer listen --port 1319 --store-as msz
+```
+
+Send files from the source machine:
+
+```bash
+mstransfer send /data/experiment1.mzML /data/batch/ remote-host:1319
+```
+
+## Usage
+
+### `mstransfer listen`
+
+Start the receiver server.
+
+```
+mstransfer listen [--host 0.0.0.0] [--port 1319] [--output-dir ./received] [--store-as msz|mzml]
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--host` | `0.0.0.0` | Bind address |
+| `--port` | `1319` | Listen port |
+| `--output-dir` | `./received` | Where received files are written |
+| `--store-as` | `msz` | Store as `msz` (compressed) or `mzml` (decompress on arrival) |
+
+### `mstransfer send`
+
+Send files to a listener. Accepts any mix of files and directories. The last positional argument is the target.
+
+```
+mstransfer send <paths...> <host[:port]> [--recursive] [--parallel 4]
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--recursive`, `-r` | off | Recurse into directories |
+| `--parallel`, `-p` | `4` | Number of concurrent uploads |
+
+Supported file types: `.mzML`, `.msz`.
+
+- **mzML files** are compressed to MSZ on-the-fly via `compress_stream()` and streamed directly into the HTTP request — no temp files on the sender.
+- **MSZ files** are streamed as-is.
+
+## API
+
+The listener exposes a REST API under `/v1/`:
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/v1/health` | GET | Server status, version, storage mode |
+| `/v1/upload` | POST | Upload a file (streamed MSZ body) |
+| `/v1/transfer/{id}/status` | GET | Poll transfer state |
+
+### Embedding in another app
+
+The server is built as a FastAPI app factory:
+
+```python
+from mstransfer import create_app
+
+# Standalone
+app = create_app(output_dir="/data/ms", store_as="mzml")
+
+# Mount in an existing FastAPI app
+from fastapi import FastAPI
+main_app = FastAPI()
+main_app.mount("/transfer", create_app())
+```
+
+## How it works
+
+```
+Sender                                          Listener
+──────                                          ────────
+.mzML → compress_stream() ─┐
+                            ├─ MSZ bytes ──→ POST /v1/upload
+.msz  → read file ─────────┘
+                                                store-as msz? → write to disk
+                                                store-as mzml? → write temp .msz
+                                                                 → decompress
+                                                                 → cleanup temp
+```
+
+## Development
+
+```bash
+uv sync --dev
+uv run pytest
+uv run ruff check src/ tests/
+```
