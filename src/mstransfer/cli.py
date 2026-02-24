@@ -3,7 +3,11 @@ from __future__ import annotations
 import argparse
 import sys
 
+import uvicorn
+
+from mstransfer.client.sender import resolve_inputs, send_batch
 from mstransfer.log import console, setup_logging
+from mstransfer.server.app import create_app
 
 
 def parse_target(target: str) -> tuple[str, int]:
@@ -21,10 +25,6 @@ def parse_target(target: str) -> tuple[str, int]:
 
 
 def cmd_listen(args: argparse.Namespace) -> None:
-    import uvicorn
-
-    from mstransfer.server.app import create_app
-
     setup_logging()
     app = create_app(output_dir=args.output_dir, store_as=args.store_as)
     console.print(
@@ -36,8 +36,6 @@ def cmd_listen(args: argparse.Namespace) -> None:
 
 
 def cmd_send(args: argparse.Namespace) -> None:
-    from mstransfer.client.sender import resolve_inputs, send_batch
-
     setup_logging()
 
     if len(args.targets) < 2:

@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import argparse
+import sys
+from unittest.mock import patch
+
 import pytest
 
 from mstransfer.cli import parse_target
@@ -30,10 +34,6 @@ class TestParseTarget:
 class TestCliParsing:
     def test_listen_defaults(self):
         """Verify listen subcommand parses with defaults."""
-        import argparse
-        import sys
-        from unittest.mock import patch
-
         with patch.object(sys, "argv", ["mstransfer", "listen"]):
             parser = argparse.ArgumentParser(prog="mstransfer")
             sub = parser.add_subparsers(dest="command")
@@ -49,8 +49,6 @@ class TestCliParsing:
             assert args.store_as == "msz"
 
     def test_listen_custom(self):
-        import argparse
-
         parser = argparse.ArgumentParser()
         sub = parser.add_subparsers(dest="command")
         lp = sub.add_parser("listen")
@@ -66,8 +64,6 @@ class TestCliParsing:
         assert args.store_as == "mzml"
 
     def test_send_parsing(self):
-        import argparse
-
         parser = argparse.ArgumentParser()
         sub = parser.add_subparsers(dest="command")
         sp = sub.add_parser("send")

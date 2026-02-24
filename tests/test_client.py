@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+import time
 
 import pytest
 import uvicorn
@@ -148,8 +149,6 @@ def _live_server(tmp_path):
     thread.start()
 
     # Wait for server to be ready
-    import time
-
     for _ in range(50):
         if server.started:
             break
@@ -179,8 +178,6 @@ def _live_server_mzml(tmp_path):
 
     thread = threading.Thread(target=server.run, daemon=True)
     thread.start()
-
-    import time
 
     for _ in range(50):
         if server.started:

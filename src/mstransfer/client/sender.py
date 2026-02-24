@@ -11,6 +11,8 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
 import httpx
+from mscompress import MZMLFile
+from mscompress.utils import detect_filetype
 from rich.live import Live
 from rich.table import Table
 
@@ -84,9 +86,6 @@ def send_file(
 
     Returns the final transfer status dict from the server.
     """
-    from mscompress import MZMLFile
-    from mscompress.utils import detect_filetype
-
     transfer_id = str(uuid.uuid4())
     filetype = detect_filetype(str(file_path))
     base_url = f"http://{host}:{port}"
@@ -152,10 +151,10 @@ def send_batch(
     host: str,
     port: int,
     parallel: int = 4,
-) -> list[dict]:
+) -> list[dict | None]:
     """Send multiple files with configurable parallelism."""
     workers = min(parallel, len(file_paths))
-    results: list[dict] = [None] * len(file_paths)
+    results: list[dict | None] = [None] * len(file_paths)
 
     overall_progress = make_overall_progress()
     file_progress = make_file_progress()
