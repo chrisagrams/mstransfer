@@ -151,10 +151,10 @@ def send_batch(
     host: str,
     port: int,
     parallel: int = 4,
-) -> list[dict]:
+) -> list[dict | None]:
     """Send multiple files with configurable parallelism."""
     workers = min(parallel, len(file_paths))
-    results: list[dict] = [None] * len(file_paths)
+    results: list[dict | None] = [None] * len(file_paths)
 
     overall_progress = make_overall_progress()
     file_progress = make_file_progress()

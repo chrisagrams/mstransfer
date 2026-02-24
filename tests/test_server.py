@@ -35,6 +35,7 @@ class TestTransferRegistry:
         reg.create("t1", "file.msz")
         reg.update("t1", state=TransferState.DONE, bytes_received=1024)
         rec = reg.get("t1")
+        assert rec is not None
         assert rec.state == TransferState.DONE
         assert rec.bytes_received == 1024
 
