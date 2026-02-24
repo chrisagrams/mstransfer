@@ -15,26 +15,26 @@ uv pip install .
 
 ## Quick start
 
-Start a listener on the receiving machine:
+Start a server on the receiving machine:
 
 ```bash
-mstransfer listen --port 1319 --store-as msz
+mstransfer serve --port 1319 --store-as msz
 ```
 
-Send files from the source machine:
+Upload files from the source machine:
 
 ```bash
-mstransfer send /data/experiment1.mzML /data/batch/ remote-host:1319
+mstransfer upload /data/experiment1.mzML /data/batch/ remote-host:1319
 ```
 
 ## Usage
 
-### `mstransfer listen`
+### `mstransfer serve`
 
 Start the receiver server.
 
 ```
-mstransfer listen [--host 0.0.0.0] [--port 1319] [--output-dir ./received] [--store-as msz|mzml]
+mstransfer serve [--host 0.0.0.0] [--port 1319] [--output-dir ./received] [--store-as msz|mzml]
 ```
 
 | Flag | Default | Description |
@@ -44,12 +44,12 @@ mstransfer listen [--host 0.0.0.0] [--port 1319] [--output-dir ./received] [--st
 | `--output-dir` | `./received` | Where received files are written |
 | `--store-as` | `msz` | Store as `msz` (compressed) or `mzml` (decompress on arrival) |
 
-### `mstransfer send`
+### `mstransfer upload`
 
-Send files to a listener. Accepts any mix of files and directories. The last positional argument is the target.
+Upload files to a server. Accepts any mix of files and directories. The last positional argument is the target.
 
 ```
-mstransfer send <paths...> <host[:port]> [--recursive] [--parallel 4]
+mstransfer upload <paths...> <host[:port]> [--recursive] [--parallel 4]
 ```
 
 | Flag | Default | Description |
@@ -64,7 +64,7 @@ Supported file types: `.mzML`, `.msz`.
 
 ## API
 
-The listener exposes a REST API under `/v1/`:
+The server exposes a REST API under `/v1/`:
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
@@ -91,8 +91,8 @@ main_app.mount("/transfer", create_app())
 ## How it works
 
 ```
-Sender                                          Listener
-──────                                          ────────
+Sender                                          Server
+──────                                          ──────
 .mzML → compress_stream() ─┐
                             ├─ MSZ bytes ──→ POST /v1/upload
 .msz  → read file ─────────┘
