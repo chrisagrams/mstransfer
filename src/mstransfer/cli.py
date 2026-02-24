@@ -24,22 +24,22 @@ def parse_target(target: str) -> tuple[str, int]:
     return target, default_port
 
 
-def cmd_listen(args: argparse.Namespace) -> None:
+def cmd_serve(args: argparse.Namespace) -> None:
     setup_logging()
     app = create_app(output_dir=args.output_dir, store_as=args.store_as)
     console.print(
-        f"[bold green]mstransfer listener[/] starting on "
+        f"[bold green]mstransfer server[/] starting on "
         f"[cyan]{args.host}:{args.port}[/] "
         f"(store-as={args.store_as}, output={args.output_dir})"
     )
     uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
 
 
-def cmd_send(args: argparse.Namespace) -> None:
+def cmd_upload(args: argparse.Namespace) -> None:
     setup_logging()
 
     if len(args.targets) < 2:
-        console.print("[red]Usage: mstransfer send <paths...> <target>")
+        console.print("[red]Usage: mstransfer upload <paths...> <target>")
         sys.exit(1)
 
     *raw_paths, target = args.targets
@@ -78,8 +78,8 @@ def main() -> None:
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    # --- listen ---
-    lp = sub.add_parser("listen", help="Start the mstransfer listener server")
+    # --- serve ---
+    lp = sub.add_parser("serve", help="Start the mstransfer server")
     lp.add_argument("--host", default="0.0.0.0", help="Bind address")
     lp.add_argument("--port", type=int, default=1319, help="Listen port")
     lp.add_argument(
@@ -93,10 +93,10 @@ def main() -> None:
         default="msz",
         help="Storage format (default: msz)",
     )
-    lp.set_defaults(func=cmd_listen)
+    lp.set_defaults(func=cmd_serve)
 
-    # --- send ---
-    sp = sub.add_parser("send", help="Send files to a mstransfer listener")
+    # --- upload ---
+    sp = sub.add_parser("upload", help="Upload files to a mstransfer server")
     sp.add_argument(
         "targets",
         nargs="+",
@@ -115,7 +115,7 @@ def main() -> None:
         default=4,
         help="Concurrent uploads (default: 4)",
     )
-    sp.set_defaults(func=cmd_send)
+    sp.set_defaults(func=cmd_upload)
 
     args = parser.parse_args()
     args.func(args)
