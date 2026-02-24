@@ -1,5 +1,8 @@
 # mstransfer
 
+[![Tests](https://github.com/chrisagrams/mstransfer/actions/workflows/test.yml/badge.svg)](https://github.com/chrisagrams/mstransfer/actions/workflows/test.yml)
+[![codecov](https://codecov.io/gh/chrisagrams/mstransfer/graph/badge.svg)](https://codecov.io/gh/chrisagrams/mstransfer)
+
 Transfer mass spectrometry files (mzML / MSZ) between machines over HTTP. Files are always transported in compressed MSZ format using [mscompress](https://github.com/chrisagrams/mscompress) — mzML sources are compressed on-the-fly without temp files, and the receiving end can optionally decompress back to mzML.
 
 ## Install
