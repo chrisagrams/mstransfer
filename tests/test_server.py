@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta
+
 import pytest
+from mscompress import MZMLFile
 
 from mstransfer.server.models import TransferState
 from mstransfer.server.state import TransferRegistry
@@ -43,8 +46,6 @@ class TestTransferRegistry:
         reg = TransferRegistry()
         rec = reg.create("t1", "old.msz")
         reg.update("t1", state=TransferState.DONE)
-        from datetime import datetime, timedelta
-
         rec.created_at = datetime.now() - timedelta(seconds=600)
         removed = reg.cleanup(max_age_seconds=300)
         assert removed == 1
@@ -61,8 +62,6 @@ class TestTransferRegistry:
     def test_cleanup_keeps_in_progress(self):
         reg = TransferRegistry()
         rec = reg.create("t1", "active.msz")
-        from datetime import datetime, timedelta
-
         rec.created_at = datetime.now() - timedelta(seconds=600)
         removed = reg.cleanup(max_age_seconds=300)
         assert removed == 0
@@ -145,8 +144,6 @@ async def test_upload_msz_store_as_mzml(mzml_client, tmp_output, test_msz):
 @pytest.mark.asyncio
 async def test_upload_mzml_stream_store_as_msz(msz_client, tmp_output, test_mzml):
     """Simulate sender compressing mzML → msz on the fly, server stores msz."""
-    from mscompress import MZMLFile
-
     mzml = MZMLFile(str(test_mzml).encode())
     compressed = b"".join(mzml.compress_stream(chunk_size=1_048_576))
 
@@ -171,8 +168,6 @@ async def test_upload_mzml_stream_store_as_msz(msz_client, tmp_output, test_mzml
 @pytest.mark.asyncio
 async def test_upload_mzml_stream_store_as_mzml(mzml_client, tmp_output, test_mzml):
     """Sender compresses mzML → msz, server decompresses back to mzML."""
-    from mscompress import MZMLFile
-
     mzml = MZMLFile(str(test_mzml).encode())
     compressed = b"".join(mzml.compress_stream(chunk_size=1_048_576))
 

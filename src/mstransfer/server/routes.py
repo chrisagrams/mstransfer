@@ -4,7 +4,9 @@ import logging
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Request
+from mscompress import MSZFile
 
+from mstransfer import __version__
 from mstransfer.server.models import (
     HealthResponse,
     TransferState,
@@ -18,8 +20,6 @@ router = APIRouter()
 
 @router.get("/health", response_model=HealthResponse)
 async def health(request: Request) -> HealthResponse:
-    from mstransfer import __version__
-
     return HealthResponse(
         status="ok",
         version=__version__,
@@ -82,8 +82,6 @@ async def upload(request: Request) -> UploadResponse:
     elif store_as == "mzml":
         registry.update(transfer_id, state=TransferState.DECOMPRESSING)
         try:
-            from mscompress import MSZFile
-
             msz_file = MSZFile(str(msz_path).encode())
             mzml_path = output_dir / f"{stem}.mzML"
             msz_file.decompress(str(mzml_path))
