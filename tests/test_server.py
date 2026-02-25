@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta
 
 import pytest
@@ -257,8 +258,6 @@ async def test_upload_missing_filename(msz_client, tmp_output, test_msz):
 @pytest.mark.asyncio
 async def test_decompress_does_not_block_event_loop(mzml_client, tmp_output, test_msz):
     """Decompression should be offloaded so concurrent requests aren't blocked."""
-    import asyncio
-
     payload = test_msz.read_bytes()
 
     upload_task = asyncio.create_task(

@@ -105,7 +105,11 @@ def send_file(
             progress_callback,
         )
     elif filetype in ("msz", "mszx"):
-        stream = _file_chunk_generator(file_path, chunk_size=chunk_size, callback=progress_callback)
+        stream = _file_chunk_generator(
+            file_path,
+            chunk_size=chunk_size,
+            callback=progress_callback
+        )
     else:
         raise ValueError(f"Unsupported file type: {filetype} for {file_path}")
 
