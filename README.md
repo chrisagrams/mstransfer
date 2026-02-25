@@ -57,10 +57,44 @@ mstransfer upload <paths...> <host[:port]> [--recursive] [--parallel 4]
 | `--recursive`, `-r` | off | Recurse into directories |
 | `--parallel`, `-p` | `4` | Number of concurrent uploads |
 
-Supported file types: `.mzML`, `.msz`.
+Supported file types: `.mzML`, `.msz`, `.mszx`.
 
 - **mzML files** are compressed to MSZ on-the-fly via `compress_stream()` and streamed directly into the HTTP request — no temp files on the sender.
-- **MSZ files** are streamed as-is.
+- **MSZ / MSZX files** are streamed as-is.
+
+## Programmatic access
+
+You can use mstransfer as a library to send files from your own Python code:
+
+```python
+from pathlib import Path
+from mstransfer.client import send_file, send_batch
+
+# Send a single file (Path)
+result = send_file(Path("experiment.mzML"), "http://remote-host:1319")
+
+# Send an already-opened mscompress object
+from mscompress import MZMLFile, MSZFile
+from mscompress.mszx import MSZXFile
+
+mzml = MZMLFile(b"/data/experiment.mzML")
+send_file(mzml, "http://remote-host:1319")
+
+msz = MSZFile(b"/data/experiment.msz")
+send_file(msz, "http://remote-host:1319")
+
+mszx = MSZXFile.open("/data/experiment.mszx")
+send_file(mszx, "http://remote-host:1319")
+
+# Send multiple files in parallel
+send_batch(
+    [Path("a.mzML"), Path("b.msz"), mszx],
+    "http://remote-host:1319",
+    parallel=4,
+)
+```
+
+`send_file` and `send_batch` accept any mix of `Path`, `MZMLFile`, `MSZFile`, and `MSZXFile` inputs.
 
 ## API
 

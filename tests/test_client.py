@@ -9,6 +9,8 @@ from unittest.mock import patch
 
 import pytest
 import uvicorn
+from mscompress import MSZFile, MZMLFile
+from mscompress.mszx import MSZXFile
 
 from mstransfer.client.sender import (
     _counting_generator,
@@ -294,6 +296,48 @@ class TestSendFile:
         assert sum(small_deltas) == test_msz.stat().st_size
         assert sum(large_deltas) == test_msz.stat().st_size
 
+    def test_send_mszfile_object(self, test_msz, _live_server):
+        """send_file accepts an MSZFile object directly."""
+        msz = MSZFile(str(test_msz).encode())
+        result = send_file(msz, _live_server["base_url"])
+        assert result.state == "done"
+        assert result.filename == "test.msz"
+        assert result.bytes_received == test_msz.stat().st_size
+
+    def test_send_mzmlfile_object(self, test_mzml, _live_server):
+        """send_file accepts an MZMLFile object directly."""
+        mzml = MZMLFile(str(test_mzml).encode())
+        result = send_file(mzml, _live_server["base_url"])
+        assert result.state == "done"
+        assert result.filename == "test.mzML"
+        assert result.bytes_received > 0
+
+    def test_send_mzmlfile_object_server_decompresses(
+        self, test_mzml, _live_server_mzml,
+    ):
+        """MZMLFile object → server decompresses back to mzML."""
+        mzml = MZMLFile(str(test_mzml).encode())
+        result = send_file(mzml, _live_server_mzml["base_url"])
+        assert result.state == "done"
+
+        mzml_out = _live_server_mzml["output_dir"] / "test.mzML"
+        assert mzml_out.exists()
+        assert mzml_out.stat().st_size == test_mzml.stat().st_size
+
+    def test_send_mszxfile_object(self, test_mszx, _live_server):
+        """send_file accepts an MSZXFile object directly."""
+        mszx = MSZXFile.open(test_mszx)
+        result = send_file(mszx, _live_server["base_url"])
+        assert result.state == "done"
+        assert result.filename == "test.mszx"
+        assert result.bytes_received == test_mszx.stat().st_size
+        mszx.close()
+
+    def test_send_file_rejects_invalid_type(self, _live_server):
+        """send_file raises TypeError for unsupported input types."""
+        with pytest.raises(TypeError, match="Unsupported source type"):
+            send_file("not_a_path_or_file", _live_server["base_url"])  # type: ignore[arg-type]
+
 
 class TestSendBatch:
     def test_single_file(self, test_msz, _live_server):
@@ -427,3 +471,48 @@ class TestSendBatch:
             mock_send.assert_called_once()
             _, kwargs = mock_send.call_args
             assert kwargs["chunk_size"] == 4096
+
+    def test_batch_with_mscompress_objects(self, test_msz, test_mzml, _live_server):
+        """send_batch accepts MSZFile and MZMLFile objects."""
+        msz = MSZFile(str(test_msz).encode())
+        mzml = MZMLFile(str(test_mzml).encode())
+        results = send_batch(
+            [msz, mzml],
+            _live_server["base_url"],
+            parallel=2,
+        )
+        assert len(results) == 2
+        for r in results:
+            assert r.response is not None
+            assert r.response.state == "done"
+
+    def test_batch_mixed_paths_and_objects(self, test_msz, test_mzml, _live_server):
+        """send_batch accepts a mix of Path and mscompress objects."""
+        mzml = MZMLFile(str(test_mzml).encode())
+        results = send_batch(
+            [test_msz, mzml],
+            _live_server["base_url"],
+            parallel=2,
+        )
+        assert len(results) == 2
+        names = {r.filename for r in results}
+        assert names == {"test.msz", "test.mzML"}
+        for r in results:
+            assert r.response is not None
+            assert r.response.state == "done"
+
+    def test_batch_with_mszxfile_object(self, test_msz, test_mszx, _live_server):
+        """send_batch accepts MSZXFile objects alongside Paths."""
+        mszx = MSZXFile.open(test_mszx)
+        results = send_batch(
+            [test_msz, mszx],
+            _live_server["base_url"],
+            parallel=2,
+        )
+        mszx.close()
+        assert len(results) == 2
+        names = {r.filename for r in results}
+        assert names == {"test.msz", "test.mszx"}
+        for r in results:
+            assert r.response is not None
+            assert r.response.state == "done"
