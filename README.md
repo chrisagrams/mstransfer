@@ -8,9 +8,15 @@ Transfer mass spectrometry files (mzML / MSZ) between machines over HTTP. Files 
 ## Install
 
 ```bash
-pip install .
-# or with uv
-uv pip install .
+# Recommended — installs as an isolated CLI tool
+uv tool install mstransfer
+
+# Or with pipx
+pipx install mstransfer
+
+# Or as a project dependency
+uv pip install mstransfer
+pip install mstransfer
 ```
 
 ## Quick start
@@ -124,16 +130,23 @@ main_app.mount("/transfer", create_app())
 
 ## How it works
 
-```
-Sender                                          Server
-──────                                          ──────
-.mzML → compress_stream() ─┐
-                            ├─ MSZ bytes ──→ POST /v1/upload
-.msz  → read file ─────────┘
-                                                store-as msz? → write to disk
-                                                store-as mzml? → write temp .msz
-                                                                 → decompress
-                                                                 → cleanup temp
+```mermaid
+flowchart LR
+    subgraph Sender
+        mzML[".mzML"] --> compress["compress_stream()"]
+        msz[".msz / .mszx"] --> read["read file"]
+    end
+
+    compress --> upload["POST /v1/upload\n(MSZ bytes)"]
+    read --> upload
+
+    subgraph Server
+        upload --> mode{store-as?}
+        mode -- msz --> write["write to disk"]
+        mode -- mzml --> temp["write temp .msz"]
+        temp --> decompress["decompress"]
+        decompress --> cleanup["cleanup temp"]
+    end
 ```
 
 ## Development
