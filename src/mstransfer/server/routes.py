@@ -10,6 +10,7 @@ from mscompress import MSZFile
 from mstransfer import __version__
 from mstransfer.server.models import (
     HealthResponse,
+    TransferRecord,
     TransferState,
     UploadResponse,
 )
@@ -32,12 +33,12 @@ async def health(request: Request) -> HealthResponse:
     )
 
 
-@router.get("/transfer/{transfer_id}/status")
-async def transfer_status(transfer_id: str, request: Request) -> dict:
+@router.get("/transfer/{transfer_id}/status", response_model=TransferRecord)
+async def transfer_status(transfer_id: str, request: Request) -> TransferRecord:
     record = request.app.state.transfers.get(transfer_id)
     if record is None:
         raise HTTPException(status_code=404, detail="Transfer not found")
-    return record.model_dump(mode="json")
+    return record
 
 
 @router.post("/upload", response_model=UploadResponse)
