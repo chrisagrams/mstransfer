@@ -5,7 +5,7 @@ from pathlib import Path
 from fastapi import FastAPI
 
 from mstransfer.server.routes import router
-from mstransfer.server.state import TransferRegistry
+from mstransfer.server.state import AppState
 
 
 def create_app(
@@ -19,9 +19,8 @@ def create_app(
         store_as: Output format — "msz" or "mzml".
     """
     app = FastAPI(title="mstransfer")
-    app.state.output_dir = Path(output_dir)
-    app.state.store_as = store_as
-    app.state.output_dir.mkdir(parents=True, exist_ok=True)
-    app.state.transfers = TransferRegistry()
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    app.state = AppState(output_dir=out, store_as=store_as)
     app.include_router(router, prefix="/v1")
     return app
