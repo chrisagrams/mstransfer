@@ -13,22 +13,29 @@ from mstransfer.cli import parse_target
 
 class TestParseTarget:
     def test_host_and_port(self):
-        assert parse_target("192.168.1.1:8080") == ("192.168.1.1", 8080)
+        assert parse_target("192.168.1.1:8080") == "http://192.168.1.1:8080"
 
     def test_host_only(self):
-        assert parse_target("myserver") == ("myserver", 1319)
+        assert parse_target("myserver") == "http://myserver:1319"
 
     def test_localhost(self):
-        assert parse_target("localhost:5000") == ("localhost", 5000)
+        assert parse_target("localhost:5000") == "http://localhost:5000"
 
     def test_default_port(self):
-        host, port = parse_target("example.com")
-        assert host == "example.com"
-        assert port == 1319
+        assert parse_target("example.com") == "http://example.com:1319"
 
     def test_invalid_port_exits(self):
         with pytest.raises(SystemExit):
             parse_target("host:notaport")
+
+    def test_http_url_passthrough(self):
+        assert parse_target("http://proxy.example.com:8080") == "http://proxy.example.com:8080"
+
+    def test_https_url_passthrough(self):
+        assert parse_target("https://proxy.example.com") == "https://proxy.example.com"
+
+    def test_url_trailing_slash_stripped(self):
+        assert parse_target("https://proxy.example.com/") == "https://proxy.example.com"
 
 
 class TestCliParsing:
