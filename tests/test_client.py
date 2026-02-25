@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
 
 import pytest
@@ -302,7 +303,136 @@ class TestSendFile:
         assert sum(large_deltas) == test_msz.stat().st_size
 
 
-class TestSendBatchChunkSize:
+class TestSendBatch:
+    def test_single_file(self, test_msz, _live_server):
+        """send_batch with a single file returns a one-element result list."""
+        results = send_batch(
+            [test_msz],
+            _live_server["host"],
+            _live_server["port"],
+            parallel=1,
+        )
+        assert len(results) == 1
+        r = results[0]
+        assert r is not None
+        assert r["state"] == "done"
+        assert r["filename"] == "test.msz"
+
+    def test_multiple_msz_files(self, test_msz, _live_server, tmp_path):
+        """send_batch sends multiple files and returns results for each."""
+        copies = []
+        for i in range(3):
+            copy = tmp_path / f"copy_{i}.msz"
+            copy.write_bytes(test_msz.read_bytes())
+            copies.append(copy)
+
+        results = send_batch(
+            copies,
+            _live_server["host"],
+            _live_server["port"],
+            parallel=2,
+        )
+        assert len(results) == 3
+        for r in results:
+            assert r is not None
+            assert r["state"] == "done"
+
+    def test_results_preserve_input_order(self, test_msz, _live_server, tmp_path):
+        """Results list indices match the input file_paths indices."""
+        files = []
+        for name in ["alpha.msz", "beta.msz", "gamma.msz"]:
+            f = tmp_path / name
+            f.write_bytes(test_msz.read_bytes())
+            files.append(f)
+
+        results = send_batch(
+            files,
+            _live_server["host"],
+            _live_server["port"],
+            parallel=1,
+        )
+        for i, f in enumerate(files):
+            r = results[i]
+            assert r is not None
+            assert r["filename"] == f.name
+
+    def test_mixed_msz_and_mzml(self, test_msz, test_mzml, _live_server):
+        """send_batch handles a mix of .msz and .mzML files."""
+        results = send_batch(
+            [test_msz, test_mzml],
+            _live_server["host"],
+            _live_server["port"],
+            parallel=2,
+        )
+        assert len(results) == 2
+        r0, r1 = results[0], results[1]
+        assert r0 is not None
+        assert r1 is not None
+        assert r0["state"] == "done"
+        assert r1["state"] == "done"
+
+    def test_error_captured_in_results(self, test_msz, _live_server):
+        """When send_file raises, the error is captured in the results list."""
+        with patch(
+            "mstransfer.client.sender.send_file",
+            side_effect=ConnectionError("server exploded"),
+        ):
+            results = send_batch(
+                [test_msz],
+                _live_server["host"],
+                _live_server["port"],
+                parallel=1,
+            )
+        assert len(results) == 1
+        r = results[0]
+        assert r is not None
+        assert "error" in r
+        assert "server exploded" in r["error"]
+        assert r["filename"] == "test.msz"
+
+    def test_partial_failure(self, test_msz, _live_server, tmp_path):
+        """One failure does not prevent other files from succeeding."""
+        good_file = tmp_path / "good.msz"
+        good_file.write_bytes(test_msz.read_bytes())
+
+        original_send = send_file
+
+        def flaky_send(file_path, *args, **kwargs):
+            if file_path.name == "bad.msz":
+                raise ConnectionError("boom")
+            return original_send(file_path, *args, **kwargs)
+
+        bad_file = tmp_path / "bad.msz"
+        bad_file.write_bytes(test_msz.read_bytes())
+
+        with patch("mstransfer.client.sender.send_file", side_effect=flaky_send):
+            results = send_batch(
+                [good_file, bad_file],
+                _live_server["host"],
+                _live_server["port"],
+                parallel=2,
+            )
+        r0, r1 = results[0], results[1]
+        assert r0 is not None
+        assert r1 is not None
+        assert r0["state"] == "done"
+        assert "error" in r1
+        assert r1["filename"] == "bad.msz"
+
+    def test_parallel_capped_to_file_count(self, test_msz, _live_server):
+        """Workers should not exceed the number of files."""
+        with patch(
+            "mstransfer.client.sender.ThreadPoolExecutor",
+            wraps=ThreadPoolExecutor,
+        ) as mock_pool:
+            send_batch(
+                [test_msz],
+                _live_server["host"],
+                _live_server["port"],
+                parallel=8,
+            )
+            mock_pool.assert_called_once_with(max_workers=1)
+
     def test_chunk_size_passed_to_send_file(self, test_msz, _live_server):
         """send_batch should forward chunk_size to send_file."""
         with patch(
