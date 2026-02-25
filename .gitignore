@@ -9,6 +9,10 @@ wheels/
 # Virtual environments
 .venv
 
+# Coverage
+.coverage
+coverage.xml
+
 # Received files
 received/
 

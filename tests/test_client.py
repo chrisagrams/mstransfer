@@ -3,14 +3,20 @@
 from __future__ import annotations
 
 import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from unittest.mock import patch
 
 import pytest
 import uvicorn
+from mscompress import MSZFile, MZMLFile
+from mscompress.mszx import MSZXFile
 
 from mstransfer.client.sender import (
     _counting_generator,
     _file_chunk_generator,
     resolve_inputs,
+    send_batch,
     send_file,
 )
 from mstransfer.server.app import create_app
@@ -148,8 +154,6 @@ def _live_server(tmp_path):
     thread.start()
 
     # Wait for server to be ready
-    import time
-
     for _ in range(50):
         if server.started:
             break
@@ -161,7 +165,7 @@ def _live_server(tmp_path):
     sockets = server.servers[0].sockets
     port = sockets[0].getsockname()[1]
 
-    yield {"host": "127.0.0.1", "port": port, "output_dir": output_dir}
+    yield {"base_url": f"http://127.0.0.1:{port}", "output_dir": output_dir}
 
     server.should_exit = True
     thread.join(timeout=5)
@@ -180,8 +184,6 @@ def _live_server_mzml(tmp_path):
     thread = threading.Thread(target=server.run, daemon=True)
     thread.start()
 
-    import time
-
     for _ in range(50):
         if server.started:
             break
@@ -192,7 +194,7 @@ def _live_server_mzml(tmp_path):
     sockets = server.servers[0].sockets
     port = sockets[0].getsockname()[1]
 
-    yield {"host": "127.0.0.1", "port": port, "output_dir": output_dir}
+    yield {"base_url": f"http://127.0.0.1:{port}", "output_dir": output_dir}
 
     server.should_exit = True
     thread.join(timeout=5)
@@ -203,12 +205,11 @@ class TestSendFile:
         """Send a real .msz file to the server."""
         result = send_file(
             test_msz,
-            _live_server["host"],
-            _live_server["port"],
+            _live_server["base_url"],
         )
-        assert result["state"] == "done"
-        assert result["filename"] == "test.msz"
-        assert result["bytes_received"] == test_msz.stat().st_size
+        assert result.state == "done"
+        assert result.filename == "test.msz"
+        assert result.bytes_received == test_msz.stat().st_size
 
         written = _live_server["output_dir"] / "test.msz"
         assert written.exists()
@@ -218,12 +219,11 @@ class TestSendFile:
         """Send a real .mzML file — sender compresses on the fly."""
         result = send_file(
             test_mzml,
-            _live_server["host"],
-            _live_server["port"],
+            _live_server["base_url"],
         )
-        assert result["state"] == "done"
-        assert result["filename"] == "test.mzML"
-        assert result["bytes_received"] > 0
+        assert result.state == "done"
+        assert result.filename == "test.mzML"
+        assert result.bytes_received > 0
 
         # Server stored as msz
         written = _live_server["output_dir"] / "test.msz"
@@ -234,10 +234,9 @@ class TestSendFile:
         """Send .mzML → server compresses to msz in transit, decompresses back."""
         result = send_file(
             test_mzml,
-            _live_server_mzml["host"],
-            _live_server_mzml["port"],
+            _live_server_mzml["base_url"],
         )
-        assert result["state"] == "done"
+        assert result.state == "done"
 
         # Server should have decompressed back to mzML
         mzml_out = _live_server_mzml["output_dir"] / "test.mzML"
@@ -249,9 +248,271 @@ class TestSendFile:
         deltas = []
         send_file(
             test_msz,
-            _live_server["host"],
-            _live_server["port"],
+            _live_server["base_url"],
             progress_callback=deltas.append,
         )
         assert len(deltas) > 0
         assert sum(deltas) == test_msz.stat().st_size
+
+    def test_send_msz_file_custom_chunk_size(self, test_msz, _live_server):
+        """Send a .msz file with a small custom chunk_size."""
+        result = send_file(
+            test_msz,
+            _live_server["base_url"],
+            chunk_size=512,
+        )
+        assert result.state == "done"
+        assert result.bytes_received == test_msz.stat().st_size
+
+    def test_send_mzml_file_custom_chunk_size(self, test_mzml, _live_server):
+        """Send a .mzML file with a custom chunk_size passed to compress_stream."""
+        result = send_file(
+            test_mzml,
+            _live_server["base_url"],
+            chunk_size=2048,
+        )
+        assert result.state == "done"
+        assert result.bytes_received > 0
+
+    def test_chunk_size_affects_generator(self, test_msz, _live_server):
+        """Smaller chunk_size should produce more progress callbacks."""
+        small_deltas = []
+        send_file(
+            test_msz,
+            _live_server["base_url"],
+            progress_callback=small_deltas.append,
+            chunk_size=256,
+        )
+        large_deltas = []
+        send_file(
+            test_msz,
+            _live_server["base_url"],
+            progress_callback=large_deltas.append,
+            chunk_size=1_048_576,
+        )
+        # Smaller chunks should produce at least as many callbacks
+        assert len(small_deltas) >= len(large_deltas)
+        # Both should transfer the full file
+        assert sum(small_deltas) == test_msz.stat().st_size
+        assert sum(large_deltas) == test_msz.stat().st_size
+
+    def test_send_mszfile_object(self, test_msz, _live_server):
+        """send_file accepts an MSZFile object directly."""
+        msz = MSZFile(str(test_msz).encode())
+        result = send_file(msz, _live_server["base_url"])
+        assert result.state == "done"
+        assert result.filename == "test.msz"
+        assert result.bytes_received == test_msz.stat().st_size
+
+    def test_send_mzmlfile_object(self, test_mzml, _live_server):
+        """send_file accepts an MZMLFile object directly."""
+        mzml = MZMLFile(str(test_mzml).encode())
+        result = send_file(mzml, _live_server["base_url"])
+        assert result.state == "done"
+        assert result.filename == "test.mzML"
+        assert result.bytes_received > 0
+
+    def test_send_mzmlfile_object_server_decompresses(
+        self, test_mzml, _live_server_mzml,
+    ):
+        """MZMLFile object → server decompresses back to mzML."""
+        mzml = MZMLFile(str(test_mzml).encode())
+        result = send_file(mzml, _live_server_mzml["base_url"])
+        assert result.state == "done"
+
+        mzml_out = _live_server_mzml["output_dir"] / "test.mzML"
+        assert mzml_out.exists()
+        assert mzml_out.stat().st_size == test_mzml.stat().st_size
+
+    def test_send_mszxfile_object(self, test_mszx, _live_server):
+        """send_file accepts an MSZXFile object directly."""
+        mszx = MSZXFile.open(test_mszx)
+        result = send_file(mszx, _live_server["base_url"])
+        assert result.state == "done"
+        assert result.filename == "test.mszx"
+        assert result.bytes_received == test_mszx.stat().st_size
+        mszx.close()
+
+    def test_send_file_rejects_invalid_type(self, _live_server):
+        """send_file raises TypeError for unsupported input types."""
+        with pytest.raises(TypeError, match="Unsupported source type"):
+            send_file("not_a_path_or_file", _live_server["base_url"])  # type: ignore[arg-type]
+
+
+class TestSendBatch:
+    def test_single_file(self, test_msz, _live_server):
+        """send_batch with a single file returns a one-element result list."""
+        results = send_batch(
+            [test_msz],
+            _live_server["base_url"],
+            parallel=1,
+        )
+        assert len(results) == 1
+        r = results[0]
+        assert r.response is not None
+        assert r.response.state == "done"
+        assert r.filename == "test.msz"
+
+    def test_multiple_msz_files(self, test_msz, _live_server, tmp_path):
+        """send_batch sends multiple files and returns results for each."""
+        copies = []
+        for i in range(3):
+            copy = tmp_path / f"copy_{i}.msz"
+            copy.write_bytes(test_msz.read_bytes())
+            copies.append(copy)
+
+        results = send_batch(
+            copies,
+            _live_server["base_url"],
+            parallel=2,
+        )
+        assert len(results) == 3
+        for r in results:
+            assert r.response is not None
+            assert r.response.state == "done"
+
+    def test_results_contain_all_filenames(self, test_msz, _live_server, tmp_path):
+        """Results contain an entry for every input file."""
+        files = []
+        for name in ["alpha.msz", "beta.msz", "gamma.msz"]:
+            f = tmp_path / name
+            f.write_bytes(test_msz.read_bytes())
+            files.append(f)
+
+        results = send_batch(
+            files,
+            _live_server["base_url"],
+            parallel=1,
+        )
+        result_names = {r.filename for r in results}
+        assert result_names == {f.name for f in files}
+
+    def test_mixed_msz_and_mzml(self, test_msz, test_mzml, _live_server):
+        """send_batch handles a mix of .msz and .mzML files."""
+        results = send_batch(
+            [test_msz, test_mzml],
+            _live_server["base_url"],
+            parallel=2,
+        )
+        assert len(results) == 2
+        r0, r1 = results[0], results[1]
+        assert r0.response is not None
+        assert r1.response is not None
+        assert r0.response.state == "done"
+        assert r1.response.state == "done"
+
+    def test_error_captured_in_results(self, test_msz, _live_server):
+        """When send_file raises, the error is captured in the results list."""
+        with patch(
+            "mstransfer.client.sender.send_file",
+            side_effect=ConnectionError("server exploded"),
+        ):
+            results = send_batch(
+                [test_msz],
+                _live_server["base_url"],
+                parallel=1,
+            )
+        assert len(results) == 1
+        r = results[0]
+        assert r.error is not None
+        assert "server exploded" in r.error
+        assert r.filename == "test.msz"
+
+    def test_partial_failure(self, test_msz, _live_server, tmp_path):
+        """One failure does not prevent other files from succeeding."""
+        good_file = tmp_path / "good.msz"
+        good_file.write_bytes(test_msz.read_bytes())
+
+        original_send = send_file
+
+        def flaky_send(file_path, *args, **kwargs):
+            if file_path.name == "bad.msz":
+                raise ConnectionError("boom")
+            return original_send(file_path, *args, **kwargs)
+
+        bad_file = tmp_path / "bad.msz"
+        bad_file.write_bytes(test_msz.read_bytes())
+
+        with patch("mstransfer.client.sender.send_file", side_effect=flaky_send):
+            results = send_batch(
+                [good_file, bad_file],
+                _live_server["base_url"],
+                parallel=2,
+            )
+        by_name = {r.filename: r for r in results}
+        assert by_name["good.msz"].response is not None
+        assert by_name["good.msz"].response.state == "done"
+        assert by_name["bad.msz"].error is not None
+
+    def test_parallel_capped_to_file_count(self, test_msz, _live_server):
+        """Workers should not exceed the number of files."""
+        with patch(
+            "mstransfer.client.sender.ThreadPoolExecutor",
+            wraps=ThreadPoolExecutor,
+        ) as mock_pool:
+            send_batch(
+                [test_msz],
+                _live_server["base_url"],
+                parallel=8,
+            )
+            mock_pool.assert_called_once_with(max_workers=1)
+
+    def test_chunk_size_passed_to_send_file(self, test_msz, _live_server):
+        """send_batch should forward chunk_size to send_file."""
+        with patch(
+            "mstransfer.client.sender.send_file", wraps=send_file,
+        ) as mock_send:
+            send_batch(
+                [test_msz],
+                _live_server["base_url"],
+                parallel=1,
+                chunk_size=4096,
+            )
+            mock_send.assert_called_once()
+            _, kwargs = mock_send.call_args
+            assert kwargs["chunk_size"] == 4096
+
+    def test_batch_with_mscompress_objects(self, test_msz, test_mzml, _live_server):
+        """send_batch accepts MSZFile and MZMLFile objects."""
+        msz = MSZFile(str(test_msz).encode())
+        mzml = MZMLFile(str(test_mzml).encode())
+        results = send_batch(
+            [msz, mzml],
+            _live_server["base_url"],
+            parallel=2,
+        )
+        assert len(results) == 2
+        for r in results:
+            assert r.response is not None
+            assert r.response.state == "done"
+
+    def test_batch_mixed_paths_and_objects(self, test_msz, test_mzml, _live_server):
+        """send_batch accepts a mix of Path and mscompress objects."""
+        mzml = MZMLFile(str(test_mzml).encode())
+        results = send_batch(
+            [test_msz, mzml],
+            _live_server["base_url"],
+            parallel=2,
+        )
+        assert len(results) == 2
+        names = {r.filename for r in results}
+        assert names == {"test.msz", "test.mzML"}
+        for r in results:
+            assert r.response is not None
+            assert r.response.state == "done"
+
+    def test_batch_with_mszxfile_object(self, test_msz, test_mszx, _live_server):
+        """send_batch accepts MSZXFile objects alongside Paths."""
+        mszx = MSZXFile.open(test_mszx)
+        results = send_batch(
+            [test_msz, mszx],
+            _live_server["base_url"],
+            parallel=2,
+        )
+        mszx.close()
+        assert len(results) == 2
+        names = {r.filename for r in results}
+        assert names == {"test.msz", "test.mszx"}
+        for r in results:
+            assert r.response is not None
+            assert r.response.state == "done"

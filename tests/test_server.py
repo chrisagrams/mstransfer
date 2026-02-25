@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
+from datetime import datetime, timedelta
+
 import pytest
+from mscompress import MZMLFile
 
 from mstransfer.server.models import TransferState
 from mstransfer.server.state import TransferRegistry
@@ -32,6 +36,7 @@ class TestTransferRegistry:
         reg.create("t1", "file.msz")
         reg.update("t1", state=TransferState.DONE, bytes_received=1024)
         rec = reg.get("t1")
+        assert rec is not None
         assert rec.state == TransferState.DONE
         assert rec.bytes_received == 1024
 
@@ -43,8 +48,6 @@ class TestTransferRegistry:
         reg = TransferRegistry()
         rec = reg.create("t1", "old.msz")
         reg.update("t1", state=TransferState.DONE)
-        from datetime import datetime, timedelta
-
         rec.created_at = datetime.now() - timedelta(seconds=600)
         removed = reg.cleanup(max_age_seconds=300)
         assert removed == 1
@@ -61,8 +64,6 @@ class TestTransferRegistry:
     def test_cleanup_keeps_in_progress(self):
         reg = TransferRegistry()
         rec = reg.create("t1", "active.msz")
-        from datetime import datetime, timedelta
-
         rec.created_at = datetime.now() - timedelta(seconds=600)
         removed = reg.cleanup(max_age_seconds=300)
         assert removed == 0
@@ -145,8 +146,6 @@ async def test_upload_msz_store_as_mzml(mzml_client, tmp_output, test_msz):
 @pytest.mark.asyncio
 async def test_upload_mzml_stream_store_as_msz(msz_client, tmp_output, test_mzml):
     """Simulate sender compressing mzML → msz on the fly, server stores msz."""
-    from mscompress import MZMLFile
-
     mzml = MZMLFile(str(test_mzml).encode())
     compressed = b"".join(mzml.compress_stream(chunk_size=1_048_576))
 
@@ -171,8 +170,6 @@ async def test_upload_mzml_stream_store_as_msz(msz_client, tmp_output, test_mzml
 @pytest.mark.asyncio
 async def test_upload_mzml_stream_store_as_mzml(mzml_client, tmp_output, test_mzml):
     """Sender compresses mzML → msz, server decompresses back to mzML."""
-    from mscompress import MZMLFile
-
     mzml = MZMLFile(str(test_mzml).encode())
     compressed = b"".join(mzml.compress_stream(chunk_size=1_048_576))
 
@@ -247,11 +244,43 @@ async def test_upload_preserves_filename_stem(msz_client, tmp_output, test_msz):
 
 
 @pytest.mark.asyncio
-async def test_upload_default_filename(msz_client, tmp_output, test_msz):
-    """Missing X-Original-Filename header should default to unknown.msz."""
-    await msz_client.post(
+async def test_upload_missing_filename(msz_client, tmp_output, test_msz):
+    """Missing X-Original-Filename header should return 400."""
+    resp = await msz_client.post(
         "/v1/upload",
         content=test_msz.read_bytes(),
         headers={"X-Transfer-ID": "default-name-test"},
     )
-    assert (tmp_output / "unknown.msz").exists()
+    assert resp.status_code == 400
+    assert "X-Original-Filename" in resp.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_decompress_does_not_block_event_loop(mzml_client, tmp_output, test_msz):
+    """Decompression should be offloaded so concurrent requests aren't blocked."""
+    payload = test_msz.read_bytes()
+
+    upload_task = asyncio.create_task(
+        mzml_client.post(
+            "/v1/upload",
+            content=payload,
+            headers={
+                "X-Transfer-ID": "blocking-test-upload",
+                "X-Original-Filename": "blocking.msz",
+            },
+        )
+    )
+
+    # Give the upload a moment to start processing
+    await asyncio.sleep(0.05)
+
+    # Health check should respond promptly even while decompression runs
+    health_resp = await asyncio.wait_for(
+        mzml_client.get("/v1/health"),
+        timeout=2.0,
+    )
+    assert health_resp.status_code == 200
+
+    upload_resp = await upload_task
+    assert upload_resp.status_code == 200
+    assert upload_resp.json()["state"] == "done"

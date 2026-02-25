@@ -12,6 +12,7 @@ dependencies = [
     "rich",
     "python-multipart",
     "pydantic>=2.0",
+    "aiofiles",
 ]
 
 [project.scripts]
@@ -29,13 +30,15 @@ target-version = "py310"
 line-length = 88
 
 [tool.ruff.lint]
-select = ["E", "F", "W", "I", "N", "UP", "B", "A", "SIM", "TCH"]
+select = ["E", "F", "W", "I", "N", "UP", "B", "A", "SIM", "TCH", "PLC0415"]
 
 [dependency-groups]
 dev = [
     "pytest",
     "pytest-asyncio",
+    "pytest-cov",
     "httpx",
     "ruff",
     "pre-commit",
+    "pyright>=1.1.408",
 ]
