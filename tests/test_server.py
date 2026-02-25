@@ -251,3 +251,36 @@ async def test_upload_default_filename(msz_client, tmp_output, test_msz):
         headers={"X-Transfer-ID": "default-name-test"},
     )
     assert (tmp_output / "unknown.msz").exists()
+
+
+@pytest.mark.asyncio
+async def test_decompress_does_not_block_event_loop(mzml_client, tmp_output, test_msz):
+    """Decompression should be offloaded so concurrent requests aren't blocked."""
+    import asyncio
+
+    payload = test_msz.read_bytes()
+
+    upload_task = asyncio.create_task(
+        mzml_client.post(
+            "/v1/upload",
+            content=payload,
+            headers={
+                "X-Transfer-ID": "blocking-test-upload",
+                "X-Original-Filename": "blocking.msz",
+            },
+        )
+    )
+
+    # Give the upload a moment to start processing
+    await asyncio.sleep(0.05)
+
+    # Health check should respond promptly even while decompression runs
+    health_resp = await asyncio.wait_for(
+        mzml_client.get("/v1/health"),
+        timeout=2.0,
+    )
+    assert health_resp.status_code == 200
+
+    upload_resp = await upload_task
+    assert upload_resp.status_code == 200
+    assert upload_resp.json()["state"] == "done"

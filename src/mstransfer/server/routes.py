@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from pathlib import Path
 
@@ -20,6 +21,10 @@ router = APIRouter()
 
 @router.get("/health", response_model=HealthResponse)
 async def health(request: Request) -> HealthResponse:
+    """
+    Simple health check endpoint that returns the server status, version,
+      and storage configuration.
+    """
     return HealthResponse(
         status="ok",
         version=__version__,
@@ -82,10 +87,19 @@ async def upload(request: Request) -> UploadResponse:
     elif store_as == "mzml":
         registry.update(transfer_id, state=TransferState.DECOMPRESSING)
         try:
+            # Open the .msz file
             msz_file = MSZFile(str(msz_path).encode())
+
+            # Construct the output path for the decompressed .mzML file
             mzml_path = output_dir / f"{stem}.mzML"
-            msz_file.decompress(str(mzml_path))
+
+            # Offload decompression to a thread to avoid blocking the event loop
+            await asyncio.to_thread(msz_file.decompress, str(mzml_path))
+
+            # Clean up the original .msz file after successful decompression
             msz_path.unlink(missing_ok=True)
+
+            # Update the registry with the final state and path to the decompressed file
             registry.update(
                 transfer_id,
                 state=TransferState.DONE,
