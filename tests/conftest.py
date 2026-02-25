@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import io
+import json
+import tarfile
 from pathlib import Path
 
 import httpx
@@ -20,6 +23,29 @@ def test_mzml() -> Path:
 def test_msz() -> Path:
     """Path to the real test.msz file."""
     return DATA_DIR / "test.msz"
+
+
+@pytest.fixture()
+def test_mszx(tmp_path) -> Path:
+    """Build a minimal .mszx archive from the real test.msz file."""
+    msz_src = DATA_DIR / "test.msz"
+    mszx_path = tmp_path / "test.mszx"
+
+    manifest = json.dumps({
+        "version": "1.0",
+        "spectra_file": "spectra.msz",
+        "num_spectra": 0,
+        "annotations": [],
+        "join_key": "scan_number",
+    }).encode()
+
+    with tarfile.open(mszx_path, "w") as tar:
+        info = tarfile.TarInfo(name="manifest.json")
+        info.size = len(manifest)
+        tar.addfile(info, io.BytesIO(manifest))
+        tar.add(str(msz_src), arcname="spectra.msz")
+
+    return mszx_path
 
 
 @pytest.fixture()

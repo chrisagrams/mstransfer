@@ -12,7 +12,8 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
 import httpx
-from mscompress import MZMLFile
+from mscompress import MSZFile, MZMLFile
+from mscompress.mszx import MSZXFile
 from mscompress.utils import detect_filetype
 
 from mstransfer.server.models import TransferRecord, TransferState, UploadResponse
@@ -97,7 +98,7 @@ def _file_chunk_generator(
 
 
 def send_file(
-    file_path: Path,
+    source: Path | MZMLFile | MSZFile | MSZXFile,
     base_url: str,
     progress_callback: Callable[[int], None] | None = None,
     timeout: float = 3600.0,
@@ -105,17 +106,46 @@ def send_file(
 ) -> UploadResponse:
     """Send a single file to the mstransfer listener.
 
-    Returns the final transfer status dict from the server.
+    Accepts a file path, or an already-opened MZMLFile / MSZFile / MSZXFile
+    from mscompress.  Returns the final transfer status from the server.
     """
 
     # Generate a unique transfer ID.
     transfer_id = str(uuid.uuid4())
 
-    # Detect file type w/ mscompress
-    filetype = detect_filetype(str(file_path))
+    # Normalize source into (file_path, filetype, mzml_obj | None).
+    if isinstance(source, MZMLFile):
+        file_path = Path(source.path.decode())
+        filetype = "mzML"
+        mzml_obj: MZMLFile | None = source
+    elif isinstance(source, MSZFile):
+        file_path = Path(source.path.decode())
+        filetype = "msz"
+        mzml_obj = None
+    elif isinstance(source, MSZXFile):
+        file_path = source.archive_path
+        filetype = "mszx"
+        mzml_obj = None
+    elif isinstance(source, Path):
+        file_path = source
+        filetype = detect_filetype(str(file_path))
+        if filetype not in VALID_FORMATS:
+            raise ValueError(f"Unsupported file type for {file_path}: {filetype}")
+        mzml_obj = MZMLFile(str(file_path).encode()) if filetype == "mzML" else None
+    else:
+        raise TypeError(f"Unsupported source type: {type(source)}")
 
-    if filetype not in VALID_FORMATS:
-        raise ValueError(f"Unsupported file type for {file_path}: {filetype}")
+    # Build the upload stream.
+    # If its an mzML file, we can use the compress_stream for on-the-fly compression.
+    if mzml_obj is not None:
+        stream = _counting_generator(
+            mzml_obj.compress_stream(chunk_size=chunk_size), progress_callback,
+        )
+    # Otherwise, we stream the file in chuncks.
+    else:
+        stream = _file_chunk_generator(
+            file_path, chunk_size=chunk_size, callback=progress_callback,
+        )
 
     # Construct headers with metadata for the server.
     headers = {
@@ -124,23 +154,6 @@ def send_file(
         "X-Source-Format": filetype,
         "Content-Type": "application/octet-stream",
     }
-
-    if filetype == "mzML":
-        # For .mzML, set up a compression stream with a progress callback.
-        mzml = MZMLFile(str(file_path).encode())
-        stream = _counting_generator(
-            mzml.compress_stream(chunk_size=chunk_size),
-            progress_callback,
-        )
-    elif filetype in ("msz", "mszx"):
-        # For .msz, just stream the file directly with a progress callback.
-        stream = _file_chunk_generator(
-            file_path,
-            chunk_size=chunk_size,
-            callback=progress_callback
-        )
-    else:
-        raise ValueError(f"Unsupported file type: {filetype} for {file_path}")
 
     # Send the POST request with streaming upload and handle the response.
     with httpx.Client(timeout=httpx.Timeout(timeout, connect=10.0)) as client:
@@ -202,7 +215,7 @@ def _poll_status(
 
 
 def send_batch(
-    file_paths: list[Path],
+    sources: list[Path | MZMLFile | MSZFile | MSZXFile],
     base_url: str,
     parallel: int = 4,
     chunk_size: int = 1_048_576,
@@ -210,7 +223,7 @@ def send_batch(
 ) -> list[FileResult]:
     """Send multiple files with configurable parallelism."""
     # Set the number of workers.
-    workers = min(parallel, len(file_paths))
+    workers = min(parallel, len(sources))
 
     results: list[FileResult] = []
 
@@ -218,11 +231,24 @@ def send_batch(
         # Keep track of futures and their corresponding index + file path.
         futures: dict[Future[UploadResponse], tuple[int, Path]] = {}
 
-        for idx, fpath in enumerate(file_paths):
-            # Currently, we can only determine total bytes for .msz files
-            #  since the .mzML is compressed on the fly.
-            is_msz = fpath.suffix.lower() == ".msz"
-            total_bytes = fpath.stat().st_size if is_msz else None
+        for idx, source in enumerate(sources):
+            # Extract a Path for progress reporting and metadata.
+            if isinstance(source, MSZXFile):
+                fpath = source.archive_path
+            elif isinstance(source, (MZMLFile, MSZFile)):
+                fpath = Path(source.path.decode())
+            else:
+                fpath = source
+
+            # We can determine total bytes for compressed files (MSZ/MSZX).
+            # For mzML, compression is on-the-fly so the total is unknown.
+            if isinstance(source, (MSZFile, MSZXFile)):
+                total_bytes = fpath.stat().st_size
+            elif isinstance(source, MZMLFile):
+                total_bytes = None
+            else:
+                is_compressed = fpath.suffix.lower() in (".msz", ".mszx")
+                total_bytes = fpath.stat().st_size if is_compressed else None
 
             # If the progress callback is provided, notify that this file is starting.
             if progress:
@@ -240,7 +266,7 @@ def send_batch(
             # Submit the file upload task to the thread pool and store the future.
             future = pool.submit(
                 send_file,
-                fpath,
+                source,
                 base_url,
                 progress_callback=make_callback(idx),
                 chunk_size=chunk_size,
