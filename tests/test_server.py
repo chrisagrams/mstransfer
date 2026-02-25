@@ -243,14 +243,15 @@ async def test_upload_preserves_filename_stem(msz_client, tmp_output, test_msz):
 
 
 @pytest.mark.asyncio
-async def test_upload_default_filename(msz_client, tmp_output, test_msz):
-    """Missing X-Original-Filename header should default to unknown.msz."""
-    await msz_client.post(
+async def test_upload_missing_filename(msz_client, tmp_output, test_msz):
+    """Missing X-Original-Filename header should return 400."""
+    resp = await msz_client.post(
         "/v1/upload",
         content=test_msz.read_bytes(),
         headers={"X-Transfer-ID": "default-name-test"},
     )
-    assert (tmp_output / "unknown.msz").exists()
+    assert resp.status_code == 400
+    assert "X-Original-Filename" in resp.json()["detail"]
 
 
 @pytest.mark.asyncio
