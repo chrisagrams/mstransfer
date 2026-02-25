@@ -56,7 +56,11 @@ def cmd_upload(args: argparse.Namespace) -> None:
         f"[cyan]{host}:{port}[/] (parallel={args.parallel})"
     )
 
-    results = send_batch(file_paths, host, port, parallel=args.parallel)
+    results = send_batch(
+        file_paths, host, port,
+        parallel=args.parallel,
+        chunk_size=args.chunk_size,
+    )
 
     ok = sum(1 for r in results if r and r.get("state") == "done")
     fail = len(results) - ok
@@ -114,6 +118,12 @@ def main() -> None:
         type=int,
         default=4,
         help="Concurrent uploads (default: 4)",
+    )
+    sp.add_argument(
+        "--chunk-size",
+        type=int,
+        default=1_048_576,
+        help="Upload chunk size in bytes (default: 1048576)",
     )
     sp.set_defaults(func=cmd_upload)
 

@@ -106,14 +106,19 @@ async def upload(
     bytes_received = 0
 
     # Stream the incoming data to a file asynchronously.
+    update_every = 64  # throttle registry updates to reduce lock overhead
+    chunk_count = 0
     try:
         async with aiofiles.open(msz_path, "wb") as f:
             async for chunk in request.stream():
                 await f.write(chunk)
-
-                # Update the registry with the bytes received so far.
                 bytes_received += len(chunk)
-                registry.update(transfer_id, bytes_received=bytes_received)
+                chunk_count += 1
+                if chunk_count % update_every == 0:
+                    registry.update(transfer_id, bytes_received=bytes_received)
+
+        # Final update to ensure accurate total
+        registry.update(transfer_id, bytes_received=bytes_received)
 
     except Exception as exc:
         registry.update(transfer_id, state=TransferState.ERROR, error=str(exc))

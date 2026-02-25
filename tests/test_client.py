@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import threading
 import time
+from unittest.mock import patch
 
 import pytest
 import uvicorn
@@ -12,6 +13,7 @@ from mstransfer.client.sender import (
     _counting_generator,
     _file_chunk_generator,
     resolve_inputs,
+    send_batch,
     send_file,
 )
 from mstransfer.server.app import create_app
@@ -252,3 +254,67 @@ class TestSendFile:
         )
         assert len(deltas) > 0
         assert sum(deltas) == test_msz.stat().st_size
+
+    def test_send_msz_file_custom_chunk_size(self, test_msz, _live_server):
+        """Send a .msz file with a small custom chunk_size."""
+        result = send_file(
+            test_msz,
+            _live_server["host"],
+            _live_server["port"],
+            chunk_size=512,
+        )
+        assert result["state"] == "done"
+        assert result["bytes_received"] == test_msz.stat().st_size
+
+    def test_send_mzml_file_custom_chunk_size(self, test_mzml, _live_server):
+        """Send a .mzML file with a custom chunk_size passed to compress_stream."""
+        result = send_file(
+            test_mzml,
+            _live_server["host"],
+            _live_server["port"],
+            chunk_size=2048,
+        )
+        assert result["state"] == "done"
+        assert result["bytes_received"] > 0
+
+    def test_chunk_size_affects_generator(self, test_msz, _live_server):
+        """Smaller chunk_size should produce more progress callbacks."""
+        small_deltas = []
+        send_file(
+            test_msz,
+            _live_server["host"],
+            _live_server["port"],
+            progress_callback=small_deltas.append,
+            chunk_size=256,
+        )
+        large_deltas = []
+        send_file(
+            test_msz,
+            _live_server["host"],
+            _live_server["port"],
+            progress_callback=large_deltas.append,
+            chunk_size=1_048_576,
+        )
+        # Smaller chunks should produce at least as many callbacks
+        assert len(small_deltas) >= len(large_deltas)
+        # Both should transfer the full file
+        assert sum(small_deltas) == test_msz.stat().st_size
+        assert sum(large_deltas) == test_msz.stat().st_size
+
+
+class TestSendBatchChunkSize:
+    def test_chunk_size_passed_to_send_file(self, test_msz, _live_server):
+        """send_batch should forward chunk_size to send_file."""
+        with patch(
+            "mstransfer.client.sender.send_file", wraps=send_file,
+        ) as mock_send:
+            send_batch(
+                [test_msz],
+                _live_server["host"],
+                _live_server["port"],
+                parallel=1,
+                chunk_size=4096,
+            )
+            mock_send.assert_called_once()
+            _, kwargs = mock_send.call_args
+            assert kwargs["chunk_size"] == 4096

@@ -70,9 +70,24 @@ class TestCliParsing:
         sp.add_argument("targets", nargs="+")
         sp.add_argument("--recursive", "-r", action="store_true")
         sp.add_argument("--parallel", "-p", type=int, default=4)
+        sp.add_argument("--chunk-size", type=int, default=1_048_576)
         args = parser.parse_args(
             ["upload", "/data/file.mzML", "/data/dir", "myhost:1319", "-r", "-p", "8"]
         )
         assert args.targets == ["/data/file.mzML", "/data/dir", "myhost:1319"]
         assert args.recursive is True
         assert args.parallel == 8
+        assert args.chunk_size == 1_048_576
+
+    def test_upload_custom_chunk_size(self):
+        parser = argparse.ArgumentParser()
+        sub = parser.add_subparsers(dest="command")
+        sp = sub.add_parser("upload")
+        sp.add_argument("targets", nargs="+")
+        sp.add_argument("--recursive", "-r", action="store_true")
+        sp.add_argument("--parallel", "-p", type=int, default=4)
+        sp.add_argument("--chunk-size", type=int, default=1_048_576)
+        args = parser.parse_args(
+            ["upload", "file.mzML", "host:1319", "--chunk-size", "8388608"]
+        )
+        assert args.chunk_size == 8_388_608

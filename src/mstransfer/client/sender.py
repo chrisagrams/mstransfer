@@ -81,6 +81,7 @@ def send_file(
     port: int,
     progress_callback: Callable[[int], None] | None = None,
     timeout: float = 3600.0,
+    chunk_size: int = 1_048_576,
 ) -> dict:
     """Send a single file to the mstransfer listener.
 
@@ -100,11 +101,11 @@ def send_file(
     if filetype == "mzML":
         mzml = MZMLFile(str(file_path).encode())
         stream = _counting_generator(
-            mzml.compress_stream(chunk_size=1_048_576),
+            mzml.compress_stream(chunk_size=chunk_size),
             progress_callback,
         )
     elif filetype in ("msz", "mszx"):
-        stream = _file_chunk_generator(file_path, callback=progress_callback)
+        stream = _file_chunk_generator(file_path, chunk_size=chunk_size, callback=progress_callback)
     else:
         raise ValueError(f"Unsupported file type: {filetype} for {file_path}")
 
@@ -151,6 +152,7 @@ def send_batch(
     host: str,
     port: int,
     parallel: int = 4,
+    chunk_size: int = 1_048_576,
 ) -> list[dict | None]:
     """Send multiple files with configurable parallelism."""
     workers = min(parallel, len(file_paths))
@@ -187,6 +189,7 @@ def send_batch(
                     host,
                     port,
                     progress_callback=make_callback(task_id),
+                    chunk_size=chunk_size,
                 )
                 future_to_idx[future] = (idx, task_id)
 
