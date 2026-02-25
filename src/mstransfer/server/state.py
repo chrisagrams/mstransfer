@@ -2,8 +2,27 @@ from __future__ import annotations
 
 import threading
 import time
+from typing import TYPE_CHECKING
+
+from starlette.datastructures import State
 
 from mstransfer.server.models import TransferRecord, TransferState
+
+if TYPE_CHECKING:
+    from pathlib import Path
+
+
+class AppState(State):
+    """Application state object to hold configuration and transfer registry."""
+    output_dir: Path
+    store_as: str
+    transfers: TransferRegistry
+
+    def __init__(self, output_dir: Path, store_as: str) -> None:
+        super().__init__()
+        self.output_dir = output_dir
+        self.store_as = store_as
+        self.transfers = TransferRegistry()
 
 
 class TransferRegistry:
