@@ -11,6 +11,7 @@ from rich.live import Live
 from rich.table import Table
 
 from mstransfer.client.sender import resolve_inputs, send_batch
+from mstransfer.server.auth import APIKeyAuthProvider
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -67,7 +68,15 @@ def cmd_serve(args: argparse.Namespace) -> None:
             )
             sys.exit(1)
 
-    app = create_app(output_dir=args.output_dir, store_as=args.store_as)
+    auth = None
+    if args.api_key:
+        auth = APIKeyAuthProvider(args.api_key)
+
+    app = create_app(
+        output_dir=args.output_dir,
+        store_as=args.store_as,
+        auth=auth,
+    )
     console.print(
         f"[bold green]mstransfer server[/] starting on "
         f"[cyan]{args.host}:{args.port}[/] "
@@ -89,7 +98,10 @@ class UploadProgressDisplay:
         self._task_ids: dict[int, TaskID] = {}
 
     def file_started(
-        self, index: int, file_path: Path, total_bytes: int | None,
+        self,
+        index: int,
+        file_path: Path,
+        total_bytes: int | None,
     ) -> None:
         task_id = self.files.add_task(file_path.name, total=total_bytes)
         self._task_ids[index] = task_id
@@ -97,13 +109,13 @@ class UploadProgressDisplay:
     def file_progress(self, index: int, delta: int) -> None:
         self.files.advance(self._task_ids[index], delta)
 
-    def file_done(self, index: int, result: UploadResponse) -> None:
+    def file_done(self, index: int, result: UploadResponse) -> None:  # noqa: ARG002
         task_id = self._task_ids[index]
         desc = self.files.tasks[task_id].description
         self.files.update(task_id, description=f"[green]{desc}")
         self.overall.advance(self.overall_task)
 
-    def file_error(self, index: int, exc: Exception) -> None:
+    def file_error(self, index: int, exc: Exception) -> None:  # noqa: ARG002
         task_id = self._task_ids[index]
         desc = self.files.tasks[task_id].description
         self.files.update(task_id, description=f"[red]{desc}")
@@ -145,15 +157,16 @@ def cmd_upload(args: argparse.Namespace) -> None:
 
     with Live(display.table, console=console, refresh_per_second=10):
         results = send_batch(
-            file_paths, base_url,
+            file_paths,
+            base_url,
             parallel=args.parallel,
             chunk_size=args.chunk_size,
             progress=display,
+            api_key=args.api_key,
         )
 
     ok = sum(
-        1 for r in results
-        if r.response and r.response.state == TransferState.DONE
+        1 for r in results if r.response and r.response.state == TransferState.DONE
     )
     fail = len(results) - ok
     if fail:
@@ -189,6 +202,11 @@ def main() -> None:
         default="msz",
         help="Storage format (default: msz)",
     )
+    lp.add_argument(
+        "--api-key",
+        default=None,
+        help="Require this API key for all requests",
+    )
     lp.set_defaults(func=cmd_serve)
 
     # --- upload ---
@@ -216,6 +234,11 @@ def main() -> None:
         type=int,
         default=1_048_576,
         help="Upload chunk size in bytes (default: 1048576)",
+    )
+    sp.add_argument(
+        "--api-key",
+        default=None,
+        help="API key for authenticating with the server",
     )
     sp.set_defaults(func=cmd_upload)
 

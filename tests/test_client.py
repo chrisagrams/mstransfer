@@ -313,7 +313,9 @@ class TestSendFile:
         assert result.bytes_received > 0
 
     def test_send_mzmlfile_object_server_decompresses(
-        self, test_mzml, _live_server_mzml,
+        self,
+        test_mzml,
+        _live_server_mzml,
     ):
         """MZMLFile object → server decompresses back to mzML."""
         mzml = MZMLFile(str(test_mzml).encode())
@@ -460,7 +462,8 @@ class TestSendBatch:
     def test_chunk_size_passed_to_send_file(self, test_msz, _live_server):
         """send_batch should forward chunk_size to send_file."""
         with patch(
-            "mstransfer.client.sender.send_file", wraps=send_file,
+            "mstransfer.client.sender.send_file",
+            wraps=send_file,
         ) as mock_send:
             send_batch(
                 [test_msz],
