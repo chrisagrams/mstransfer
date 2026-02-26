@@ -14,6 +14,7 @@ if TYPE_CHECKING:
 
 class AppState(State):
     """Application state object to hold configuration and transfer registry."""
+
     output_dir: Path
     store_as: str
     transfers: TransferRegistry

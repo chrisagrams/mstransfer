@@ -6,6 +6,7 @@ from pydantic import BaseModel, Field
 
 class TransferState(str, Enum):
     """Enumeration of possible states for a file transfer."""
+
     RECEIVING = "receiving"
     RECEIVED = "received"
     DECOMPRESSING = "decompressing"
@@ -15,6 +16,7 @@ class TransferState(str, Enum):
 
 class TransferRecord(BaseModel):
     """Data model for a file transfer record in the registry."""
+
     transfer_id: str
     filename: str
     state: TransferState = TransferState.RECEIVING
@@ -28,6 +30,7 @@ class TransferRecord(BaseModel):
 
 class UploadResponse(BaseModel):
     """Response model for a successful upload."""
+
     transfer_id: str
     filename: str
     stored_as: str
@@ -37,6 +40,7 @@ class UploadResponse(BaseModel):
 
 class HealthResponse(BaseModel):
     """Response model for health check endpoint."""
+
     status: str
     version: str
     store_as: str

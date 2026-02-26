@@ -9,6 +9,7 @@ import httpx
 import pytest
 
 from mstransfer.server.app import create_app
+from mstransfer.server.auth import APIKeyAuthProvider
 
 DATA_DIR = Path(__file__).parent / "data"
 
@@ -31,13 +32,15 @@ def test_mszx(tmp_path) -> Path:
     msz_src = DATA_DIR / "test.msz"
     mszx_path = tmp_path / "test.mszx"
 
-    manifest = json.dumps({
-        "version": "1.0",
-        "spectra_file": "spectra.msz",
-        "num_spectra": 0,
-        "annotations": [],
-        "join_key": "scan_number",
-    }).encode()
+    manifest = json.dumps(
+        {
+            "version": "1.0",
+            "spectra_file": "spectra.msz",
+            "num_spectra": 0,
+            "annotations": [],
+            "join_key": "scan_number",
+        }
+    ).encode()
 
     with tarfile.open(mszx_path, "w") as tar:
         info = tarfile.TarInfo(name="manifest.json")
@@ -79,6 +82,23 @@ def msz_client(msz_app):
 def mzml_client(mzml_app):
     """httpx AsyncClient wired to the mzml app via ASGI transport."""
     transport = httpx.ASGITransport(app=mzml_app)
+    return httpx.AsyncClient(transport=transport, base_url="http://test")
+
+
+@pytest.fixture()
+def authed_app(tmp_output):
+    """FastAPI app configured with API key auth."""
+    return create_app(
+        output_dir=str(tmp_output),
+        store_as="msz",
+        auth=APIKeyAuthProvider("test-secret"),
+    )
+
+
+@pytest.fixture()
+def authed_client(authed_app):
+    """httpx AsyncClient wired to the authed app via ASGI transport."""
+    transport = httpx.ASGITransport(app=authed_app)
     return httpx.AsyncClient(transport=transport, base_url="http://test")
 
 

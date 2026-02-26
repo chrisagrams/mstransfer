@@ -43,7 +43,10 @@ class TestParseTarget:
             parse_target("host:notaport")
 
     def test_http_url_passthrough(self):
-        assert parse_target("http://proxy.example.com:8080") == "http://proxy.example.com:8080"
+        assert (
+            parse_target("http://proxy.example.com:8080")
+            == "http://proxy.example.com:8080"
+        )
 
     def test_https_url_passthrough(self):
         assert parse_target("https://proxy.example.com") == "https://proxy.example.com"
@@ -126,6 +129,7 @@ class TestCmdServe:
             "port": 1319,
             "output_dir": "./received",
             "store_as": "msz",
+            "api_key": None,
         }
         defaults.update(overrides)
         return argparse.Namespace(**defaults)
@@ -140,25 +144,37 @@ class TestCmdServe:
         cmd_serve(args)
 
         mock_create_app.assert_called_once_with(
-            output_dir="./received", store_as="msz",
+            output_dir="./received",
+            store_as="msz",
+            auth=None,
         )
         mock_run.assert_called_once_with(
-            mock_app, host="0.0.0.0", port=1319, log_level="warning",
+            mock_app,
+            host="0.0.0.0",
+            port=1319,
+            log_level="warning",
         )
 
     @patch("mstransfer.cli.uvicorn.run")
     @patch("mstransfer.cli.create_app")
     def test_serve_custom_args(self, mock_create_app, mock_run):
         args = self._make_args(
-            host="127.0.0.1", port=9999, output_dir="/tmp/out", store_as="mzml",
+            host="127.0.0.1",
+            port=9999,
+            output_dir="/tmp/out",
+            store_as="mzml",
         )
         cmd_serve(args)
         mock_create_app.assert_called_once_with(
-            output_dir="/tmp/out", store_as="mzml",
+            output_dir="/tmp/out",
+            store_as="mzml",
+            auth=None,
         )
         mock_run.assert_called_once_with(
             mock_create_app.return_value,
-            host="127.0.0.1", port=9999, log_level="warning",
+            host="127.0.0.1",
+            port=9999,
+            log_level="warning",
         )
 
     def test_serve_port_in_use_exits(self):
@@ -185,6 +201,7 @@ class TestCmdUpload:
             "recursive": False,
             "parallel": 4,
             "chunk_size": 1_048_576,
+            "api_key": None,
         }
         defaults.update(overrides)
         return argparse.Namespace(**defaults)
@@ -195,40 +212,44 @@ class TestCmdUpload:
         with pytest.raises(SystemExit, match="1"):
             cmd_upload(args)
 
-    @patch(
-        "mstransfer.cli.resolve_inputs",
-        side_effect=FileNotFoundError("No valid files"),
-    )
-    def test_no_valid_files_exits(self, _mock_resolve):
-        args = self._make_args(["nonexistent.txt", "host:1319"])
-        with pytest.raises(SystemExit, match="1"):
-            cmd_upload(args)
+    def test_no_valid_files_exits(self):
+        with patch(
+            "mstransfer.cli.resolve_inputs",
+            side_effect=FileNotFoundError("No valid files"),
+        ):
+            args = self._make_args(["nonexistent.txt", "host:1319"])
+            with pytest.raises(SystemExit, match="1"):
+                cmd_upload(args)
 
-    @patch(
-        "mstransfer.cli.resolve_inputs",
-        return_value=[Path("/data/a.mzML")],
-    )
-    @patch(
-        "mstransfer.cli.httpx.get",
-        side_effect=httpx.ConnectError("refused"),
-    )
-    def test_healthcheck_connect_error_exits(self, _mock_get, _mock_resolve):
-        args = self._make_args(["/data/a.mzML", "badhost:1319"])
-        with pytest.raises(SystemExit, match="1"):
-            cmd_upload(args)
+    def test_healthcheck_connect_error_exits(self):
+        with (
+            patch(
+                "mstransfer.cli.resolve_inputs",
+                return_value=[Path("/data/a.mzML")],
+            ),
+            patch(
+                "mstransfer.cli.httpx.get",
+                side_effect=httpx.ConnectError("refused"),
+            ),
+        ):
+            args = self._make_args(["/data/a.mzML", "badhost:1319"])
+            with pytest.raises(SystemExit, match="1"):
+                cmd_upload(args)
 
-    @patch(
-        "mstransfer.cli.resolve_inputs",
-        return_value=[Path("/data/a.mzML")],
-    )
-    @patch(
-        "mstransfer.cli.httpx.get",
-        side_effect=httpx.TimeoutException("timeout"),
-    )
-    def test_healthcheck_timeout_exits(self, _mock_get, _mock_resolve):
-        args = self._make_args(["/data/a.mzML", "slowhost:1319"])
-        with pytest.raises(SystemExit, match="1"):
-            cmd_upload(args)
+    def test_healthcheck_timeout_exits(self):
+        with (
+            patch(
+                "mstransfer.cli.resolve_inputs",
+                return_value=[Path("/data/a.mzML")],
+            ),
+            patch(
+                "mstransfer.cli.httpx.get",
+                side_effect=httpx.TimeoutException("timeout"),
+            ),
+        ):
+            args = self._make_args(["/data/a.mzML", "slowhost:1319"])
+            with pytest.raises(SystemExit, match="1"):
+                cmd_upload(args)
 
     @patch("mstransfer.cli.send_batch")
     @patch("mstransfer.cli.httpx.get")
@@ -241,15 +262,21 @@ class TestCmdUpload:
             FileResult(
                 filename="a.mzML",
                 response=UploadResponse(
-                    transfer_id="t1", filename="a.msz", stored_as="msz",
-                    state=TransferState.DONE, bytes_received=100,
+                    transfer_id="t1",
+                    filename="a.msz",
+                    stored_as="msz",
+                    state=TransferState.DONE,
+                    bytes_received=100,
                 ),
             ),
             FileResult(
                 filename="b.msz",
                 response=UploadResponse(
-                    transfer_id="t2", filename="b.msz", stored_as="msz",
-                    state=TransferState.DONE, bytes_received=200,
+                    transfer_id="t2",
+                    filename="b.msz",
+                    stored_as="msz",
+                    state=TransferState.DONE,
+                    bytes_received=200,
                 ),
             ),
         ]
@@ -267,7 +294,10 @@ class TestCmdUpload:
     @patch("mstransfer.cli.httpx.get")
     @patch("mstransfer.cli.resolve_inputs")
     def test_partial_failure_prints_errors(
-        self, mock_resolve, mock_get, mock_send_batch,
+        self,
+        mock_resolve,
+        mock_get,
+        mock_send_batch,
     ):
         mock_resolve.return_value = [Path("/data/a.mzML"), Path("/data/b.msz")]
         mock_get.return_value = MagicMock(status_code=200)
@@ -275,8 +305,11 @@ class TestCmdUpload:
             FileResult(
                 filename="a.mzML",
                 response=UploadResponse(
-                    transfer_id="t1", filename="a.msz", stored_as="msz",
-                    state=TransferState.DONE, bytes_received=100,
+                    transfer_id="t1",
+                    filename="a.msz",
+                    stored_as="msz",
+                    state=TransferState.DONE,
+                    bytes_received=100,
                 ),
             ),
             FileResult(filename="b.msz", error="Connection reset"),
@@ -290,7 +323,10 @@ class TestCmdUpload:
     @patch("mstransfer.cli.httpx.get")
     @patch("mstransfer.cli.resolve_inputs")
     def test_upload_passes_parallel_and_chunk_size(
-        self, mock_resolve, mock_get, mock_send_batch,
+        self,
+        mock_resolve,
+        mock_get,
+        mock_send_batch,
     ):
         mock_resolve.return_value = [Path("/data/a.mzML")]
         mock_get.return_value = MagicMock(status_code=200)
@@ -298,14 +334,19 @@ class TestCmdUpload:
             FileResult(
                 filename="a.mzML",
                 response=UploadResponse(
-                    transfer_id="t1", filename="a.msz", stored_as="msz",
-                    state=TransferState.DONE, bytes_received=100,
+                    transfer_id="t1",
+                    filename="a.msz",
+                    stored_as="msz",
+                    state=TransferState.DONE,
+                    bytes_received=100,
                 ),
             ),
         ]
 
         args = self._make_args(
-            ["/data/a.mzML", "host"], parallel=8, chunk_size=4_194_304,
+            ["/data/a.mzML", "host"],
+            parallel=8,
+            chunk_size=4_194_304,
         )
         cmd_upload(args)
 
@@ -324,8 +365,11 @@ class TestCmdUpload:
             FileResult(
                 filename="a.mzML",
                 response=UploadResponse(
-                    transfer_id="t1", filename="a.msz", stored_as="msz",
-                    state=TransferState.ERROR, bytes_received=50,
+                    transfer_id="t1",
+                    filename="a.msz",
+                    stored_as="msz",
+                    state=TransferState.ERROR,
+                    bytes_received=50,
                 ),
             ),
         ]
@@ -362,8 +406,11 @@ class TestUploadProgressDisplay:
         display = UploadProgressDisplay(total_files=1)
         display.file_started(0, Path("/data/a.mzML"), total_bytes=1000)
         resp = UploadResponse(
-            transfer_id="t1", filename="a.msz", stored_as="msz",
-            state=TransferState.DONE, bytes_received=1000,
+            transfer_id="t1",
+            filename="a.msz",
+            stored_as="msz",
+            state=TransferState.DONE,
+            bytes_received=1000,
         )
         display.file_done(0, resp)
 
@@ -383,8 +430,11 @@ class TestUploadProgressDisplay:
         display.file_started(0, Path("a.mzML"), total_bytes=100)
         display.file_started(1, Path("b.msz"), total_bytes=200)
         resp = UploadResponse(
-            transfer_id="t1", filename="a.msz", stored_as="msz",
-            state=TransferState.DONE, bytes_received=100,
+            transfer_id="t1",
+            filename="a.msz",
+            stored_as="msz",
+            state=TransferState.DONE,
+            bytes_received=100,
         )
         display.file_done(0, resp)
 
