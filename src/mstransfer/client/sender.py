@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Sequence
 
 import httpx
 from mscompress import MSZFile, MZMLFile
@@ -29,11 +29,8 @@ class BatchProgressCallback(Protocol):
     """Callback protocol for observing batch upload progress."""
 
     def file_started(
-            self,
-            index: int,
-            file_path: Path,
-            total_bytes: int | None
-        ) -> None: ...
+        self, index: int, file_path: Path, total_bytes: int | None
+    ) -> None: ...
 
     def file_progress(self, index: int, delta: int) -> None: ...
     def file_done(self, index: int, result: UploadResponse) -> None: ...
@@ -103,6 +100,7 @@ def send_file(
     progress_callback: Callable[[int], None] | None = None,
     timeout: float = 3600.0,
     chunk_size: int = 1_048_576,
+    api_key: str | None = None,
 ) -> UploadResponse:
     """Send a single file to the mstransfer listener.
 
@@ -139,12 +137,15 @@ def send_file(
     # If its an mzML file, we can use the compress_stream for on-the-fly compression.
     if mzml_obj is not None:
         stream = _counting_generator(
-            mzml_obj.compress_stream(chunk_size=chunk_size), progress_callback,
+            mzml_obj.compress_stream(chunk_size=chunk_size),
+            progress_callback,
         )
     # Otherwise, we stream the file in chuncks.
     else:
         stream = _file_chunk_generator(
-            file_path, chunk_size=chunk_size, callback=progress_callback,
+            file_path,
+            chunk_size=chunk_size,
+            callback=progress_callback,
         )
 
     # Construct headers with metadata for the server.
@@ -154,6 +155,8 @@ def send_file(
         "X-Source-Format": filetype,
         "Content-Type": "application/octet-stream",
     }
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
 
     # Send the POST request with streaming upload and handle the response.
     with httpx.Client(timeout=httpx.Timeout(timeout, connect=10.0)) as client:
@@ -167,7 +170,13 @@ def send_file(
 
     # Poll for server-side processing completion
     if upload_result.state not in (TransferState.DONE, TransferState.ERROR):
-        state = _poll_status(base_url, transfer_id, timeout=timeout)
+        poll_headers = {"Authorization": f"Bearer {api_key}"} if api_key else None
+        state = _poll_status(
+            base_url,
+            transfer_id,
+            timeout=timeout,
+            headers=poll_headers,
+        )
         upload_result.state = state
 
     return upload_result
@@ -178,6 +187,7 @@ def _poll_status(
     transfer_id: str,
     timeout: float = 300.0,
     interval: float = 0.5,
+    headers: dict[str, str] | None = None,
 ) -> TransferState:
     """Poll transfer status until terminal state or timeout."""
 
@@ -193,7 +203,10 @@ def _poll_status(
         # Continously poll until we hit a terminal state or exceed the deadline.
         while time.monotonic() < deadline:
             # Make a GET request to the status endpoint for this transfer ID.
-            resp = client.get(f"{base_url}/v1/transfer/{transfer_id}/status")
+            resp = client.get(
+                f"{base_url}/v1/transfer/{transfer_id}/status",
+                headers=headers,
+            )
             if resp.status_code == 200:
                 record = TransferRecord.model_validate(resp.json())
 
@@ -209,17 +222,16 @@ def _poll_status(
                     deadline = time.monotonic() + timeout
             # Sleep until the next poll interval before checking again.
             time.sleep(interval)
-    raise TimeoutError(
-        f"Transfer {transfer_id} did not complete within {timeout}s"
-    )
+    raise TimeoutError(f"Transfer {transfer_id} did not complete within {timeout}s")
 
 
 def send_batch(
-    sources: list[Path | MZMLFile | MSZFile | MSZXFile],
+    sources: Sequence[Path | MZMLFile | MSZFile | MSZXFile],
     base_url: str,
     parallel: int = 4,
     chunk_size: int = 1_048_576,
     progress: BatchProgressCallback | None = None,
+    api_key: str | None = None,
 ) -> list[FileResult]:
     """Send multiple files with configurable parallelism."""
     # Set the number of workers.
@@ -258,9 +270,11 @@ def send_batch(
                 """
                 Create a callback function that captures the file index for progress.
                 """
+
                 def cb(delta: int):
                     if progress:
                         progress.file_progress(i, delta)
+
                 return cb
 
             # Submit the file upload task to the thread pool and store the future.
@@ -270,6 +284,7 @@ def send_batch(
                 base_url,
                 progress_callback=make_callback(idx),
                 chunk_size=chunk_size,
+                api_key=api_key,
             )
             futures[future] = (idx, fpath)
 
