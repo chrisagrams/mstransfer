@@ -1,0 +1,8 @@
+# Downloaded datasets
+data/
+
+# Secrets
+.env
+
+# Benchmark results
+results*.csv
