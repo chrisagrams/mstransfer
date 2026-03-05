@@ -107,7 +107,9 @@ for t in "${TARGETS[@]}"; do
 done
 
 MODE="${BENCHMARK_MODE:-per-file}"
-CSV_FILE="$SCRIPT_DIR/results_$(date +%Y%m%d_%H%M%S).csv"
+RESULTS_DIR="$SCRIPT_DIR/results"
+mkdir -p "$RESULTS_DIR"
+CSV_FILE="$RESULTS_DIR/results_$(date +%Y%m%d_%H%M%S).csv"
 echo "target,file,size_bytes,duration_s,throughput_mbps" > "$CSV_FILE"
 
 # ── Upload functions (single file) ───────────────────────────────────────────

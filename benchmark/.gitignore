@@ -5,4 +5,7 @@ data/
 .env
 
 # Benchmark results
-results*.csv
+results/
+
+# Generated plots
+plots/
