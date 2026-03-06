@@ -4,20 +4,36 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DATA_DIR="$SCRIPT_DIR/data"
 ALL_TARGETS=(mstransfer sftp s3)
+BANDWIDTH=""
 
 usage() {
-    echo "Usage: $(basename "$0") [target ...]"
+    echo "Usage: $(basename "$0") [options] [target ...]"
+    echo ""
+    echo "Options:"
+    echo "  -b, --bandwidth <mbit>  Throttle upload bandwidth using tc (in mbit/s)"
+    echo "  -h, --help              Show this help message"
     echo ""
     echo "Targets: mstransfer, sftp, s3 (default: all)"
     echo ""
     echo "Examples:"
-    echo "  $(basename "$0")                  # run all targets"
-    echo "  $(basename "$0") mstransfer       # mstransfer only"
-    echo "  $(basename "$0") sftp s3          # sftp and s3 only"
+    echo "  $(basename "$0")                            # run all targets"
+    echo "  $(basename "$0") mstransfer                 # mstransfer only"
+    echo "  $(basename "$0") -b 100 sftp s3             # sftp and s3, throttled to 100 mbit/s"
+    echo "  $(basename "$0") -b 1000 mstransfer         # mstransfer at 1 gbit/s"
     exit 0
 }
 
-[[ "${1:-}" == "-h" || "${1:-}" == "--help" ]] && usage
+# Parse options
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -h|--help) usage ;;
+        -b|--bandwidth)
+            BANDWIDTH="$2"
+            shift 2
+            ;;
+        *) break ;;
+    esac
+done
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -48,6 +64,36 @@ throughput() {
 fmt_mb() {
     awk "BEGIN { printf \"%.1f\", $1 / 1000000 }"
 }
+
+# ── Bandwidth throttling via tc ──────────────────────────────────────────────
+
+NET_IFACE=""
+
+tc_setup() {
+    # Detect the default outbound interface
+    NET_IFACE=$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1); exit}')
+    if [[ -z "$NET_IFACE" ]]; then
+        echo "ERROR: Could not detect network interface for tc throttling."
+        exit 1
+    fi
+    echo "Throttling upload bandwidth to ${BANDWIDTH}mbit on $NET_IFACE"
+    sudo tc qdisc replace dev "$NET_IFACE" root tbf rate "${BANDWIDTH}mbit" burst 32kbit latency 50ms
+}
+
+tc_teardown() {
+    if [[ -n "$NET_IFACE" ]]; then
+        sudo tc qdisc del dev "$NET_IFACE" root 2>/dev/null || true
+    fi
+}
+
+if [[ -n "$BANDWIDTH" ]]; then
+    if ! command -v tc &>/dev/null; then
+        echo "ERROR: 'tc' (iproute2) is required for bandwidth throttling but is not installed."
+        exit 1
+    fi
+    tc_setup
+    trap tc_teardown EXIT
+fi
 
 # ── Prerequisites ────────────────────────────────────────────────────────────
 
@@ -109,7 +155,11 @@ done
 MODE="${BENCHMARK_MODE:-per-file}"
 RESULTS_DIR="$SCRIPT_DIR/results"
 mkdir -p "$RESULTS_DIR"
-CSV_FILE="$RESULTS_DIR/results_$(date +%Y%m%d_%H%M%S).csv"
+if [[ -n "$BANDWIDTH" ]]; then
+    CSV_FILE="$RESULTS_DIR/results_${BANDWIDTH}mbit_$(date +%Y%m%d_%H%M%S).csv"
+else
+    CSV_FILE="$RESULTS_DIR/results_$(date +%Y%m%d_%H%M%S).csv"
+fi
 echo "target,file,size_bytes,duration_s,throughput_mbps" > "$CSV_FILE"
 
 # ── Upload functions (single file) ───────────────────────────────────────────
