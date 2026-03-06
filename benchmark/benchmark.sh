@@ -221,6 +221,20 @@ run_batch() {
     echo "$target,ALL,$total_size,$dur,$tput" >> "$CSV_FILE"
 }
 
+# ── Ensure S3 bucket exists ───────────────────────────────────────────────────
+
+for t in "${TARGETS[@]}"; do
+    if [[ "$t" == "s3" ]]; then
+        if ! aws s3api head-bucket --bucket "$S3_BUCKET" \
+            ${S3_ENDPOINT_URL:+--endpoint-url "$S3_ENDPOINT_URL"} 2>/dev/null; then
+            echo "Creating S3 bucket: $S3_BUCKET"
+            aws s3api create-bucket --bucket "$S3_BUCKET" \
+                ${S3_ENDPOINT_URL:+--endpoint-url "$S3_ENDPOINT_URL"}
+        fi
+        break
+    fi
+done
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 echo "Benchmark mode: $MODE"
