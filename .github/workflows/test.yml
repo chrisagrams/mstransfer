@@ -28,6 +28,9 @@ jobs:
       - name: Lint
         run: uv run ruff check .
 
+      - name: Type check (mypy)
+        run: uv run mypy src/
+
       - name: Run tests with coverage
         run: uv run pytest --cov=mstransfer --cov-report=term-missing --cov-report=xml
 
