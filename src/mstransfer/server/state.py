@@ -6,7 +6,10 @@ from typing import TYPE_CHECKING
 
 from starlette.datastructures import State
 
-from mstransfer.server.models import TransferRecord, TransferState
+from mstransfer.server.models import StoreFormat, TransferRecord, TransferState
+
+if TYPE_CHECKING:
+    from mstransfer.server.fileprovider import FileProvider
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -16,14 +19,21 @@ class AppState(State):
     """Application state object to hold configuration and transfer registry."""
 
     output_dir: Path
-    store_as: str
+    store_as: StoreFormat
     transfers: TransferRegistry
+    files: FileProvider
 
-    def __init__(self, output_dir: Path, store_as: str) -> None:
+    def __init__(
+        self,
+        output_dir: Path,
+        store_as: StoreFormat,
+        files: FileProvider,
+    ) -> None:
         super().__init__()
         self.output_dir = output_dir
         self.store_as = store_as
         self.transfers = TransferRegistry()
+        self.files = files
 
 
 class TransferRegistry:
