@@ -156,3 +156,11 @@ uv sync --dev
 uv run pytest
 uv run ruff check src/ tests/
 ```
+
+### Pre-commit hooks
+
+Install the pre-commit hooks to automatically run linting, type checking, and tests before each commit:
+
+```bash
+uv run pre-commit install
+```
