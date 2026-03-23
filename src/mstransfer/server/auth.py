@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hmac
+from collections.abc import Awaitable, Callable
 from typing import Any, Protocol, runtime_checkable
 
 from fastapi import HTTPException, Request
@@ -53,7 +54,9 @@ class APIKeyAuthProvider:
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
 
-def make_auth_dependency(provider: AuthProvider):
+def make_auth_dependency(
+    provider: AuthProvider,
+) -> Callable[[Request], Awaitable[AuthContext]]:
     """Convert an AuthProvider into a FastAPI dependency callable."""
 
     async def _dependency(request: Request) -> AuthContext:

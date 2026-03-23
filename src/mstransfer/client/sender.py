@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Sequence
+    from collections.abc import Callable, Generator, Iterable, Sequence
 
 import httpx
 from mscompress import MSZFile, MZMLFile
@@ -70,7 +70,9 @@ def resolve_inputs(paths: list[str], recursive: bool = False) -> list[Path]:
     return sorted(set(result))
 
 
-def _counting_generator(iterator, callback: Callable[[int], None] | None = None):
+def _counting_generator(
+    iterator: Iterable[bytes], callback: Callable[[int], None] | None = None
+) -> Generator[bytes, None, None]:
     """Wrap an iterator, calling callback with byte count per chunk."""
     for chunk in iterator:
         if callback:
@@ -82,7 +84,7 @@ def _file_chunk_generator(
     file_path: Path,
     chunk_size: int = 1_048_576,
     callback: Callable[[int], None] | None = None,
-):
+) -> Generator[bytes, None, None]:
     """Read a file in chunks, calling callback with each chunk's size."""
     with open(file_path, "rb") as f:
         while True:
@@ -126,7 +128,7 @@ def send_file(
         mzml_obj = None
     elif isinstance(source, Path):
         file_path = source
-        filetype = detect_filetype(str(file_path))
+        filetype = detect_filetype(str(file_path)) or ""
         if filetype not in VALID_FORMATS:
             raise ValueError(f"Unsupported file type for {file_path}: {filetype}")
         mzml_obj = MZMLFile(str(file_path).encode()) if filetype == "mzML" else None
@@ -266,12 +268,12 @@ def send_batch(
             if progress:
                 progress.file_started(idx, fpath, total_bytes)
 
-            def make_callback(i: int):
+            def make_callback(i: int) -> Callable[[int], None]:
                 """
                 Create a callback function that captures the file index for progress.
                 """
 
-                def cb(delta: int):
+                def cb(delta: int) -> None:
                     if progress:
                         progress.file_progress(i, delta)
 
