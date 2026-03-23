@@ -249,14 +249,14 @@ def send_batch(
             # Extract a Path for progress reporting and metadata.
             if isinstance(source, MSZXFile):
                 fpath = source.archive_path
-            elif isinstance(source, (MZMLFile, MSZFile)):
+            elif isinstance(source, MZMLFile | MSZFile):
                 fpath = Path(source.path.decode())
             else:
                 fpath = source
 
             # We can determine total bytes for compressed files (MSZ/MSZX).
             # For mzML, compression is on-the-fly so the total is unknown.
-            if isinstance(source, (MSZFile, MSZXFile)):
+            if isinstance(source, MSZFile | MSZXFile):
                 total_bytes = fpath.stat().st_size
             elif isinstance(source, MZMLFile):
                 total_bytes = None
