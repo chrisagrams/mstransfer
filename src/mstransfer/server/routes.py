@@ -8,10 +8,12 @@ from typing import TYPE_CHECKING, Any
 import aiofiles
 import aiofiles.os
 from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import StreamingResponse
 from mscompress import MSZFile
 
 from mstransfer import __version__
 from mstransfer.server.models import (
+    FileListResponse,
     HealthResponse,
     TransferRecord,
     TransferState,
@@ -19,7 +21,7 @@ from mstransfer.server.models import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import AsyncGenerator, Callable
 
     from mstransfer.server.state import AppState
 
@@ -199,4 +201,53 @@ def make_router(auth_dep: Callable[..., Any] | None = None) -> APIRouter:
             bytes_received=final.bytes_received,
         )
 
+    @router.get("/files", dependencies=protected)
+    async def list_files(state: AppState = StateDep) -> FileListResponse:
+        """List all files available for download.
+
+        Note: ``response_model`` is intentionally omitted so that
+        custom :class:`~mstransfer.server.models.FileInfo` subclass
+        fields (added by a custom :class:`FileProvider`) are preserved
+        in the response via ``SerializeAsAny``.
+        """
+        files = await state.files.list_files()
+        return FileListResponse(files=files)
+
+    @router.get("/files/{filename}", dependencies=protected)
+    async def download_file(
+        filename: str, state: AppState = StateDep
+    ) -> StreamingResponse:
+        """Download a single file by name."""
+        path = await state.files.get_file(filename)
+        if path is None:
+            raise HTTPException(status_code=404, detail="File not found")
+
+        stat = await aiofiles.os.stat(path)
+        content_type = (
+            "application/xml"
+            if path.suffix.lower() == ".mzml"
+            else "application/octet-stream"
+        )
+
+        return StreamingResponse(
+            _stream_file(path),
+            media_type=content_type,
+            headers={
+                "Content-Length": str(stat.st_size),
+                "Content-Disposition": f'attachment; filename="{path.name}"',
+            },
+        )
+
     return router
+
+
+async def _stream_file(
+    path: Path, chunk_size: int = 1_048_576
+) -> AsyncGenerator[bytes, None]:
+    """Async generator that reads a file in chunks."""
+    async with aiofiles.open(path, "rb") as f:
+        while True:
+            chunk = await f.read(chunk_size)
+            if not chunk:
+                break
+            yield chunk

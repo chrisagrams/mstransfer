@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import socket
 import sys
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import httpx
@@ -10,12 +11,11 @@ import uvicorn
 from rich.live import Live
 from rich.table import Table
 
+from mstransfer.client.downloader import DownloadRequest, download_batch
 from mstransfer.client.sender import resolve_inputs, send_batch
 from mstransfer.server.auth import APIKeyAuthProvider
 
 if TYPE_CHECKING:
-    from pathlib import Path
-
     from rich.progress import TaskID
 
 from mstransfer.log import (
@@ -180,6 +180,82 @@ def cmd_upload(args: argparse.Namespace) -> None:
         console.print(f"\n[green]All {ok} file(s) transferred successfully.")
 
 
+class DownloadProgressDisplay:
+    """Rich-based implementation of BatchDownloadProgress for the CLI."""
+
+    def __init__(self, total_files: int) -> None:
+        self.overall = make_overall_progress()
+        self.files = make_file_progress()
+        self.overall_task = self.overall.add_task("Downloading", total=total_files)
+        self.table = Table.grid()
+        self.table.add_row(self.overall)
+        self.table.add_row(self.files)
+        self._task_ids: dict[str, TaskID] = {}
+
+    def on_file_start(self, filename: str, total_bytes: int | None) -> None:
+        task_id = self.files.add_task(filename, total=total_bytes)
+        self._task_ids[filename] = task_id
+
+    def on_file_progress(self, filename: str, bytes_delta: int) -> None:
+        self.files.advance(self._task_ids[filename], bytes_delta)
+
+    def on_file_complete(self, filename: str) -> None:
+        task_id = self._task_ids[filename]
+        desc = self.files.tasks[task_id].description
+        self.files.update(task_id, description=f"[green]{desc}")
+        self.overall.advance(self.overall_task)
+
+    def on_file_error(self, filename: str, error: Exception) -> None:  # noqa: ARG002
+        task_id = self._task_ids[filename]
+        desc = self.files.tasks[task_id].description
+        self.files.update(task_id, description=f"[red]{desc}")
+        self.overall.advance(self.overall_task)
+
+
+def cmd_download(args: argparse.Namespace) -> None:
+    setup_logging()
+
+    if not args.urls:
+        console.print("[red]Usage: mstransfer download <url>... --output-dir <dir>")
+        sys.exit(1)
+
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Build download requests from the URL list.
+    requests: list[DownloadRequest] = []
+    for url in args.urls:
+        # Derive filename from the URL path.
+        filename = url.rstrip("/").rsplit("/", 1)[-1] or "download"
+        dest = output_dir / filename
+        requests.append(DownloadRequest(url=url, dest=dest))
+
+    console.print(
+        f"Downloading [bold]{len(requests)}[/] file(s) to "
+        f"[cyan]{output_dir}[/] (parallel={args.parallel})"
+    )
+
+    display = DownloadProgressDisplay(len(requests))
+
+    with Live(display.table, console=console, refresh_per_second=10):
+        results = download_batch(
+            requests,
+            store_as=args.store_as,
+            parallel=args.parallel,
+            chunk_size=args.chunk_size,
+            progress=display,
+            skip_existing=args.skip_existing,
+            force=args.force,
+        )
+
+    ok = len(results)
+    fail = len(requests) - ok
+    if fail:
+        console.print(f"\n[green]{ok} succeeded[/], [red]{fail} failed[/]")
+    else:
+        console.print(f"\n[green]All {ok} file(s) downloaded successfully.")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="mstransfer",
@@ -241,6 +317,50 @@ def main() -> None:
         help="API key for authenticating with the server",
     )
     sp.set_defaults(func=cmd_upload)
+
+    # --- download ---
+    dp = sub.add_parser("download", help="Download files from URLs")
+    dp.add_argument(
+        "urls",
+        nargs="+",
+        help="URLs to download",
+    )
+    dp.add_argument(
+        "--output-dir",
+        "-o",
+        default="./downloads",
+        help="Directory to save downloaded files (default: ./downloads)",
+    )
+    dp.add_argument(
+        "--parallel",
+        "-p",
+        type=int,
+        default=4,
+        help="Concurrent downloads (default: 4)",
+    )
+    dp.add_argument(
+        "--chunk-size",
+        type=int,
+        default=1_048_576,
+        help="Download chunk size in bytes (default: 1048576)",
+    )
+    dp.add_argument(
+        "--store-as",
+        choices=["msz", "mzml"],
+        default=None,
+        help="Convert downloaded files to this format (default: keep as-is)",
+    )
+    dp.add_argument(
+        "--skip-existing",
+        action="store_true",
+        help="Skip download if destination file already exists",
+    )
+    dp.add_argument(
+        "--force",
+        action="store_true",
+        help="Re-download even if destination file exists",
+    )
+    dp.set_defaults(func=cmd_download)
 
     args = parser.parse_args()
     args.func(args)

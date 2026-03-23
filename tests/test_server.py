@@ -8,6 +8,7 @@ from datetime import datetime, timedelta
 import pytest
 from mscompress import MZMLFile
 
+from mstransfer.server.fileprovider import DirectoryFileProvider
 from mstransfer.server.models import TransferState
 from mstransfer.server.state import TransferRegistry
 
@@ -284,3 +285,180 @@ async def test_decompress_does_not_block_event_loop(mzml_client, tmp_output, tes
     upload_resp = await upload_task
     assert upload_resp.status_code == 200
     assert upload_resp.json()["state"] == "done"
+
+
+# ---------------------------------------------------------------------------
+# DirectoryFileProvider unit tests
+# ---------------------------------------------------------------------------
+
+
+class TestDirectoryFileProvider:
+    @pytest.mark.asyncio
+    async def test_list_files_empty(self, tmp_path):
+        provider = DirectoryFileProvider(tmp_path)
+        files = await provider.list_files()
+        assert files == []
+
+    @pytest.mark.asyncio
+    async def test_list_files_finds_msz_and_mzml(self, tmp_path):
+        (tmp_path / "a.msz").write_bytes(b"msz data")
+        (tmp_path / "b.mzML").write_bytes(b"mzml data")
+        (tmp_path / "c.txt").write_bytes(b"not a ms file")
+
+        provider = DirectoryFileProvider(tmp_path)
+        files = await provider.list_files()
+        names = [f.name for f in files]
+        assert "a.msz" in names
+        assert "b.mzML" in names
+        assert "c.txt" not in names
+
+    @pytest.mark.asyncio
+    async def test_list_files_reports_correct_metadata(self, tmp_path):
+        content = b"x" * 100
+        (tmp_path / "test.msz").write_bytes(content)
+
+        provider = DirectoryFileProvider(tmp_path)
+        files = await provider.list_files()
+        assert len(files) == 1
+        assert files[0].name == "test.msz"
+        assert files[0].size_bytes == 100
+        assert files[0].format == "msz"
+
+    @pytest.mark.asyncio
+    async def test_list_files_sorted(self, tmp_path):
+        (tmp_path / "z.msz").write_bytes(b"z")
+        (tmp_path / "a.msz").write_bytes(b"a")
+
+        provider = DirectoryFileProvider(tmp_path)
+        files = await provider.list_files()
+        assert [f.name for f in files] == ["a.msz", "z.msz"]
+
+    @pytest.mark.asyncio
+    async def test_get_file_exists(self, tmp_path):
+        (tmp_path / "test.msz").write_bytes(b"data")
+        provider = DirectoryFileProvider(tmp_path)
+        path = await provider.get_file("test.msz")
+        assert path is not None
+        assert path.name == "test.msz"
+
+    @pytest.mark.asyncio
+    async def test_get_file_not_found(self, tmp_path):
+        provider = DirectoryFileProvider(tmp_path)
+        assert await provider.get_file("nonexistent.msz") is None
+
+    @pytest.mark.asyncio
+    async def test_get_file_rejects_traversal(self, tmp_path):
+        provider = DirectoryFileProvider(tmp_path)
+        assert await provider.get_file("../etc/passwd") is None
+        assert await provider.get_file("sub/file.msz") is None
+        assert await provider.get_file("..\\secret") is None
+
+    @pytest.mark.asyncio
+    async def test_get_file_rejects_empty(self, tmp_path):
+        provider = DirectoryFileProvider(tmp_path)
+        assert await provider.get_file("") is None
+
+
+# ---------------------------------------------------------------------------
+# File listing and download route tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_list_files_empty(msz_client):
+    """Fresh server with no uploads returns empty file list."""
+    resp = await msz_client.get("/v1/files")
+    assert resp.status_code == 200
+    assert resp.json() == {"files": []}
+
+
+@pytest.mark.asyncio
+async def test_list_files_after_upload(msz_client, test_msz):
+    """Uploaded file appears in the file listing."""
+    payload = test_msz.read_bytes()
+    await msz_client.post(
+        "/v1/upload",
+        content=payload,
+        headers={
+            "X-Transfer-ID": "list-test",
+            "X-Original-Filename": "test.msz",
+        },
+    )
+
+    resp = await msz_client.get("/v1/files")
+    assert resp.status_code == 200
+    files = resp.json()["files"]
+    assert len(files) == 1
+    assert files[0]["name"] == "test.msz"
+    assert files[0]["size_bytes"] == len(payload)
+    assert files[0]["format"] == "msz"
+
+
+@pytest.mark.asyncio
+async def test_download_msz(msz_client, test_msz):
+    """Download a previously uploaded .msz file."""
+    payload = test_msz.read_bytes()
+    await msz_client.post(
+        "/v1/upload",
+        content=payload,
+        headers={
+            "X-Transfer-ID": "dl-msz",
+            "X-Original-Filename": "test.msz",
+        },
+    )
+
+    resp = await msz_client.get("/v1/files/test.msz")
+    assert resp.status_code == 200
+    assert resp.content == payload
+    assert resp.headers["content-disposition"] == 'attachment; filename="test.msz"'
+    assert resp.headers["content-length"] == str(len(payload))
+
+
+@pytest.mark.asyncio
+async def test_download_mzml(mzml_client, test_msz, test_mzml):
+    """Download from an mzml-mode server returns the decompressed file."""
+    payload = test_msz.read_bytes()
+    await mzml_client.post(
+        "/v1/upload",
+        content=payload,
+        headers={
+            "X-Transfer-ID": "dl-mzml",
+            "X-Original-Filename": "test.msz",
+        },
+    )
+
+    resp = await mzml_client.get("/v1/files/test.mzML")
+    assert resp.status_code == 200
+    assert len(resp.content) == test_mzml.stat().st_size
+    assert resp.headers["content-type"] == "application/xml"
+
+
+@pytest.mark.asyncio
+async def test_download_not_found(msz_client):
+    """Requesting a file that doesn't exist returns 404."""
+    resp = await msz_client.get("/v1/files/nonexistent.msz")
+    assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_download_directory_traversal(msz_client):
+    """Path traversal attempts are rejected."""
+    resp = await msz_client.get("/v1/files/..%2F..%2Fetc%2Fpasswd")
+    assert resp.status_code == 404
+
+    resp = await msz_client.get("/v1/files/..%5Csecret")
+    assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_list_files_auth_required(authed_client):
+    """File listing requires auth when configured."""
+    resp = await authed_client.get("/v1/files")
+    assert resp.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_download_auth_required(authed_client):
+    """File download requires auth when configured."""
+    resp = await authed_client.get("/v1/files/test.msz")
+    assert resp.status_code == 401

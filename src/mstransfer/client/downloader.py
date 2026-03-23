@@ -1,0 +1,287 @@
+from __future__ import annotations
+
+import logging
+import os
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
+from pathlib import Path
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
+
+import httpx
+from mscompress import MSZFile, MZMLFile
+
+if TYPE_CHECKING:
+    from mstransfer.server.models import StoreFormat
+
+logger = logging.getLogger(__name__)
+
+
+def _detect_source_format(url: str) -> str | None:
+    """Infer the source format from the URL filename extension.
+
+    Returns ``"msz"``, ``"mzml"``, or *None* if the format cannot be
+    determined.
+    """
+    # Strip query params and fragments before inspecting extension.
+    path = url.split("?", 1)[0].split("#", 1)[0]
+    ext = Path(path).suffix.lower()
+    if ext == ".msz":
+        return "msz"
+    if ext == ".mzml":
+        return "mzml"
+    return None
+
+
+def _resolve_dest(
+    dest: Path, store_as: StoreFormat | None, source_fmt: str | None
+) -> Path:
+    """Adjust *dest* extension when *store_as* differs from the source."""
+    if store_as is None or source_fmt is None or store_as == source_fmt:
+        return dest
+    # Replace the extension to match the target format.
+    ext = ".msz" if store_as == "msz" else ".mzML"
+    return dest.with_suffix(ext)
+
+
+@runtime_checkable
+class DownloadProgressCallback(Protocol):
+    """Callback protocol for observing single-file download progress."""
+
+    def on_progress(self, bytes_delta: int) -> None: ...
+
+
+@runtime_checkable
+class BatchDownloadProgress(Protocol):
+    """Callback protocol for observing batch download progress."""
+
+    def on_file_start(self, filename: str, total_bytes: int | None) -> None: ...
+    def on_file_progress(self, filename: str, bytes_delta: int) -> None: ...
+    def on_file_complete(self, filename: str) -> None: ...
+    def on_file_error(self, filename: str, error: Exception) -> None: ...
+
+
+@dataclass
+class DownloadRequest:
+    """A single download request: URL to fetch and local destination path."""
+
+    url: str
+    dest: Path
+
+
+def download_file(
+    url: str,
+    dest: Path,
+    *,
+    store_as: StoreFormat | None = None,
+    chunk_size: int = 1_048_576,
+    connect_timeout: float = 10.0,
+    read_timeout: float = 300.0,
+    progress_callback: DownloadProgressCallback | None = None,
+    skip_existing: bool = False,
+    force: bool = False,
+) -> Path:
+    """Download a single file from *url* to *dest*.
+
+    The file is streamed to a temporary ``.part`` file first, then atomically
+    renamed (or converted) to the final destination on success.
+
+    Parameters
+    ----------
+    url:
+        The URL to download from.
+    dest:
+        The local path where the file should be saved.  If *store_as*
+        requires a format conversion, the extension will be adjusted
+        automatically.
+    store_as:
+        Desired output format — ``"msz"``, ``"mzml"``, or *None* to keep
+        the file as-is.  When set, the downloaded file is compressed or
+        decompressed after download using **mscompress**.
+    chunk_size:
+        Number of bytes per read chunk (default 1 MiB).
+    connect_timeout:
+        Timeout in seconds for establishing the connection.
+    read_timeout:
+        Timeout in seconds for reading the response body.
+    progress_callback:
+        Optional callback invoked with byte deltas per chunk.
+    skip_existing:
+        If *True* and the final destination already exists, skip the
+        download.
+    force:
+        If *True*, re-download even if the destination already exists
+        (overrides *skip_existing*).
+
+    Returns
+    -------
+    Path
+        The final destination path (may differ from *dest* if the
+        extension was adjusted for format conversion).
+    """
+    source_fmt = _detect_source_format(url)
+    final_dest = _resolve_dest(dest, store_as, source_fmt)
+
+    # Skip if file already exists and we're not forcing.
+    if not force and skip_existing and final_dest.exists():
+        logger.info("Skipping existing file: %s", final_dest)
+        return final_dest
+
+    # Ensure the parent directory exists.
+    final_dest.parent.mkdir(parents=True, exist_ok=True)
+
+    # Write to a temp .part file to avoid partial downloads.
+    part_path = dest.with_suffix(dest.suffix + ".part")
+
+    timeout = httpx.Timeout(read_timeout, connect=connect_timeout)
+
+    with httpx.Client(timeout=timeout) as client, client.stream("GET", url) as resp:
+        resp.raise_for_status()
+
+        with open(part_path, "wb") as f:
+            for chunk in resp.iter_bytes(chunk_size=chunk_size):
+                f.write(chunk)
+                if progress_callback:
+                    progress_callback.on_progress(len(chunk))
+
+    # Determine whether a format conversion is needed.
+    needs_conversion = (
+        store_as is not None and source_fmt is not None and store_as != source_fmt
+    )
+
+    if not needs_conversion:
+        # No conversion — atomic rename to final destination.
+        part_path.rename(final_dest)
+        return final_dest
+
+    # Conversion required — give the temp file the correct source extension
+    # so mscompress can recognise its format, then convert.
+    src_ext = ".msz" if source_fmt == "msz" else ".mzML"
+    tmp_source = part_path.with_suffix(src_ext)
+    part_path.rename(tmp_source)
+
+    try:
+        if source_fmt == "msz" and store_as == "mzml":
+            msz = MSZFile(str(tmp_source).encode())
+            msz.decompress(str(final_dest))
+            logger.info("Decompressed %s → %s", tmp_source.name, final_dest.name)
+        elif source_fmt == "mzml" and store_as == "msz":
+            mzml = MZMLFile(str(tmp_source).encode())
+            mzml.compress(str(final_dest))
+            logger.info("Compressed %s → %s", tmp_source.name, final_dest.name)
+    finally:
+        # Clean up the intermediate source file.
+        if tmp_source.exists():
+            os.remove(tmp_source)
+
+    return final_dest
+
+
+def download_batch(
+    files: list[DownloadRequest],
+    *,
+    store_as: StoreFormat | None = None,
+    parallel: int = 4,
+    chunk_size: int = 1_048_576,
+    connect_timeout: float = 10.0,
+    read_timeout: float = 300.0,
+    progress: BatchDownloadProgress | None = None,
+    skip_existing: bool = False,
+    force: bool = False,
+) -> list[Path]:
+    """Download multiple files in parallel.
+
+    Parameters
+    ----------
+    files:
+        List of :class:`DownloadRequest` objects (url + dest pairs).
+    store_as:
+        Desired output format — ``"msz"``, ``"mzml"``, or *None* to keep
+        files as-is.  Forwarded to each :func:`download_file` call.
+    parallel:
+        Maximum number of concurrent downloads (capped to file count).
+    chunk_size:
+        Number of bytes per read chunk.
+    connect_timeout:
+        Timeout in seconds for establishing each connection.
+    read_timeout:
+        Timeout in seconds for reading each response body.
+    progress:
+        Optional batch progress callback.
+    skip_existing:
+        If *True*, skip files whose destination already exists.
+    force:
+        If *True*, re-download even if destination exists.
+
+    Returns
+    -------
+    list[Path]
+        List of final destination paths (in completion order).
+    """
+    workers = min(parallel, len(files))
+    results: list[Path] = []
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures: dict[Future[Path], DownloadRequest] = {}
+
+        for req in files:
+            filename = req.dest.name
+
+            # Try to determine total bytes from a HEAD request (best-effort).
+            total_bytes: int | None = None
+            if progress:
+                try:
+                    head_resp = httpx.head(
+                        req.url, timeout=connect_timeout, follow_redirects=True
+                    )
+                    cl = head_resp.headers.get("content-length")
+                    if cl is not None:
+                        total_bytes = int(cl)
+                except Exception:  # noqa: BLE001
+                    pass
+                progress.on_file_start(filename, total_bytes)
+
+            # Build a per-file progress adapter that implements
+            # DownloadProgressCallback by forwarding to BatchDownloadProgress.
+            file_progress: _FileProgressAdapter | None = None
+            if progress:
+                file_progress = _FileProgressAdapter(filename, progress)
+
+            future = pool.submit(
+                download_file,
+                req.url,
+                req.dest,
+                store_as=store_as,
+                chunk_size=chunk_size,
+                connect_timeout=connect_timeout,
+                read_timeout=read_timeout,
+                progress_callback=file_progress,
+                skip_existing=skip_existing,
+                force=force,
+            )
+            futures[future] = req
+
+        for future in as_completed(futures):
+            req = futures[future]
+            filename = req.dest.name
+            try:
+                result = future.result()
+                results.append(result)
+                if progress:
+                    progress.on_file_complete(filename)
+            except Exception as exc:
+                if progress:
+                    progress.on_file_error(filename, exc)
+                logger.error("Failed to download %s: %s", filename, exc)
+
+    return results
+
+
+class _FileProgressAdapter:
+    """Adapts :class:`BatchDownloadProgress` to :class:`DownloadProgressCallback`."""
+
+    def __init__(self, filename: str, batch: BatchDownloadProgress) -> None:
+        self._filename = filename
+        self._batch = batch
+
+    def on_progress(self, bytes_delta: int) -> None:
+        self._batch.on_file_progress(self._filename, bytes_delta)
