@@ -25,7 +25,8 @@ if TYPE_CHECKING:
 
 
 def get_state(request: Request) -> AppState:
-    return request.app.state
+    state: AppState = request.app.state
+    return state
 
 
 StateDep = Depends(get_state)
