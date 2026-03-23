@@ -12,7 +12,9 @@ import httpx
 import pytest
 
 from mstransfer.cli import (
+    DownloadProgressDisplay,
     UploadProgressDisplay,
+    cmd_download,
     cmd_serve,
     cmd_upload,
     main,
@@ -459,6 +461,170 @@ class TestUploadProgressDisplay:
 
 
 # ---------------------------------------------------------------------------
+# cmd_download tests
+# ---------------------------------------------------------------------------
+
+
+class TestCmdDownload:
+    def _make_args(self, urls, **overrides):
+        defaults = {
+            "urls": urls,
+            "output_dir": "./downloads",
+            "store_as": None,
+            "parallel": 4,
+            "chunk_size": 1_048_576,
+            "skip_existing": False,
+            "force": False,
+        }
+        defaults.update(overrides)
+        return argparse.Namespace(**defaults)
+
+    def test_no_urls_exits(self):
+        """download with no URLs should exit."""
+        args = self._make_args([])
+        with pytest.raises(SystemExit, match="1"):
+            cmd_download(args)
+
+    @patch("mstransfer.cli.download_batch")
+    def test_successful_download(self, mock_batch, tmp_path):
+        dest = tmp_path / "file.msz"
+        mock_batch.return_value = [dest]
+
+        args = self._make_args(
+            ["http://host/file.msz"],
+            output_dir=str(tmp_path),
+        )
+        cmd_download(args)
+
+        mock_batch.assert_called_once()
+        call_kwargs = mock_batch.call_args[1]
+        assert call_kwargs["parallel"] == 4
+        assert call_kwargs["store_as"] is None
+
+    @patch("mstransfer.cli.download_batch")
+    def test_partial_failure(self, mock_batch, tmp_path):
+        """One failure does not prevent reporting."""
+        # Return only 1 result for 2 requests → 1 failure
+        mock_batch.return_value = [tmp_path / "a.msz"]
+
+        args = self._make_args(
+            ["http://host/a.msz", "http://host/b.msz"],
+            output_dir=str(tmp_path),
+        )
+        # Should not raise — just prints summary
+        cmd_download(args)
+
+    @patch("mstransfer.cli.download_batch")
+    def test_passes_store_as(self, mock_batch, tmp_path):
+        mock_batch.return_value = [tmp_path / "file.mzML"]
+
+        args = self._make_args(
+            ["http://host/file.msz"],
+            output_dir=str(tmp_path),
+            store_as="mzml",
+        )
+        cmd_download(args)
+
+        call_kwargs = mock_batch.call_args[1]
+        assert call_kwargs["store_as"] == "mzml"
+
+    @patch("mstransfer.cli.download_batch")
+    def test_passes_parallel_and_chunk_size(self, mock_batch, tmp_path):
+        mock_batch.return_value = [tmp_path / "file.msz"]
+
+        args = self._make_args(
+            ["http://host/file.msz"],
+            output_dir=str(tmp_path),
+            parallel=8,
+            chunk_size=4_194_304,
+        )
+        cmd_download(args)
+
+        call_kwargs = mock_batch.call_args[1]
+        assert call_kwargs["parallel"] == 8
+        assert call_kwargs["chunk_size"] == 4_194_304
+
+    @patch("mstransfer.cli.download_batch")
+    def test_passes_skip_existing_and_force(self, mock_batch, tmp_path):
+        mock_batch.return_value = []
+
+        args = self._make_args(
+            ["http://host/file.msz"],
+            output_dir=str(tmp_path),
+            skip_existing=True,
+            force=True,
+        )
+        cmd_download(args)
+
+        call_kwargs = mock_batch.call_args[1]
+        assert call_kwargs["skip_existing"] is True
+        assert call_kwargs["force"] is True
+
+
+# ---------------------------------------------------------------------------
+# DownloadProgressDisplay tests
+# ---------------------------------------------------------------------------
+
+
+class TestDownloadProgressDisplay:
+    def test_on_file_start_adds_task(self):
+        display = DownloadProgressDisplay(total_files=2)
+        display.on_file_start("a.msz", total_bytes=1000)
+
+        assert "a.msz" in display._task_ids
+        task = display.files.tasks[display._task_ids["a.msz"]]
+        assert task.description == "a.msz"
+        assert task.total == 1000
+
+    def test_on_file_progress_advances(self):
+        display = DownloadProgressDisplay(total_files=1)
+        display.on_file_start("a.msz", total_bytes=1000)
+        display.on_file_progress("a.msz", 500)
+
+        task = display.files.tasks[display._task_ids["a.msz"]]
+        assert task.completed == 500
+
+    def test_on_file_complete_marks_green(self):
+        display = DownloadProgressDisplay(total_files=1)
+        display.on_file_start("a.msz", total_bytes=1000)
+        display.on_file_complete("a.msz")
+
+        task = display.files.tasks[display._task_ids["a.msz"]]
+        assert task.description == "[green]a.msz"
+
+    def test_on_file_error_marks_red(self):
+        display = DownloadProgressDisplay(total_files=1)
+        display.on_file_start("a.msz", total_bytes=1000)
+        display.on_file_error("a.msz", RuntimeError("boom"))
+
+        task = display.files.tasks[display._task_ids["a.msz"]]
+        assert task.description == "[red]a.msz"
+
+    def test_overall_advances_on_complete(self):
+        display = DownloadProgressDisplay(total_files=2)
+        display.on_file_start("a.msz", total_bytes=100)
+        display.on_file_complete("a.msz")
+
+        overall_task = display.overall.tasks[display.overall_task]
+        assert overall_task.completed == 1
+
+    def test_overall_advances_on_error(self):
+        display = DownloadProgressDisplay(total_files=2)
+        display.on_file_start("a.msz", total_bytes=100)
+        display.on_file_error("a.msz", RuntimeError("fail"))
+
+        overall_task = display.overall.tasks[display.overall_task]
+        assert overall_task.completed == 1
+
+    def test_none_total_bytes(self):
+        display = DownloadProgressDisplay(total_files=1)
+        display.on_file_start("a.msz", total_bytes=None)
+
+        task = display.files.tasks[display._task_ids["a.msz"]]
+        assert task.total is None
+
+
+# ---------------------------------------------------------------------------
 # main() entry point tests
 # ---------------------------------------------------------------------------
 
@@ -475,6 +641,12 @@ class TestMain:
         with patch("sys.argv", ["mstransfer", "upload", "file.mzML", "host"]):
             main()
         mock_cmd_upload.assert_called_once()
+
+    @patch("mstransfer.cli.cmd_download")
+    def test_main_dispatches_download(self, mock_cmd_download):
+        with patch("sys.argv", ["mstransfer", "download", "http://host/f.msz"]):
+            main()
+        mock_cmd_download.assert_called_once()
 
     def test_main_no_command_exits(self):
         with patch("sys.argv", ["mstransfer"]), pytest.raises(SystemExit):
