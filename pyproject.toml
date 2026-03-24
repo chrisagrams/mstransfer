@@ -1,6 +1,6 @@
 [project]
 name = "mstransfer"
-version = "0.3.0"
+version = "0.2.1"
 description = "Transfer mass spectrometry files (mzML/MSZ) between endpoints using mscompress"
 readme = "README.md"
 requires-python = ">=3.10"

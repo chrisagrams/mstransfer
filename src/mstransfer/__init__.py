@@ -1,6 +1,6 @@
 """mstransfer — Transfer mass spectrometry files between endpoints."""
 
-__version__ = "0.3.0"
+__version__ = "0.2.1"
 
 from mstransfer.server.app import create_app
 from mstransfer.server.auth import (
