@@ -667,39 +667,39 @@ wheels = [
 
 [[package]]
 name = "mscompress"
-version = "1.0.11"
+version = "1.0.13"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "mlcroissant" },
     { name = "numpy" },
     { name = "zstandard" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/74/ae/6657946627c308fcf2544c1d7af378a6ca062837a2621a7f2e75b9540cd8/mscompress-1.0.11.tar.gz", hash = "sha256:f2da8e94417fb19a06e351bcbbfc426416d1769b74c93d296954ff76ff76aafd", size = 2056277, upload-time = "2026-02-23T20:09:40.084Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/5d/2d/9fada4b5a45774d293f8f66347bcc2467d66a77d74cbd4a524125af57da1/mscompress-1.0.13.tar.gz", hash = "sha256:c6a04845eb9a1d9c4dfb34b61e538e3a4aabee5504491129940366b15a20da5e", size = 2058766, upload-time = "2026-03-25T20:05:53.856Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/a1/e5/4a77d5336058b548fba79dda162117ba124589d1c209153eb6e5b8db422c/mscompress-1.0.11-cp310-cp310-macosx_10_9_x86_64.whl", hash = "sha256:75a6d438fbcd3a46fd85b9fc31679b7eeb48aaddf71a28ae888deb113a77ee84", size = 1006752, upload-time = "2026-02-23T20:09:10.775Z" },
-    { url = "https://files.pythonhosted.org/packages/50/ce/b9116a93efe0ae19098b1722ff368432d17496b4e2810add13e4ab05bab6/mscompress-1.0.11-cp310-cp310-macosx_11_0_arm64.whl", hash = "sha256:f96b860899dc1665d08179819c349c0c3ff284a48d4bdd25a8e8e8a6ddaba7e8", size = 913906, upload-time = "2026-02-23T20:09:12.55Z" },
-    { url = "https://files.pythonhosted.org/packages/a4/c4/2f16b7a2610dd99a0b34c578ce9792e89ff713f8c8da3851f03e59e7659b/mscompress-1.0.11-cp310-cp310-manylinux_2_17_aarch64.manylinux2014_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:cf4a2c381386dfb0a2a01cd0dd977bc4ce8fe00ee79a96a4de05e38f4cb029a6", size = 4506764, upload-time = "2026-02-23T20:09:14.065Z" },
-    { url = "https://files.pythonhosted.org/packages/98/a9/b9f3723de166270754f3232949176da6bc3d85497bde8c7ee4fbef438ab1/mscompress-1.0.11-cp310-cp310-manylinux_2_17_x86_64.manylinux2014_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:62f69c1f349e58b568a6676b360d37a6f48fed91dd3dac52980bad4036cc4797", size = 4824301, upload-time = "2026-02-23T20:09:15.455Z" },
-    { url = "https://files.pythonhosted.org/packages/59/9d/c971be748da0c9ea64ed7f3f49ebf4d9d0809e677f5d84d65516f439e721/mscompress-1.0.11-cp310-cp310-win_amd64.whl", hash = "sha256:e4027296f740790d10bc687213f29323f69510ef3a2b9046de6f47295a7efa73", size = 709586, upload-time = "2026-02-23T20:09:17.008Z" },
-    { url = "https://files.pythonhosted.org/packages/6e/71/516d2cd26555cb6aeba806094619e331b9e94c0ed3a8810f679aab664c22/mscompress-1.0.11-cp311-cp311-macosx_10_9_x86_64.whl", hash = "sha256:79acc9d3e67ddb01e6512a31d22c7677be5e0660f1125da27c9a65973164248e", size = 1004525, upload-time = "2026-02-23T20:09:18.502Z" },
-    { url = "https://files.pythonhosted.org/packages/51/a9/04dfcd3e8ae2b41464036b19436410c81dea1c0af3441c90fdd8a61c107d/mscompress-1.0.11-cp311-cp311-macosx_11_0_arm64.whl", hash = "sha256:565b82748eeb3e16fb5b6c4f6982aa1b4bbc41dabd8a3745e86cd7b68a6e0cdc", size = 912700, upload-time = "2026-02-23T20:09:20.104Z" },
-    { url = "https://files.pythonhosted.org/packages/74/f3/427745e48ac1fca2b7388931e2b08e83a27e31610eebc91bd51901ce9ba4/mscompress-1.0.11-cp311-cp311-manylinux_2_17_aarch64.manylinux2014_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:5f0361ed1bf1f59aa25e97feef904a1f9b12117ac8b64cf6a991a2661390226d", size = 4572798, upload-time = "2026-02-23T20:09:21.44Z" },
-    { url = "https://files.pythonhosted.org/packages/80/99/a20a9239066fb9d072f16bb84d8c39f1e7daefd7a0824d8e955968294164/mscompress-1.0.11-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:d97f8f2274ec8284f452eed35e9a248af5e2fa1dee6d0e52d95fe6c92ebdee6f", size = 4883250, upload-time = "2026-02-23T20:09:23.333Z" },
-    { url = "https://files.pythonhosted.org/packages/60/40/c3dbedfc1b2425cbd710fd24b34dc6875dfffa5573c1c1179b658dc2aeef/mscompress-1.0.11-cp311-cp311-win_amd64.whl", hash = "sha256:6399ef7644737a26bb4d3feb9dcb2ff738a74fdeef3cbade1547e14e63a42dda", size = 710025, upload-time = "2026-02-23T20:09:25.238Z" },
-    { url = "https://files.pythonhosted.org/packages/9b/7d/15204a02365f89956527b7d8aa3f7d9471e55fa2dd098d37cec3d25e6709/mscompress-1.0.11-cp312-cp312-macosx_10_13_x86_64.whl", hash = "sha256:3556e0d5e3bedd2b0de60e7139a99a1165352125fcc2cf2a20cad865e781dd90", size = 1003623, upload-time = "2026-02-23T20:09:26.732Z" },
-    { url = "https://files.pythonhosted.org/packages/a6/42/296bc469b8af4df732f50395a6b254d4d6832d528595fcf062a0bdcfb4d0/mscompress-1.0.11-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:0c453271cc135985eacd9bd5ada5d858b80cf652e06293e130d06a6f2fd0a9d7", size = 912398, upload-time = "2026-02-23T20:09:27.941Z" },
-    { url = "https://files.pythonhosted.org/packages/22/ad/6122928f88ad196665746b65abb788e63edfc10570ac14875add41eb69d3/mscompress-1.0.11-cp312-cp312-manylinux_2_17_aarch64.manylinux2014_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:c12c4ffce7669d15d4fbed2c9175f763ff50ded34bd6e1a002478e7bdecd8ca7", size = 4494367, upload-time = "2026-02-23T20:09:29.557Z" },
-    { url = "https://files.pythonhosted.org/packages/b9/7a/40e2afc5cb519187a1b3f282c05bdade38d89e0fe953ceb8f9f7e08a3931/mscompress-1.0.11-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:3f907b6c3914cfeecd96a9b294b69ec9483ea1c5fdaaf70f68d0b2a8680bc123", size = 4814087, upload-time = "2026-02-23T20:09:31.261Z" },
-    { url = "https://files.pythonhosted.org/packages/14/88/895e3630b0c6cdfa34aff82ba01d797f2219cb07e452198e4e4155964ca8/mscompress-1.0.11-cp312-cp312-win_amd64.whl", hash = "sha256:21662f35778b2e61358b52f8f1892466d6c90359fe69150ea46a5340bb1cdcbf", size = 706367, upload-time = "2026-02-23T20:09:32.541Z" },
-    { url = "https://files.pythonhosted.org/packages/dd/10/468f87b461d90d9992a0b46c7796de60b795941adbd1edf154a5b0758050/mscompress-1.0.11-cp313-cp313-macosx_11_0_arm64.whl", hash = "sha256:b74ecd40b81291d375e1fc3a8b70f04e5cb9d2d5ba1d2224d8a8ec960b5c2d28", size = 912641, upload-time = "2026-02-23T20:09:33.834Z" },
-    { url = "https://files.pythonhosted.org/packages/10/c1/28048708c1ef12a7a37130430210856035eced811c2a6e62ebb914ed8711/mscompress-1.0.11-cp313-cp313-manylinux_2_17_aarch64.manylinux2014_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:4624d7364c12aa95ee64bb38809165e71144291774a3a1e05acb831b49717770", size = 4498979, upload-time = "2026-02-23T20:09:35.76Z" },
-    { url = "https://files.pythonhosted.org/packages/29/52/caa5dd3802e1edb0eeb01665828ed1089717bdc76f86b704af7d86a0f697/mscompress-1.0.11-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:77f357cd1a81041d1badcb7e319d876daf341507fbd3abf45d3dbe587fe830d4", size = 4813227, upload-time = "2026-02-23T20:09:37.141Z" },
-    { url = "https://files.pythonhosted.org/packages/d4/1c/6ce8e7d1eeea938bf3550735117598b8830933d50b87d3c40f6aa538fab9/mscompress-1.0.11-cp313-cp313-win_amd64.whl", hash = "sha256:edac1db94fcd97f79b98a0321eea083b50c8ea70b8264bfac08e8e6c98e261a7", size = 708449, upload-time = "2026-02-23T20:09:38.925Z" },
+    { url = "https://files.pythonhosted.org/packages/d9/71/a6b31fed331f613868ec2d4eba09dc75aa3ca0a92202d41907926c061992/mscompress-1.0.13-cp310-cp310-macosx_10_9_x86_64.whl", hash = "sha256:3e2aedff5a8a762b10b854b13fe69f527b536a441ee931cefdd417d3a687ed0f", size = 1007461, upload-time = "2026-03-25T20:05:23.575Z" },
+    { url = "https://files.pythonhosted.org/packages/f3/3b/472474687547948115871c381c0b08c53503855eb374e07870fdb422559f/mscompress-1.0.13-cp310-cp310-macosx_11_0_arm64.whl", hash = "sha256:09aca4723c09aa38ae4f055e41605c8f84b54f83a03997c9b4dfc3caed86e1c7", size = 914620, upload-time = "2026-03-25T20:05:25.233Z" },
+    { url = "https://files.pythonhosted.org/packages/5e/95/c063693503d8038118b107bde659862a3d2acc800352b776b4c51888d542/mscompress-1.0.13-cp310-cp310-manylinux_2_17_aarch64.manylinux2014_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:05669fd7a9d8ae0b2a90c322c9d3b8647e49c62df6c5517bac6670fe677cb982", size = 4508250, upload-time = "2026-03-25T20:05:26.936Z" },
+    { url = "https://files.pythonhosted.org/packages/4b/90/53427a0afdaf5758bd63eb652b427940a8e032e3f1a738cf4650502af6b9/mscompress-1.0.13-cp310-cp310-manylinux_2_17_x86_64.manylinux2014_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:4361e92abe65a9f45e66b672bb91c5640ecdfa7e6fe7fc33dce76cb341202486", size = 4825890, upload-time = "2026-03-25T20:05:28.396Z" },
+    { url = "https://files.pythonhosted.org/packages/7a/30/dce135f0570028e4e14318c95abe3cbd2fd5e036c17b14631aa137dbc721/mscompress-1.0.13-cp310-cp310-win_amd64.whl", hash = "sha256:98e5135286a7630bb85baedfa15e3ea959fe5153d739c709a6628bfbbc81c725", size = 710064, upload-time = "2026-03-25T20:05:30.21Z" },
+    { url = "https://files.pythonhosted.org/packages/09/30/ca927bb83e3297eef95ee76915a961d4faa7ec20b8b197d8dfc78e62a5c3/mscompress-1.0.13-cp311-cp311-macosx_10_9_x86_64.whl", hash = "sha256:a2cbaefed239770ddac233779fd1dba0623b8537ed73447ab6de7d3a973c2747", size = 1005234, upload-time = "2026-03-25T20:05:31.59Z" },
+    { url = "https://files.pythonhosted.org/packages/18/c5/5d42621f784be42100f38bc879035931a1bacff49d3e8b3eda4f668293b3/mscompress-1.0.13-cp311-cp311-macosx_11_0_arm64.whl", hash = "sha256:8608600c0980ecf892f2e8cee6a89d0ff766049a595ee6be045d45737ea275d5", size = 913485, upload-time = "2026-03-25T20:05:33.259Z" },
+    { url = "https://files.pythonhosted.org/packages/e3/56/f5abdb60ddab6472e9103c14d5f06639df8c24375ae2cced33f1700b039c/mscompress-1.0.13-cp311-cp311-manylinux_2_17_aarch64.manylinux2014_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:e2d0cb2c96303b8e3737baca63d720865ade59115b0041524981c543e15116f0", size = 4574146, upload-time = "2026-03-25T20:05:34.918Z" },
+    { url = "https://files.pythonhosted.org/packages/02/df/081ecea3e7eeaf2ef278005c4c2efa14719b118c7c0886754a2f19b79392/mscompress-1.0.13-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:423dc435f5e7cc43d84c9befa6098e1e2506570aee2c757e05a73ba15f6581d0", size = 4884335, upload-time = "2026-03-25T20:05:36.707Z" },
+    { url = "https://files.pythonhosted.org/packages/6e/aa/9473e11f445095d2fcbab9368c96c61c2c59534a37b0ba33c68f72695b11/mscompress-1.0.13-cp311-cp311-win_amd64.whl", hash = "sha256:6bd71b5557dd3b7a235ad3f07dc04e924d1e382b66290c45e5bab400ffd0be86", size = 710091, upload-time = "2026-03-25T20:05:38.218Z" },
+    { url = "https://files.pythonhosted.org/packages/65/02/45584cfcbdba75ab6c69ca603af35a79b21344c5ca07434bda124aa6730a/mscompress-1.0.13-cp312-cp312-macosx_10_13_x86_64.whl", hash = "sha256:d2c0b88a78058931a3cf412d01a9c066a36b36f69cc2f0d9b8ab2cf90d8459b0", size = 1004078, upload-time = "2026-03-25T20:05:39.864Z" },
+    { url = "https://files.pythonhosted.org/packages/a6/41/71de8d2093146ef521f807ed463dafe8b3079cea43fae080a8eeba75391f/mscompress-1.0.13-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:6fb3870dd5db86695a8285053eda832ac207062eb28e43798bed029ab915a9ec", size = 913141, upload-time = "2026-03-25T20:05:41.294Z" },
+    { url = "https://files.pythonhosted.org/packages/d7/99/c3ecdbe049085eb46a73cb7e091e84282a875f9bbeaec5dca8b88f4be3e6/mscompress-1.0.13-cp312-cp312-manylinux_2_17_aarch64.manylinux2014_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:260cbf515a6b2bad2e6fd61dbf054e2b611a30f16d3ec603867e154e54010d99", size = 4495774, upload-time = "2026-03-25T20:05:43.002Z" },
+    { url = "https://files.pythonhosted.org/packages/da/e1/0b77b756b0641e972b8275baf17008ce2c3871edd5415dcb7d92b813995b/mscompress-1.0.13-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:6471e26c66cb7a470df6d974b44346f09d51eb56846ded406fc07eaec811caee", size = 4815451, upload-time = "2026-03-25T20:05:44.734Z" },
+    { url = "https://files.pythonhosted.org/packages/a0/f8/0314ffe35e156d9b46e6acdd7b600fc0c55c0ce26176e5191ec867a7ad6f/mscompress-1.0.13-cp312-cp312-win_amd64.whl", hash = "sha256:3d09a0a06d52da51529f2cbdc347ad28e98a62c9c75e810cbccb9ecafeea4f5d", size = 706848, upload-time = "2026-03-25T20:05:46.451Z" },
+    { url = "https://files.pythonhosted.org/packages/b0/1b/3aed57765207673a9246fcc9942527f1a9332ad449106a71c6b9fff603c5/mscompress-1.0.13-cp313-cp313-macosx_11_0_arm64.whl", hash = "sha256:386a1f6d5c06b579a555a1df021ce9b5fd7b7043854879674980544d901db0e9", size = 913421, upload-time = "2026-03-25T20:05:47.911Z" },
+    { url = "https://files.pythonhosted.org/packages/b5/0d/82a97b7636d8a1f65ac2dea3de87449212f1950adcca8c730f8e3ebbe52f/mscompress-1.0.13-cp313-cp313-manylinux_2_17_aarch64.manylinux2014_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:d099e658d7139e2724e4d673e56dc445c486ad77a0f289a0caf142085c5062ec", size = 4500417, upload-time = "2026-03-25T20:05:49.402Z" },
+    { url = "https://files.pythonhosted.org/packages/d8/61/de65ddd64dd089f442bc6d74c613a6799e73189311435ed0a66f76873279/mscompress-1.0.13-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:1d8efa6fd5ad3579184f38833cf215e2b20e81d404873fe3bf6742c93c2bb142", size = 4814443, upload-time = "2026-03-25T20:05:50.902Z" },
+    { url = "https://files.pythonhosted.org/packages/41/57/1f00e75967d181b4d9491126721a7fbd5fbe6b58958bce3a56567f970361/mscompress-1.0.13-cp313-cp313-win_amd64.whl", hash = "sha256:57e582df13d3a08bb3a3834515675183a0b97af27930f9ca73bc29cb6b854418", size = 708574, upload-time = "2026-03-25T20:05:52.552Z" },
 ]
 
 [[package]]
 name = "mstransfer"
-version = "0.3.0"
+version = "0.2.1"
 source = { editable = "." }
 dependencies = [
     { name = "aiofiles" },
@@ -729,7 +729,7 @@ requires-dist = [
     { name = "aiofiles" },
     { name = "fastapi" },
     { name = "httpx" },
-    { name = "mscompress" },
+    { name = "mscompress", specifier = ">=1.0.13" },
     { name = "pydantic", specifier = ">=2.0" },
     { name = "python-multipart" },
     { name = "rich" },
