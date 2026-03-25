@@ -1,11 +1,11 @@
 [project]
 name = "mstransfer"
-version = "0.2.1"
+version = "0.2.2"
 description = "Transfer mass spectrometry files (mzML/MSZ) between endpoints using mscompress"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "mscompress",
+    "mscompress>=1.0.13",
     "fastapi",
     "uvicorn[standard]",
     "httpx",
