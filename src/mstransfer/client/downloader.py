@@ -11,6 +11,8 @@ import aiofiles
 import httpx
 from mscompress import MSZFile, MZMLFile
 
+from mstransfer.client.utils import optional_client
+
 if TYPE_CHECKING:
     from mstransfer.server.models import StoreFormat
 
@@ -80,6 +82,7 @@ async def async_download_file(
     progress_callback: DownloadProgressCallback | None = None,
     skip_existing: bool = False,
     force: bool = False,
+    client: httpx.AsyncClient | None = None,
 ) -> Path:
     """Download a single file from *url* to *dest* (async).
 
@@ -136,8 +139,8 @@ async def async_download_file(
     timeout = httpx.Timeout(read_timeout, connect=connect_timeout)
 
     async with (
-        httpx.AsyncClient(timeout=timeout) as client,
-        client.stream("GET", url) as resp,
+        optional_client(client, timeout=timeout) as c,
+        c.stream("GET", url) as resp,
     ):
         resp.raise_for_status()
 
@@ -191,6 +194,7 @@ async def async_download_batch(
     progress: BatchDownloadProgress | None = None,
     skip_existing: bool = False,
     force: bool = False,
+    client: httpx.AsyncClient | None = None,
 ) -> list[Path]:
     """Download multiple files in parallel (async).
 
@@ -235,8 +239,8 @@ async def async_download_batch(
             total_bytes: int | None = None
             if progress:
                 try:
-                    async with httpx.AsyncClient(
-                        timeout=connect_timeout,
+                    async with optional_client(
+                        client, timeout=connect_timeout
                     ) as head_client:
                         head_resp = await head_client.head(
                             req.url, follow_redirects=True
@@ -265,6 +269,7 @@ async def async_download_batch(
                     progress_callback=file_progress,
                     skip_existing=skip_existing,
                     force=force,
+                    client=client,
                 )
                 results[idx] = result
                 if progress:
@@ -290,6 +295,7 @@ def download_file(
     progress_callback: DownloadProgressCallback | None = None,
     skip_existing: bool = False,
     force: bool = False,
+    client: httpx.AsyncClient | None = None,
 ) -> Path:
     """Download a single file from *url* to *dest*.
 
@@ -306,6 +312,7 @@ def download_file(
             progress_callback=progress_callback,
             skip_existing=skip_existing,
             force=force,
+            client=client,
         )
     )
 
@@ -321,6 +328,7 @@ def download_batch(
     progress: BatchDownloadProgress | None = None,
     skip_existing: bool = False,
     force: bool = False,
+    client: httpx.AsyncClient | None = None,
 ) -> list[Path]:
     """Download multiple files in parallel.
 
@@ -337,6 +345,7 @@ def download_batch(
             progress=progress,
             skip_existing=skip_existing,
             force=force,
+            client=client,
         )
     )
 

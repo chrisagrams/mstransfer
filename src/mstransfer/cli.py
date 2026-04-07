@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import socket
 import sys
 from pathlib import Path
@@ -11,8 +12,8 @@ import uvicorn
 from rich.live import Live
 from rich.table import Table
 
-from mstransfer.client.downloader import DownloadRequest, download_batch
-from mstransfer.client.sender import send_batch
+from mstransfer.client.downloader import DownloadRequest, async_download_batch
+from mstransfer.client.sender import FileResult, async_send_batch
 from mstransfer.client.utils import resolve_inputs
 from mstransfer.server.auth import APIKeyAuthProvider
 
@@ -156,15 +157,22 @@ def cmd_upload(args: argparse.Namespace) -> None:
 
     display = UploadProgressDisplay(len(file_paths))
 
+    async def _run() -> list[FileResult]:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(3600.0, connect=10.0),
+        ) as client:
+            return await async_send_batch(
+                file_paths,
+                base_url,
+                parallel=args.parallel,
+                chunk_size=args.chunk_size,
+                progress=display,
+                api_key=args.api_key,
+                client=client,
+            )
+
     with Live(display.table, console=console, refresh_per_second=10):
-        results = send_batch(
-            file_paths,
-            base_url,
-            parallel=args.parallel,
-            chunk_size=args.chunk_size,
-            progress=display,
-            api_key=args.api_key,
-        )
+        results = asyncio.run(_run())
 
     ok = sum(
         1 for r in results if r.response and r.response.state == TransferState.DONE
@@ -238,16 +246,23 @@ def cmd_download(args: argparse.Namespace) -> None:
 
     display = DownloadProgressDisplay(len(requests))
 
+    async def _run() -> list[Path]:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(300.0, connect=10.0),
+        ) as client:
+            return await async_download_batch(
+                requests,
+                store_as=args.store_as,
+                parallel=args.parallel,
+                chunk_size=args.chunk_size,
+                progress=display,
+                skip_existing=args.skip_existing,
+                force=args.force,
+                client=client,
+            )
+
     with Live(display.table, console=console, refresh_per_second=10):
-        results = download_batch(
-            requests,
-            store_as=args.store_as,
-            parallel=args.parallel,
-            chunk_size=args.chunk_size,
-            progress=display,
-            skip_existing=args.skip_existing,
-            force=args.force,
-        )
+        results = asyncio.run(_run())
 
     ok = len(results)
     fail = len(requests) - ok

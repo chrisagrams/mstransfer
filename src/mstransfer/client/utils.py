@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
+
+import httpx
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Callable, Iterator
@@ -59,6 +62,19 @@ def normalize_source(
         mzml_obj = MZMLFile(str(source).encode()) if filetype == "mzML" else None
         return source, filetype, mzml_obj
     raise TypeError(f"Unsupported source type: {type(source)}")
+
+
+@asynccontextmanager
+async def optional_client(
+    client: httpx.AsyncClient | None,
+    **kwargs: Any,
+) -> AsyncIterator[httpx.AsyncClient]:
+    """Yield *client* if provided, otherwise create and close a temporary one."""
+    if client is not None:
+        yield client
+    else:
+        async with httpx.AsyncClient(**kwargs) as c:
+            yield c
 
 
 async def async_iter_from_sync(

@@ -20,6 +20,7 @@ from mstransfer.client.utils import (
     async_file_chunk_generator,
     async_iter_from_sync,
     normalize_source,
+    optional_client,
 )
 from mstransfer.server.models import TransferRecord, TransferState, UploadResponse
 
@@ -55,6 +56,7 @@ async def async_send_file(
     timeout: float = 3600.0,
     chunk_size: int = 1_048_576,
     api_key: str | None = None,
+    client: httpx.AsyncClient | None = None,
 ) -> UploadResponse:
     """Send a single file to the mstransfer listener (async).
 
@@ -94,10 +96,10 @@ async def async_send_file(
         headers["Authorization"] = f"Bearer {api_key}"
 
     # Send the POST request with streaming upload and handle the response.
-    async with httpx.AsyncClient(
-        timeout=httpx.Timeout(timeout, connect=10.0),
-    ) as client:
-        resp = await client.post(
+    async with optional_client(
+        client, timeout=httpx.Timeout(timeout, connect=10.0)
+    ) as c:
+        resp = await c.post(
             f"{base_url}/v1/upload",
             headers=headers,
             content=stream,
@@ -113,6 +115,7 @@ async def async_send_file(
             transfer_id,
             timeout=timeout,
             headers=poll_headers,
+            client=client,
         )
         upload_result.state = state
 
@@ -125,6 +128,7 @@ async def _async_poll_status(
     timeout: float = 300.0,
     interval: float = 0.5,
     headers: dict[str, str] | None = None,
+    client: httpx.AsyncClient | None = None,
 ) -> TransferState:
     """Poll transfer status until terminal state or timeout (async)."""
 
@@ -136,11 +140,11 @@ async def _async_poll_status(
     last_bytes: int = 0
 
     # Individual request timeout should be reasonably short.
-    async with httpx.AsyncClient(timeout=10.0) as client:
+    async with optional_client(client, timeout=10.0) as c:
         # Continuously poll until we hit a terminal state or exceed the deadline.
         while time.monotonic() < deadline:
             # Make a GET request to the status endpoint for this transfer ID.
-            resp = await client.get(
+            resp = await c.get(
                 f"{base_url}/v1/transfer/{transfer_id}/status",
                 headers=headers,
             )
@@ -169,6 +173,7 @@ async def async_send_batch(
     chunk_size: int = 1_048_576,
     progress: BatchProgressCallback | None = None,
     api_key: str | None = None,
+    client: httpx.AsyncClient | None = None,
 ) -> list[FileResult]:
     """Send multiple files with configurable parallelism (async)."""
     workers = min(parallel, len(sources))
@@ -217,6 +222,7 @@ async def async_send_batch(
                     progress_callback=make_callback(idx),
                     chunk_size=chunk_size,
                     api_key=api_key,
+                    client=client,
                 )
                 results[idx] = FileResult(filename=fpath.name, response=result)
                 if progress:
@@ -239,6 +245,7 @@ def send_file(
     timeout: float = 3600.0,
     chunk_size: int = 1_048_576,
     api_key: str | None = None,
+    client: httpx.AsyncClient | None = None,
 ) -> UploadResponse:
     """Send a single file to the mstransfer listener.
 
@@ -255,6 +262,7 @@ def send_file(
             timeout=timeout,
             chunk_size=chunk_size,
             api_key=api_key,
+            client=client,
         )
     )
 
@@ -266,6 +274,7 @@ def send_batch(
     chunk_size: int = 1_048_576,
     progress: BatchProgressCallback | None = None,
     api_key: str | None = None,
+    client: httpx.AsyncClient | None = None,
 ) -> list[FileResult]:
     """Send multiple files with configurable parallelism.
 
@@ -279,5 +288,6 @@ def send_batch(
             chunk_size=chunk_size,
             progress=progress,
             api_key=api_key,
+            client=client,
         )
     )

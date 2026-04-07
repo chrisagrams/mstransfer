@@ -6,7 +6,7 @@ import argparse
 import socket
 import sys
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
@@ -253,7 +253,7 @@ class TestCmdUpload:
             with pytest.raises(SystemExit, match="1"):
                 cmd_upload(args)
 
-    @patch("mstransfer.cli.send_batch")
+    @patch("mstransfer.cli.async_send_batch", new_callable=AsyncMock)
     @patch("mstransfer.cli.httpx.get")
     @patch("mstransfer.cli.resolve_inputs")
     def test_successful_upload(self, mock_resolve, mock_get, mock_send_batch):
@@ -292,7 +292,7 @@ class TestCmdUpload:
         assert call_kwargs[0][0] == files
         assert call_kwargs[0][1] == "http://myhost:1319"
 
-    @patch("mstransfer.cli.send_batch")
+    @patch("mstransfer.cli.async_send_batch", new_callable=AsyncMock)
     @patch("mstransfer.cli.httpx.get")
     @patch("mstransfer.cli.resolve_inputs")
     def test_partial_failure_prints_errors(
@@ -321,7 +321,7 @@ class TestCmdUpload:
         # Should not raise — just prints the error summary
         cmd_upload(args)
 
-    @patch("mstransfer.cli.send_batch")
+    @patch("mstransfer.cli.async_send_batch", new_callable=AsyncMock)
     @patch("mstransfer.cli.httpx.get")
     @patch("mstransfer.cli.resolve_inputs")
     def test_upload_passes_parallel_and_chunk_size(
@@ -356,7 +356,7 @@ class TestCmdUpload:
         assert kwargs["parallel"] == 8
         assert kwargs["chunk_size"] == 4_194_304
 
-    @patch("mstransfer.cli.send_batch")
+    @patch("mstransfer.cli.async_send_batch", new_callable=AsyncMock)
     @patch("mstransfer.cli.httpx.get")
     @patch("mstransfer.cli.resolve_inputs")
     def test_upload_error_response_state(self, mock_resolve, mock_get, mock_send_batch):
@@ -485,7 +485,7 @@ class TestCmdDownload:
         with pytest.raises(SystemExit, match="1"):
             cmd_download(args)
 
-    @patch("mstransfer.cli.download_batch")
+    @patch("mstransfer.cli.async_download_batch", new_callable=AsyncMock)
     def test_successful_download(self, mock_batch, tmp_path):
         dest = tmp_path / "file.msz"
         mock_batch.return_value = [dest]
@@ -501,7 +501,7 @@ class TestCmdDownload:
         assert call_kwargs["parallel"] == 4
         assert call_kwargs["store_as"] is None
 
-    @patch("mstransfer.cli.download_batch")
+    @patch("mstransfer.cli.async_download_batch", new_callable=AsyncMock)
     def test_partial_failure(self, mock_batch, tmp_path):
         """One failure does not prevent reporting."""
         # Return only 1 result for 2 requests → 1 failure
@@ -514,7 +514,7 @@ class TestCmdDownload:
         # Should not raise — just prints summary
         cmd_download(args)
 
-    @patch("mstransfer.cli.download_batch")
+    @patch("mstransfer.cli.async_download_batch", new_callable=AsyncMock)
     def test_passes_store_as(self, mock_batch, tmp_path):
         mock_batch.return_value = [tmp_path / "file.mzML"]
 
@@ -528,7 +528,7 @@ class TestCmdDownload:
         call_kwargs = mock_batch.call_args[1]
         assert call_kwargs["store_as"] == "mzml"
 
-    @patch("mstransfer.cli.download_batch")
+    @patch("mstransfer.cli.async_download_batch", new_callable=AsyncMock)
     def test_passes_parallel_and_chunk_size(self, mock_batch, tmp_path):
         mock_batch.return_value = [tmp_path / "file.msz"]
 
@@ -544,7 +544,7 @@ class TestCmdDownload:
         assert call_kwargs["parallel"] == 8
         assert call_kwargs["chunk_size"] == 4_194_304
 
-    @patch("mstransfer.cli.download_batch")
+    @patch("mstransfer.cli.async_download_batch", new_callable=AsyncMock)
     def test_passes_skip_existing_and_force(self, mock_batch, tmp_path):
         mock_batch.return_value = []
 
