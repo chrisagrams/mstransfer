@@ -11,7 +11,7 @@ import aiofiles
 import httpx
 from mscompress import MSZFile, MZMLFile
 
-from mstransfer.client.utils import optional_client
+from mstransfer.client.utils import ThrottledCallback, optional_client
 
 if TYPE_CHECKING:
     from mstransfer.server.models import StoreFormat
@@ -138,6 +138,11 @@ async def async_download_file(
 
     timeout = httpx.Timeout(read_timeout, connect=connect_timeout)
 
+    # Throttle progress callbacks to reduce overhead (default: every 8 MiB).
+    throttled = (
+        ThrottledCallback(progress_callback.on_progress) if progress_callback else None
+    )
+
     async with (
         optional_client(client, timeout=timeout) as c,
         c.stream("GET", url) as resp,
@@ -147,8 +152,11 @@ async def async_download_file(
         async with aiofiles.open(part_path, "wb") as f:
             async for chunk in resp.aiter_bytes(chunk_size=chunk_size):
                 await f.write(chunk)
-                if progress_callback:
-                    progress_callback.on_progress(len(chunk))
+                if throttled:
+                    throttled(len(chunk))
+
+        if throttled:
+            throttled.flush()
 
     # Determine whether a format conversion is needed.
     needs_conversion = (

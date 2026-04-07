@@ -100,6 +100,28 @@ async def async_iter_from_sync(
         yield chunk
 
 
+class ThrottledCallback:
+    """Accumulate byte deltas and forward only after *threshold* bytes."""
+
+    def __init__(
+        self, callback: Callable[[int], None], threshold: int = 8_388_608
+    ) -> None:
+        self._callback = callback
+        self._threshold = threshold
+        self._accumulated = 0
+
+    def __call__(self, delta: int) -> None:
+        self._accumulated += delta
+        if self._accumulated >= self._threshold:
+            self._callback(self._accumulated)
+            self._accumulated = 0
+
+    def flush(self) -> None:
+        if self._accumulated:
+            self._callback(self._accumulated)
+            self._accumulated = 0
+
+
 async def async_counting_generator(
     async_iter: AsyncIterator[bytes],
     callback: Callable[[int], None] | None = None,

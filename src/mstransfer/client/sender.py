@@ -16,6 +16,7 @@ from mscompress import MSZFile, MZMLFile
 from mscompress.mszx import MSZXFile
 
 from mstransfer.client.utils import (
+    ThrottledCallback,
     async_counting_generator,
     async_file_chunk_generator,
     async_iter_from_sync,
@@ -70,19 +71,22 @@ async def async_send_file(
     # Normalize source into (file_path, filetype, mzml_obj | None).
     file_path, filetype, mzml_obj = normalize_source(source)
 
+    # Throttle progress callbacks to reduce overhead (default: every 8 MiB).
+    throttled = ThrottledCallback(progress_callback) if progress_callback else None
+
     # Build the upload stream.
     # If its an mzML file, we can use the compress_stream for on-the-fly compression.
     if mzml_obj is not None:
         stream = async_counting_generator(
             async_iter_from_sync(mzml_obj.compress_stream(chunk_size=chunk_size)),
-            progress_callback,
+            throttled,
         )
     # Otherwise, we stream the file in chunks.
     else:
         stream = async_file_chunk_generator(
             file_path,
             chunk_size=chunk_size,
-            callback=progress_callback,
+            callback=throttled,
         )
 
     # Construct headers with metadata for the server.
@@ -106,6 +110,10 @@ async def async_send_file(
         )
         resp.raise_for_status()
         upload_result = UploadResponse.model_validate(resp.json())
+
+    # Flush any remaining accumulated progress.
+    if throttled:
+        throttled.flush()
 
     # Poll for server-side processing completion
     if upload_result.state not in (TransferState.DONE, TransferState.ERROR):

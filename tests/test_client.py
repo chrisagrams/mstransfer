@@ -19,7 +19,7 @@ from mstransfer.client.sender import (
     send_batch,
     send_file,
 )
-from mstransfer.client.utils import resolve_inputs
+from mstransfer.client.utils import ThrottledCallback, resolve_inputs
 from mstransfer.server.app import create_app
 
 # ---------------------------------------------------------------------------
@@ -82,6 +82,56 @@ class TestResolveInputs:
     def test_no_duplicates(self, sample_files):
         result = resolve_inputs([str(sample_files), str(sample_files)], recursive=True)
         assert len(result) == len(set(result))
+
+
+# ---------------------------------------------------------------------------
+# ThrottledCallback
+# ---------------------------------------------------------------------------
+
+
+class TestThrottledCallback:
+    def test_accumulates_below_threshold(self):
+        """Deltas below threshold are accumulated, not forwarded."""
+        forwarded: list[int] = []
+        cb = ThrottledCallback(forwarded.append, threshold=100)
+        cb(30)
+        cb(30)
+        assert forwarded == []
+        assert cb._accumulated == 60
+
+    def test_forwards_at_threshold(self):
+        """Callback fires once accumulated bytes reach the threshold."""
+        forwarded: list[int] = []
+        cb = ThrottledCallback(forwarded.append, threshold=100)
+        cb(60)
+        cb(50)  # 110 >= 100 → forward
+        assert forwarded == [110]
+        assert cb._accumulated == 0
+
+    def test_flush_sends_remainder(self):
+        """flush() forwards any leftover accumulated bytes."""
+        forwarded: list[int] = []
+        cb = ThrottledCallback(forwarded.append, threshold=100)
+        cb(40)
+        cb.flush()
+        assert forwarded == [40]
+        assert cb._accumulated == 0
+
+    def test_flush_noop_when_empty(self):
+        """flush() does nothing if there are no accumulated bytes."""
+        forwarded: list[int] = []
+        cb = ThrottledCallback(forwarded.append, threshold=100)
+        cb.flush()
+        assert forwarded == []
+
+    def test_total_bytes_preserved(self):
+        """Sum of forwarded deltas equals sum of input deltas after flush."""
+        forwarded: list[int] = []
+        cb = ThrottledCallback(forwarded.append, threshold=50)
+        for _ in range(100):
+            cb(7)
+        cb.flush()
+        assert sum(forwarded) == 700
 
 
 # ---------------------------------------------------------------------------
@@ -224,24 +274,22 @@ class TestSendFile:
         assert result.bytes_received > 0
 
     def test_chunk_size_affects_generator(self, test_msz, _live_server):
-        """Smaller chunk_size should produce more progress callbacks."""
-        small_deltas = []
+        """Both small and large chunk sizes should transfer the full file."""
+        small_deltas: list[int] = []
         send_file(
             test_msz,
             _live_server["base_url"],
             progress_callback=small_deltas.append,
             chunk_size=256,
         )
-        large_deltas = []
+        large_deltas: list[int] = []
         send_file(
             test_msz,
             _live_server["base_url"],
             progress_callback=large_deltas.append,
             chunk_size=1_048_576,
         )
-        # Smaller chunks should produce at least as many callbacks
-        assert len(small_deltas) >= len(large_deltas)
-        # Both should transfer the full file
+        # Both should transfer the full file regardless of chunk size
         assert sum(small_deltas) == test_msz.stat().st_size
         assert sum(large_deltas) == test_msz.stat().st_size
 
