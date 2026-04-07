@@ -12,7 +12,8 @@ from rich.live import Live
 from rich.table import Table
 
 from mstransfer.client.downloader import DownloadRequest, download_batch
-from mstransfer.client.sender import resolve_inputs, send_batch
+from mstransfer.client.sender import send_batch
+from mstransfer.client.utils import resolve_inputs
 from mstransfer.server.auth import APIKeyAuthProvider
 
 if TYPE_CHECKING:

@@ -1,27 +1,29 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 import uuid
-from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Generator, Iterable, Sequence
+    from collections.abc import Callable, Sequence
 
 import httpx
 from mscompress import MSZFile, MZMLFile
 from mscompress.mszx import MSZXFile
-from mscompress.utils import detect_filetype
 
+from mstransfer.client.utils import (
+    async_counting_generator,
+    async_file_chunk_generator,
+    async_iter_from_sync,
+    normalize_source,
+)
 from mstransfer.server.models import TransferRecord, TransferState, UploadResponse
 
 logger = logging.getLogger(__name__)
-
-VALID_EXTENSIONS = {".mzml", ".msz", ".mszx"}
-VALID_FORMATS = {"mzML", "msz", "mszx"}
 
 
 @runtime_checkable
@@ -46,57 +48,7 @@ class FileResult:
     error: str | None = field(default=None)
 
 
-def resolve_inputs(paths: list[str], recursive: bool = False) -> list[Path]:
-    """Resolve files and directories into a sorted list of valid MS files."""
-    result: list[Path] = []
-    for p in paths:
-        path = Path(p)
-        if path.is_file():
-            if path.suffix.lower() in VALID_EXTENSIONS:
-                result.append(path)
-            else:
-                logger.warning("Skipping unsupported file: %s", path)
-        elif path.is_dir():
-            for ext in ("*.mzML", "*.msz", "*.mzml", "*.MSZ"):
-                if recursive:
-                    result.extend(path.rglob(ext))
-                else:
-                    result.extend(path.glob(ext))
-            result = list(dict.fromkeys(result))
-        else:
-            logger.warning("Path does not exist: %s", path)
-    if not result:
-        raise FileNotFoundError("No valid .mzML or .msz files found in the given paths")
-    return sorted(set(result))
-
-
-def _counting_generator(
-    iterator: Iterable[bytes], callback: Callable[[int], None] | None = None
-) -> Generator[bytes, None, None]:
-    """Wrap an iterator, calling callback with byte count per chunk."""
-    for chunk in iterator:
-        if callback:
-            callback(len(chunk))
-        yield chunk
-
-
-def _file_chunk_generator(
-    file_path: Path,
-    chunk_size: int = 1_048_576,
-    callback: Callable[[int], None] | None = None,
-) -> Generator[bytes, None, None]:
-    """Read a file in chunks, calling callback with each chunk's size."""
-    with open(file_path, "rb") as f:
-        while True:
-            chunk = f.read(chunk_size)
-            if not chunk:
-                break
-            if callback:
-                callback(len(chunk))
-            yield chunk
-
-
-def send_file(
+async def async_send_file(
     source: Path | MZMLFile | MSZFile | MSZXFile,
     base_url: str,
     progress_callback: Callable[[int], None] | None = None,
@@ -104,7 +56,7 @@ def send_file(
     chunk_size: int = 1_048_576,
     api_key: str | None = None,
 ) -> UploadResponse:
-    """Send a single file to the mstransfer listener.
+    """Send a single file to the mstransfer listener (async).
 
     Accepts a file path, or an already-opened MZMLFile / MSZFile / MSZXFile
     from mscompress.  Returns the final transfer status from the server.
@@ -114,37 +66,18 @@ def send_file(
     transfer_id = str(uuid.uuid4())
 
     # Normalize source into (file_path, filetype, mzml_obj | None).
-    if isinstance(source, MZMLFile):
-        file_path = Path(source.path.decode())
-        filetype = "mzML"
-        mzml_obj: MZMLFile | None = source
-    elif isinstance(source, MSZFile):
-        file_path = Path(source.path.decode())
-        filetype = "msz"
-        mzml_obj = None
-    elif isinstance(source, MSZXFile):
-        file_path = source.archive_path
-        filetype = "mszx"
-        mzml_obj = None
-    elif isinstance(source, Path):
-        file_path = source
-        filetype = detect_filetype(str(file_path)) or ""
-        if filetype not in VALID_FORMATS:
-            raise ValueError(f"Unsupported file type for {file_path}: {filetype}")
-        mzml_obj = MZMLFile(str(file_path).encode()) if filetype == "mzML" else None
-    else:
-        raise TypeError(f"Unsupported source type: {type(source)}")
+    file_path, filetype, mzml_obj = normalize_source(source)
 
     # Build the upload stream.
     # If its an mzML file, we can use the compress_stream for on-the-fly compression.
     if mzml_obj is not None:
-        stream = _counting_generator(
-            mzml_obj.compress_stream(chunk_size=chunk_size),
+        stream = async_counting_generator(
+            async_iter_from_sync(mzml_obj.compress_stream(chunk_size=chunk_size)),
             progress_callback,
         )
-    # Otherwise, we stream the file in chuncks.
+    # Otherwise, we stream the file in chunks.
     else:
-        stream = _file_chunk_generator(
+        stream = async_file_chunk_generator(
             file_path,
             chunk_size=chunk_size,
             callback=progress_callback,
@@ -161,8 +94,10 @@ def send_file(
         headers["Authorization"] = f"Bearer {api_key}"
 
     # Send the POST request with streaming upload and handle the response.
-    with httpx.Client(timeout=httpx.Timeout(timeout, connect=10.0)) as client:
-        resp = client.post(
+    async with httpx.AsyncClient(
+        timeout=httpx.Timeout(timeout, connect=10.0),
+    ) as client:
+        resp = await client.post(
             f"{base_url}/v1/upload",
             headers=headers,
             content=stream,
@@ -173,7 +108,7 @@ def send_file(
     # Poll for server-side processing completion
     if upload_result.state not in (TransferState.DONE, TransferState.ERROR):
         poll_headers = {"Authorization": f"Bearer {api_key}"} if api_key else None
-        state = _poll_status(
+        state = await _async_poll_status(
             base_url,
             transfer_id,
             timeout=timeout,
@@ -184,14 +119,14 @@ def send_file(
     return upload_result
 
 
-def _poll_status(
+async def _async_poll_status(
     base_url: str,
     transfer_id: str,
     timeout: float = 300.0,
     interval: float = 0.5,
     headers: dict[str, str] | None = None,
 ) -> TransferState:
-    """Poll transfer status until terminal state or timeout."""
+    """Poll transfer status until terminal state or timeout (async)."""
 
     # Configure a deadline for the polling operation.
     deadline = time.monotonic() + timeout
@@ -201,11 +136,11 @@ def _poll_status(
     last_bytes: int = 0
 
     # Individual request timeout should be reasonably short.
-    with httpx.Client(timeout=10.0) as client:
-        # Continously poll until we hit a terminal state or exceed the deadline.
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        # Continuously poll until we hit a terminal state or exceed the deadline.
         while time.monotonic() < deadline:
             # Make a GET request to the status endpoint for this transfer ID.
-            resp = client.get(
+            resp = await client.get(
                 f"{base_url}/v1/transfer/{transfer_id}/status",
                 headers=headers,
             )
@@ -223,8 +158,105 @@ def _poll_status(
                     last_bytes = record.bytes_received
                     deadline = time.monotonic() + timeout
             # Sleep until the next poll interval before checking again.
-            time.sleep(interval)
+            await asyncio.sleep(interval)
     raise TimeoutError(f"Transfer {transfer_id} did not complete within {timeout}s")
+
+
+async def async_send_batch(
+    sources: Sequence[Path | MZMLFile | MSZFile | MSZXFile],
+    base_url: str,
+    parallel: int = 4,
+    chunk_size: int = 1_048_576,
+    progress: BatchProgressCallback | None = None,
+    api_key: str | None = None,
+) -> list[FileResult]:
+    """Send multiple files with configurable parallelism (async)."""
+    workers = min(parallel, len(sources))
+    sem = asyncio.Semaphore(workers)
+
+    # Pre-allocate results list indexed by position for deterministic ordering.
+    results: list[FileResult | None] = [None] * len(sources)
+
+    async def _upload_one(idx: int, src: Path | MZMLFile | MSZFile | MSZXFile) -> None:
+        # Extract a Path for progress reporting and metadata.
+        if isinstance(src, MSZXFile):
+            fpath = src.archive_path
+        elif isinstance(src, MZMLFile | MSZFile):
+            fpath = Path(src.path.decode())
+        else:
+            fpath = src
+
+        # We can determine total bytes for compressed files (MSZ/MSZX).
+        # For mzML, compression is on-the-fly so the total is unknown.
+        if isinstance(src, MSZFile | MSZXFile):
+            total_bytes: int | None = fpath.stat().st_size
+        elif isinstance(src, MZMLFile):
+            total_bytes = None
+        else:
+            is_compressed = fpath.suffix.lower() in (".msz", ".mszx")
+            total_bytes = fpath.stat().st_size if is_compressed else None
+
+        async with sem:
+            # If the progress callback is provided, notify that this file is starting.
+            if progress:
+                progress.file_started(idx, fpath, total_bytes)
+
+            def make_callback(i: int) -> Callable[[int], None]:
+                """Create a callback that captures the file index for progress."""
+
+                def cb(delta: int) -> None:
+                    if progress:
+                        progress.file_progress(i, delta)
+
+                return cb
+
+            try:
+                result = await async_send_file(
+                    src,
+                    base_url,
+                    progress_callback=make_callback(idx),
+                    chunk_size=chunk_size,
+                    api_key=api_key,
+                )
+                results[idx] = FileResult(filename=fpath.name, response=result)
+                if progress:
+                    progress.file_done(idx, result)
+            except Exception as exc:
+                results[idx] = FileResult(filename=fpath.name, error=str(exc))
+                if progress:
+                    progress.file_error(idx, exc)
+                logger.error("Failed to send %s: %s", fpath, exc)
+
+    await asyncio.gather(*[_upload_one(i, s) for i, s in enumerate(sources)])
+
+    return [r for r in results if r is not None]
+
+
+def send_file(
+    source: Path | MZMLFile | MSZFile | MSZXFile,
+    base_url: str,
+    progress_callback: Callable[[int], None] | None = None,
+    timeout: float = 3600.0,
+    chunk_size: int = 1_048_576,
+    api_key: str | None = None,
+) -> UploadResponse:
+    """Send a single file to the mstransfer listener.
+
+    Accepts a file path, or an already-opened MZMLFile / MSZFile / MSZXFile
+    from mscompress.  Returns the final transfer status from the server.
+
+    This is a synchronous wrapper around :func:`async_send_file`.
+    """
+    return asyncio.run(
+        async_send_file(
+            source,
+            base_url,
+            progress_callback=progress_callback,
+            timeout=timeout,
+            chunk_size=chunk_size,
+            api_key=api_key,
+        )
+    )
 
 
 def send_batch(
@@ -235,75 +267,17 @@ def send_batch(
     progress: BatchProgressCallback | None = None,
     api_key: str | None = None,
 ) -> list[FileResult]:
-    """Send multiple files with configurable parallelism."""
-    # Set the number of workers.
-    workers = min(parallel, len(sources))
+    """Send multiple files with configurable parallelism.
 
-    results: list[FileResult] = []
-
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        # Keep track of futures and their corresponding index + file path.
-        futures: dict[Future[UploadResponse], tuple[int, Path]] = {}
-
-        for idx, source in enumerate(sources):
-            # Extract a Path for progress reporting and metadata.
-            if isinstance(source, MSZXFile):
-                fpath = source.archive_path
-            elif isinstance(source, MZMLFile | MSZFile):
-                fpath = Path(source.path.decode())
-            else:
-                fpath = source
-
-            # We can determine total bytes for compressed files (MSZ/MSZX).
-            # For mzML, compression is on-the-fly so the total is unknown.
-            if isinstance(source, MSZFile | MSZXFile):
-                total_bytes = fpath.stat().st_size
-            elif isinstance(source, MZMLFile):
-                total_bytes = None
-            else:
-                is_compressed = fpath.suffix.lower() in (".msz", ".mszx")
-                total_bytes = fpath.stat().st_size if is_compressed else None
-
-            # If the progress callback is provided, notify that this file is starting.
-            if progress:
-                progress.file_started(idx, fpath, total_bytes)
-
-            def make_callback(i: int) -> Callable[[int], None]:
-                """
-                Create a callback function that captures the file index for progress.
-                """
-
-                def cb(delta: int) -> None:
-                    if progress:
-                        progress.file_progress(i, delta)
-
-                return cb
-
-            # Submit the file upload task to the thread pool and store the future.
-            future = pool.submit(
-                send_file,
-                source,
-                base_url,
-                progress_callback=make_callback(idx),
-                chunk_size=chunk_size,
-                api_key=api_key,
-            )
-            futures[future] = (idx, fpath)
-
-        # As the futures complete,
-        for future in as_completed(futures):
-            # Unpack the index and file path for this future to report progress callback
-            idx, fpath = futures[future]
-            try:
-                result = future.result()
-                results.append(FileResult(filename=fpath.name, response=result))
-                if progress:
-                    progress.file_done(idx, result)
-            # On exception, append a FileResult with the error message.
-            except Exception as exc:
-                results.append(FileResult(filename=fpath.name, error=str(exc)))
-                if progress:
-                    progress.file_error(idx, exc)
-                logger.error("Failed to send %s: %s", fpath, exc)
-
-    return results
+    This is a synchronous wrapper around :func:`async_send_batch`.
+    """
+    return asyncio.run(
+        async_send_batch(
+            sources,
+            base_url,
+            parallel=parallel,
+            chunk_size=chunk_size,
+            progress=progress,
+            api_key=api_key,
+        )
+    )

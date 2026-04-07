@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import http.server
 import posixpath
 import shutil
 import threading
 import urllib.parse
-from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
 
 import httpx
@@ -18,6 +18,8 @@ from mstransfer.client.downloader import (
     _detect_source_format,
     _FileProgressAdapter,
     _resolve_dest,
+    async_download_batch,
+    async_download_file,
     download_batch,
     download_file,
 )
@@ -247,7 +249,7 @@ class TestDownloadBatch:
         assert (tmp_path / "medium.bin").read_bytes() == b"x" * 10_000
 
     def test_parallel_capped_to_file_count(self, served_files, tmp_path):
-        """Workers should not exceed the number of files."""
+        """Semaphore should not exceed the number of files."""
         requests = [
             DownloadRequest(
                 url=f"{served_files['base_url']}/small.bin",
@@ -255,11 +257,11 @@ class TestDownloadBatch:
             ),
         ]
         with patch(
-            "mstransfer.client.downloader.ThreadPoolExecutor",
-            wraps=ThreadPoolExecutor,
-        ) as mock_pool:
+            "asyncio.Semaphore",
+            wraps=asyncio.Semaphore,
+        ) as mock_sem:
             download_batch(requests, parallel=8)
-            mock_pool.assert_called_once_with(max_workers=1)
+            mock_sem.assert_called_once_with(1)
 
     def test_batch_progress_callback(self, served_files, tmp_path):
         """Batch progress callbacks are invoked correctly."""
@@ -501,3 +503,144 @@ class TestFormatConversion:
         assert len(results) == 1
         assert results[0] == tmp_path / "result.mzML"
         assert results[0].stat().st_size == test_mzml.stat().st_size
+
+
+# ---------------------------------------------------------------------------
+# async_download_file
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestAsyncDownloadFile:
+    async def test_basic_download(self, served_files, tmp_path):
+        """Download a file and verify contents (async)."""
+        dest = tmp_path / "out" / "small.bin"
+        result = await async_download_file(
+            f"{served_files['base_url']}/small.bin",
+            dest,
+        )
+        assert result == dest
+        assert dest.exists()
+        assert dest.read_bytes() == b"hello world"
+
+    async def test_progress_callback(self, served_files, tmp_path):
+        """Progress callback is invoked with byte deltas (async)."""
+        dest = tmp_path / "medium.bin"
+        deltas: list[int] = []
+
+        class Tracker:
+            def on_progress(self, bytes_delta: int) -> None:
+                deltas.append(bytes_delta)
+
+        await async_download_file(
+            f"{served_files['base_url']}/medium.bin",
+            dest,
+            progress_callback=Tracker(),
+            chunk_size=1024,
+        )
+        assert len(deltas) > 0
+        assert sum(deltas) == 10_000
+
+    async def test_skip_existing(self, served_files, tmp_path):
+        """When skip_existing=True and file exists, download is skipped (async)."""
+        dest = tmp_path / "small.bin"
+        dest.write_bytes(b"already here")
+
+        result = await async_download_file(
+            f"{served_files['base_url']}/small.bin",
+            dest,
+            skip_existing=True,
+        )
+        assert result == dest
+        assert dest.read_bytes() == b"already here"
+
+    async def test_format_conversion_msz_to_mzml(
+        self, served_ms_files, test_mzml, tmp_path
+    ):
+        """Download .msz and decompress to .mzML (async)."""
+        dest = tmp_path / "result.msz"
+        result = await async_download_file(
+            f"{served_ms_files['base_url']}/test.msz",
+            dest,
+            store_as="mzml",
+        )
+        assert result == tmp_path / "result.mzML"
+        assert result.exists()
+        assert result.stat().st_size == test_mzml.stat().st_size
+
+    async def test_http_404_raises(self, served_files, tmp_path):
+        """HTTP 404 raises an httpx.HTTPStatusError (async)."""
+        dest = tmp_path / "missing.bin"
+        with pytest.raises(httpx.HTTPStatusError):
+            await async_download_file(f"{served_files['base_url']}/nonexistent", dest)
+        assert not dest.exists()
+
+
+# ---------------------------------------------------------------------------
+# async_download_batch
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestAsyncDownloadBatch:
+    async def test_single_file(self, served_files, tmp_path):
+        """async_download_batch with a single file."""
+        dest = tmp_path / "small.bin"
+        requests = [
+            DownloadRequest(url=f"{served_files['base_url']}/small.bin", dest=dest),
+        ]
+        results = await async_download_batch(requests)
+        assert len(results) == 1
+        assert results[0] == dest
+        assert dest.read_bytes() == b"hello world"
+
+    async def test_multiple_files(self, served_files, tmp_path):
+        """async_download_batch downloads multiple files concurrently."""
+        requests = [
+            DownloadRequest(
+                url=f"{served_files['base_url']}/small.bin",
+                dest=tmp_path / "small.bin",
+            ),
+            DownloadRequest(
+                url=f"{served_files['base_url']}/medium.bin",
+                dest=tmp_path / "medium.bin",
+            ),
+        ]
+        results = await async_download_batch(requests, parallel=2)
+        assert len(results) == 2
+        assert (tmp_path / "small.bin").read_bytes() == b"hello world"
+        assert (tmp_path / "medium.bin").read_bytes() == b"x" * 10_000
+
+    async def test_error_does_not_block_others(self, served_files, tmp_path):
+        """One failed download does not prevent others from completing (async)."""
+        requests = [
+            DownloadRequest(
+                url=f"{served_files['base_url']}/small.bin",
+                dest=tmp_path / "small.bin",
+            ),
+            DownloadRequest(
+                url=f"{served_files['base_url']}/nonexistent",
+                dest=tmp_path / "missing.bin",
+            ),
+        ]
+
+        errors: list[str] = []
+
+        class Tracker:
+            def on_file_start(self, filename: str, total_bytes: int | None) -> None:
+                pass
+
+            def on_file_progress(self, filename: str, bytes_delta: int) -> None:
+                pass
+
+            def on_file_complete(self, filename: str) -> None:
+                pass
+
+            def on_file_error(self, filename: str, error: Exception) -> None:
+                errors.append(filename)
+
+        results = await async_download_batch(requests, parallel=2, progress=Tracker())
+        assert len(results) == 1
+        assert results[0] == tmp_path / "small.bin"
+        assert (tmp_path / "small.bin").read_bytes() == b"hello world"
+        assert "missing.bin" in errors
