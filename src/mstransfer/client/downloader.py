@@ -18,16 +18,19 @@ from mstransfer.client.utils import ThrottledCallback, optional_client
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-DownloadFormat = Literal["msz", "mzml", "mszx"]
-"""Output formats the client can produce on disk after download."""
-
 logger = logging.getLogger(__name__)
 
+# Output formats the client can produce on disk after download.
+DownloadFormat = Literal["msz", "mzml", "mszx"]
+
+# Mapping of format to canonical file extension for naming converted outputs.
 _FORMAT_EXT: dict[DownloadFormat, str] = {
     "msz": ".msz",
     "mzml": ".mzML",
     "mszx": ".mszx",
 }
+
+# Reverse mapping of lowercase extension to format for source format inference.
 _EXT_FORMAT: dict[str, DownloadFormat] = {v.lower(): k for k, v in _FORMAT_EXT.items()}
 
 
