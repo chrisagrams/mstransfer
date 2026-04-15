@@ -1,11 +1,11 @@
 [project]
 name = "mstransfer"
-version = "0.1.1"
+version = "0.2.2"
 description = "Transfer mass spectrometry files (mzML/MSZ) between endpoints using mscompress"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "mscompress",
+    "mscompress>=1.0.13",
     "fastapi",
     "uvicorn[standard]",
     "httpx",
@@ -32,6 +32,18 @@ line-length = 88
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "N", "UP", "B", "A", "SIM", "TCH", "PLC0415"]
 
+[tool.mypy]
+python_version = "3.10"
+strict = true
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+plugins = ["pydantic.mypy"]
+
+[[tool.mypy.overrides]]
+module = ["mscompress.*", "aiofiles.*"]
+ignore_missing_imports = true
+
 [dependency-groups]
 dev = [
     "pytest",
@@ -41,4 +53,5 @@ dev = [
     "ruff",
     "pre-commit",
     "pyright>=1.1.408",
+    "mypy>=1.10",
 ]
