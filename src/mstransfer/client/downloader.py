@@ -25,6 +25,7 @@ _FORMAT_EXT: dict[DownloadFormat, str] = {
     "mzml": ".mzML",
     "mszx": ".mszx",
 }
+_EXT_FORMAT: dict[str, DownloadFormat] = {v.lower(): k for k, v in _FORMAT_EXT.items()}
 
 
 def _detect_source_format(url: str) -> DownloadFormat | None:
@@ -35,14 +36,7 @@ def _detect_source_format(url: str) -> DownloadFormat | None:
     """
     # Strip query params and fragments before inspecting extension.
     path = url.split("?", 1)[0].split("#", 1)[0]
-    ext = Path(path).suffix.lower()
-    if ext == ".msz":
-        return "msz"
-    if ext == ".mzml":
-        return "mzml"
-    if ext == ".mszx":
-        return "mszx"
-    return None
+    return _EXT_FORMAT.get(Path(path).suffix.lower())
 
 
 def _resolve_dest(
