@@ -32,6 +32,10 @@ line-length = 88
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "N", "UP", "B", "A", "SIM", "TCH", "PLC0415"]
 
+[tool.pyright]
+include = ["src", "tests"]
+exclude = ["benchmark", ".venv", "**/__pycache__", "**/node_modules", "build", "dist"]
+
 [tool.mypy]
 python_version = "3.10"
 strict = true
@@ -39,6 +43,7 @@ warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = true
 plugins = ["pydantic.mypy"]
+exclude = ["benchmark/"]
 
 [[tool.mypy.overrides]]
 module = ["mscompress.*", "aiofiles.*"]

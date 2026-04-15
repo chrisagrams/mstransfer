@@ -648,6 +648,10 @@ class TestMain:
             main()
         mock_cmd_download.assert_called_once()
 
-    def test_main_no_command_exits(self):
-        with patch("sys.argv", ["mstransfer"]), pytest.raises(SystemExit):
+    def test_main_no_command_prints_help(self, capsys):
+        with patch("sys.argv", ["mstransfer"]), pytest.raises(SystemExit) as exc_info:
             main()
+        assert exc_info.value.code == 0
+        captured = capsys.readouterr()
+        assert "usage: mstransfer" in captured.out
+        assert "{serve,upload,download}" in captured.out
