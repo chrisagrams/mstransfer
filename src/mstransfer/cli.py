@@ -277,7 +277,7 @@ def main() -> None:
         prog="mstransfer",
         description=("Transfer mass spectrometry files (mzML/MSZ) between endpoints"),
     )
-    sub = parser.add_subparsers(dest="command", required=True)
+    sub = parser.add_subparsers(dest="command")
 
     # --- serve ---
     lp = sub.add_parser("serve", help="Start the mstransfer server")
@@ -379,4 +379,7 @@ def main() -> None:
     dp.set_defaults(func=cmd_download)
 
     args = parser.parse_args()
+    if args.command is None:
+        parser.print_help()
+        sys.exit(0)
     args.func(args)
