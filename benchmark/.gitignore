@@ -1,0 +1,11 @@
+# Downloaded datasets
+data/
+
+# Secrets
+.env
+
+# Benchmark results
+results/
+
+# Generated plots
+plots/

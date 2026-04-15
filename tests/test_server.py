@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timedelta
 
 import pytest
 from mscompress import MZMLFile
@@ -45,29 +44,59 @@ class TestTransferRegistry:
         reg = TransferRegistry()
         assert reg.update("nope", state=TransferState.DONE) is None
 
-    def test_cleanup(self):
-        reg = TransferRegistry()
-        rec = reg.create("t1", "old.msz")
+    def test_evicts_oldest_terminal_when_full(self):
+        reg = TransferRegistry(maxsize=2)
+        reg.create("t1", "a.msz")
         reg.update("t1", state=TransferState.DONE)
-        rec.created_at = datetime.now() - timedelta(seconds=600)
-        removed = reg.cleanup(max_age_seconds=300)
-        assert removed == 1
+        reg.create("t2", "b.msz")
+        reg.update("t2", state=TransferState.DONE)
+        # Creating a third record should evict t1 (oldest terminal).
+        reg.create("t3", "c.msz")
         assert reg.get("t1") is None
+        assert reg.get("t2") is not None
+        assert reg.get("t3") is not None
 
-    def test_cleanup_keeps_recent(self):
-        reg = TransferRegistry()
-        reg.create("t1", "new.msz")
-        reg.update("t1", state=TransferState.DONE)
-        removed = reg.cleanup(max_age_seconds=300)
-        assert removed == 0
+    def test_never_evicts_in_progress(self):
+        reg = TransferRegistry(maxsize=2)
+        reg.create("t1", "a.msz")  # RECEIVING (in-progress)
+        reg.create("t2", "b.msz")  # RECEIVING (in-progress)
+        reg.create("t3", "c.msz")  # RECEIVING (in-progress)
+        # All three should be kept — no terminal records to evict.
         assert reg.get("t1") is not None
+        assert reg.get("t2") is not None
+        assert reg.get("t3") is not None
 
-    def test_cleanup_keeps_in_progress(self):
-        reg = TransferRegistry()
-        rec = reg.create("t1", "active.msz")
-        rec.created_at = datetime.now() - timedelta(seconds=600)
-        removed = reg.cleanup(max_age_seconds=300)
-        assert removed == 0
+    def test_evicts_least_recently_used(self):
+        reg = TransferRegistry(maxsize=2)
+        reg.create("t1", "a.msz")
+        reg.update("t1", state=TransferState.DONE)
+        reg.create("t2", "b.msz")
+        reg.update("t2", state=TransferState.DONE)
+        # Access t1 to refresh it (move to end).
+        reg.get("t1")
+        # Now t2 is the least-recently-used terminal record.
+        reg.create("t3", "c.msz")
+        assert reg.get("t1") is not None  # refreshed, kept
+        assert reg.get("t2") is None  # LRU, evicted
+        assert reg.get("t3") is not None
+
+    def test_get_refreshes_order(self):
+        reg = TransferRegistry(maxsize=3)
+        reg.create("t1", "a.msz")
+        reg.update("t1", state=TransferState.DONE)
+        reg.create("t2", "b.msz")
+        reg.update("t2", state=TransferState.DONE)
+        reg.create("t3", "c.msz")
+        reg.update("t3", state=TransferState.DONE)
+        # Refresh t1 so it's no longer the oldest.
+        reg.get("t1")
+        # Evict twice by adding two new records.
+        reg.create("t4", "d.msz")
+        reg.create("t5", "e.msz")
+        # t2 and t3 should be evicted (oldest), t1 kept.
+        assert reg.get("t2") is None
+        assert reg.get("t3") is None
+        assert reg.get("t1") is not None
 
 
 # ---------------------------------------------------------------------------

@@ -1,0 +1,14 @@
+# MSTransfer Benchmark - Dataset Manifest
+#
+# One URL per line pointing to a RAW file on PRIDE FTP/HTTPS.
+# Lines starting with '#' and blank lines are ignored.
+# RAW files are downloaded and converted to mzML via msconvert Docker.
+#
+# Example:
+#   https://ftp.pride.ebi.ac.uk/pride/data/archive/2024/01/PXD012345/sample.raw
+#
+# Add your dataset URLs below:
+https://ftp.pride.ebi.ac.uk/pride/data/archive/2020/09/PXD016914/MDR_11122019_IMX1770_3_DDA01.raw
+https://ftp.pride.ebi.ac.uk/pride/data/archive/2020/09/PXD021034/m17349ftMASTMTFrac5.raw
+https://ftp.pride.ebi.ac.uk/pride/data/archive/2020/11/PXD016398/L08129.raw
+https://ftp.pride.ebi.ac.uk/pride/data/archive/2020/11/PXD020735/92-70562_PHJ11604X076__0Gy_RepIII40-20626.raw
