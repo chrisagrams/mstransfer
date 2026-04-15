@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import http.server
 import posixpath
 import shutil
 import threading
 import urllib.parse
-from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
 
 import httpx
@@ -18,6 +18,8 @@ from mstransfer.client.downloader import (
     _detect_source_format,
     _FileProgressAdapter,
     _resolve_dest,
+    async_download_batch,
+    async_download_file,
     download_batch,
     download_file,
 )
@@ -78,13 +80,14 @@ def served_files(tmp_path):
 
 
 @pytest.fixture()
-def served_ms_files(tmp_path, test_msz, test_mzml):
-    """Serve real .msz and .mzML files via a local HTTP server."""
+def served_ms_files(tmp_path, test_msz, test_mzml, test_mszx):
+    """Serve real .msz, .mzML, and .mszx files via a local HTTP server."""
     serve_dir = tmp_path / "ms_serve"
     serve_dir.mkdir()
 
     shutil.copy(test_msz, serve_dir / "test.msz")
     shutil.copy(test_mzml, serve_dir / "test.mzML")
+    shutil.copy(test_mszx, serve_dir / "test.mszx")
 
     server, thread, base_url = _make_http_server(serve_dir)
 
@@ -247,7 +250,7 @@ class TestDownloadBatch:
         assert (tmp_path / "medium.bin").read_bytes() == b"x" * 10_000
 
     def test_parallel_capped_to_file_count(self, served_files, tmp_path):
-        """Workers should not exceed the number of files."""
+        """Semaphore should not exceed the number of files."""
         requests = [
             DownloadRequest(
                 url=f"{served_files['base_url']}/small.bin",
@@ -255,11 +258,11 @@ class TestDownloadBatch:
             ),
         ]
         with patch(
-            "mstransfer.client.downloader.ThreadPoolExecutor",
-            wraps=ThreadPoolExecutor,
-        ) as mock_pool:
+            "asyncio.Semaphore",
+            wraps=asyncio.Semaphore,
+        ) as mock_sem:
             download_batch(requests, parallel=8)
-            mock_pool.assert_called_once_with(max_workers=1)
+            mock_sem.assert_called_once_with(1)
 
     def test_batch_progress_callback(self, served_files, tmp_path):
         """Batch progress callbacks are invoked correctly."""
@@ -392,6 +395,12 @@ class TestDetectSourceFormat:
     def test_fragment_stripped(self):
         assert _detect_source_format("http://h/f.mzML#section") == "mzml"
 
+    def test_mszx_url(self):
+        assert _detect_source_format("http://host/data/file.mszx") == "mszx"
+
+    def test_mszx_uppercase(self):
+        assert _detect_source_format("http://host/data/file.MSZX") == "mszx"
+
 
 class TestResolveDest:
     def test_no_store_as(self, tmp_path):
@@ -413,6 +422,22 @@ class TestResolveDest:
     def test_unknown_source_no_change(self, tmp_path):
         dest = tmp_path / "file.bin"
         assert _resolve_dest(dest, "msz", None) == dest
+
+    def test_mszx_same_format(self, tmp_path):
+        dest = tmp_path / "file.mszx"
+        assert _resolve_dest(dest, "mszx", "mszx") == dest
+
+    def test_mszx_to_msz(self, tmp_path):
+        dest = tmp_path / "file.mszx"
+        assert _resolve_dest(dest, "msz", "mszx") == tmp_path / "file.msz"
+
+    def test_mszx_to_mzml(self, tmp_path):
+        dest = tmp_path / "file.mszx"
+        assert _resolve_dest(dest, "mzml", "mszx") == tmp_path / "file.mzML"
+
+    def test_msz_to_mszx(self, tmp_path):
+        dest = tmp_path / "file.msz"
+        assert _resolve_dest(dest, "mszx", "msz") == tmp_path / "file.mszx"
 
 
 # ---------------------------------------------------------------------------
@@ -501,3 +526,291 @@ class TestFormatConversion:
         assert len(results) == 1
         assert results[0] == tmp_path / "result.mzML"
         assert results[0].stat().st_size == test_mzml.stat().st_size
+
+    def test_download_mszx_store_as_mzml(self, served_ms_files, test_mzml, tmp_path):
+        """Download .mszx and decompress inner spectra to .mzML."""
+        dest = tmp_path / "result.mszx"
+        result = download_file(
+            f"{served_ms_files['base_url']}/test.mszx",
+            dest,
+            store_as="mzml",
+        )
+        assert result == tmp_path / "result.mzML"
+        assert result.exists()
+        assert result.stat().st_size == test_mzml.stat().st_size
+
+    def test_download_mszx_store_as_msz(self, served_ms_files, test_msz, tmp_path):
+        """Download .mszx and extract inner .msz — bytes match the original."""
+        dest = tmp_path / "result.mszx"
+        result = download_file(
+            f"{served_ms_files['base_url']}/test.mszx",
+            dest,
+            store_as="msz",
+        )
+        assert result == tmp_path / "result.msz"
+        assert result.exists()
+        # Inner spectra.msz is a byte-for-byte copy of test.msz (conftest).
+        assert result.read_bytes() == test_msz.read_bytes()
+
+    def test_download_mszx_store_as_mszx_no_conversion(
+        self, served_ms_files, test_mszx, tmp_path
+    ):
+        """Download .mszx with store_as='mszx' — no conversion, bytes match."""
+        dest = tmp_path / "result.mszx"
+        result = download_file(
+            f"{served_ms_files['base_url']}/test.mszx",
+            dest,
+            store_as="mszx",
+        )
+        assert result == dest
+        assert dest.read_bytes() == test_mszx.read_bytes()
+
+    def test_download_mszx_store_as_none_keeps_original(
+        self, served_ms_files, test_mszx, tmp_path
+    ):
+        """Download .mszx with store_as=None keeps file as-is."""
+        dest = tmp_path / "result.mszx"
+        result = download_file(
+            f"{served_ms_files['base_url']}/test.mszx",
+            dest,
+            store_as=None,
+        )
+        assert result == dest
+        assert dest.read_bytes() == test_mszx.read_bytes()
+
+    def test_no_intermediate_file_left_mszx(self, served_ms_files, tmp_path):
+        """After mszx→mzml, only the final .mzML remains in the output dir."""
+        out_dir = tmp_path / "clean_output_mszx"
+        out_dir.mkdir()
+        dest = out_dir / "result.mszx"
+        download_file(
+            f"{served_ms_files['base_url']}/test.mszx",
+            dest,
+            store_as="mzml",
+        )
+        remaining = list(out_dir.iterdir())
+        assert len(remaining) == 1
+        assert remaining[0].suffix == ".mzML"
+
+    def test_batch_mszx_store_as_mzml_converts(
+        self, served_ms_files, test_mzml, tmp_path
+    ):
+        """Regression: batch .mszx URL + store_as='mzml' must convert, not no-op."""
+        requests = [
+            DownloadRequest(
+                url=f"{served_ms_files['base_url']}/test.mszx",
+                dest=tmp_path / "result.mszx",
+            ),
+        ]
+        results = download_batch(requests, store_as="mzml")
+        assert len(results) == 1
+        assert results[0] == tmp_path / "result.mzML"
+        # Not silently kept as mszx.
+        assert not (tmp_path / "result.mszx").exists()
+        assert results[0].stat().st_size == test_mzml.stat().st_size
+
+    def test_msz_to_mszx_raises(self, served_ms_files, tmp_path):
+        """Converting msz → mszx is out of scope and raises NotImplementedError."""
+        dest = tmp_path / "result.msz"
+        with pytest.raises(NotImplementedError):
+            download_file(
+                f"{served_ms_files['base_url']}/test.msz",
+                dest,
+                store_as="mszx",
+            )
+
+    def test_mzml_to_mszx_raises(self, served_ms_files, tmp_path):
+        """Converting mzml → mszx is out of scope and raises NotImplementedError."""
+        dest = tmp_path / "result.mzML"
+        with pytest.raises(NotImplementedError):
+            download_file(
+                f"{served_ms_files['base_url']}/test.mzML",
+                dest,
+                store_as="mszx",
+            )
+
+    def test_malformed_mszx_cleans_up(self, served_ms_files, tmp_path):
+        """A malformed .mszx archive raises and leaves no files behind."""
+        # Overwrite the served file with invalid tar bytes.
+        (served_ms_files["serve_dir"] / "broken.mszx").write_bytes(b"not a tar")
+
+        out_dir = tmp_path / "broken_output"
+        out_dir.mkdir()
+        dest = out_dir / "broken.mszx"
+
+        with pytest.raises(Exception):  # noqa: B017, PT011
+            download_file(
+                f"{served_ms_files['base_url']}/broken.mszx",
+                dest,
+                store_as="mzml",
+            )
+
+        # No .part, no partial mzML, no leftover mszx in the output dir.
+        assert list(out_dir.iterdir()) == []
+
+
+# ---------------------------------------------------------------------------
+# async_download_file
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestAsyncDownloadFile:
+    async def test_basic_download(self, served_files, tmp_path):
+        """Download a file and verify contents (async)."""
+        dest = tmp_path / "out" / "small.bin"
+        result = await async_download_file(
+            f"{served_files['base_url']}/small.bin",
+            dest,
+        )
+        assert result == dest
+        assert dest.exists()
+        assert dest.read_bytes() == b"hello world"
+
+    async def test_progress_callback(self, served_files, tmp_path):
+        """Progress callback is invoked with byte deltas (async)."""
+        dest = tmp_path / "medium.bin"
+        deltas: list[int] = []
+
+        class Tracker:
+            def on_progress(self, bytes_delta: int) -> None:
+                deltas.append(bytes_delta)
+
+        await async_download_file(
+            f"{served_files['base_url']}/medium.bin",
+            dest,
+            progress_callback=Tracker(),
+            chunk_size=1024,
+        )
+        assert len(deltas) > 0
+        assert sum(deltas) == 10_000
+
+    async def test_skip_existing(self, served_files, tmp_path):
+        """When skip_existing=True and file exists, download is skipped (async)."""
+        dest = tmp_path / "small.bin"
+        dest.write_bytes(b"already here")
+
+        result = await async_download_file(
+            f"{served_files['base_url']}/small.bin",
+            dest,
+            skip_existing=True,
+        )
+        assert result == dest
+        assert dest.read_bytes() == b"already here"
+
+    async def test_format_conversion_msz_to_mzml(
+        self, served_ms_files, test_mzml, tmp_path
+    ):
+        """Download .msz and decompress to .mzML (async)."""
+        dest = tmp_path / "result.msz"
+        result = await async_download_file(
+            f"{served_ms_files['base_url']}/test.msz",
+            dest,
+            store_as="mzml",
+        )
+        assert result == tmp_path / "result.mzML"
+        assert result.exists()
+        assert result.stat().st_size == test_mzml.stat().st_size
+
+    async def test_format_conversion_mszx_to_mzml(
+        self, served_ms_files, test_mzml, tmp_path
+    ):
+        """Download .mszx and decompress inner spectra to .mzML (async)."""
+        dest = tmp_path / "result.mszx"
+        result = await async_download_file(
+            f"{served_ms_files['base_url']}/test.mszx",
+            dest,
+            store_as="mzml",
+        )
+        assert result == tmp_path / "result.mzML"
+        assert result.stat().st_size == test_mzml.stat().st_size
+
+    async def test_format_conversion_mszx_to_msz(
+        self, served_ms_files, test_msz, tmp_path
+    ):
+        """Download .mszx and extract inner .msz (async)."""
+        dest = tmp_path / "result.mszx"
+        result = await async_download_file(
+            f"{served_ms_files['base_url']}/test.mszx",
+            dest,
+            store_as="msz",
+        )
+        assert result == tmp_path / "result.msz"
+        assert result.read_bytes() == test_msz.read_bytes()
+
+    async def test_http_404_raises(self, served_files, tmp_path):
+        """HTTP 404 raises an httpx.HTTPStatusError (async)."""
+        dest = tmp_path / "missing.bin"
+        with pytest.raises(httpx.HTTPStatusError):
+            await async_download_file(f"{served_files['base_url']}/nonexistent", dest)
+        assert not dest.exists()
+
+
+# ---------------------------------------------------------------------------
+# async_download_batch
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestAsyncDownloadBatch:
+    async def test_single_file(self, served_files, tmp_path):
+        """async_download_batch with a single file."""
+        dest = tmp_path / "small.bin"
+        requests = [
+            DownloadRequest(url=f"{served_files['base_url']}/small.bin", dest=dest),
+        ]
+        results = await async_download_batch(requests)
+        assert len(results) == 1
+        assert results[0] == dest
+        assert dest.read_bytes() == b"hello world"
+
+    async def test_multiple_files(self, served_files, tmp_path):
+        """async_download_batch downloads multiple files concurrently."""
+        requests = [
+            DownloadRequest(
+                url=f"{served_files['base_url']}/small.bin",
+                dest=tmp_path / "small.bin",
+            ),
+            DownloadRequest(
+                url=f"{served_files['base_url']}/medium.bin",
+                dest=tmp_path / "medium.bin",
+            ),
+        ]
+        results = await async_download_batch(requests, parallel=2)
+        assert len(results) == 2
+        assert (tmp_path / "small.bin").read_bytes() == b"hello world"
+        assert (tmp_path / "medium.bin").read_bytes() == b"x" * 10_000
+
+    async def test_error_does_not_block_others(self, served_files, tmp_path):
+        """One failed download does not prevent others from completing (async)."""
+        requests = [
+            DownloadRequest(
+                url=f"{served_files['base_url']}/small.bin",
+                dest=tmp_path / "small.bin",
+            ),
+            DownloadRequest(
+                url=f"{served_files['base_url']}/nonexistent",
+                dest=tmp_path / "missing.bin",
+            ),
+        ]
+
+        errors: list[str] = []
+
+        class Tracker:
+            def on_file_start(self, filename: str, total_bytes: int | None) -> None:
+                pass
+
+            def on_file_progress(self, filename: str, bytes_delta: int) -> None:
+                pass
+
+            def on_file_complete(self, filename: str) -> None:
+                pass
+
+            def on_file_error(self, filename: str, error: Exception) -> None:
+                errors.append(filename)
+
+        results = await async_download_batch(requests, parallel=2, progress=Tracker())
+        assert len(results) == 1
+        assert results[0] == tmp_path / "small.bin"
+        assert (tmp_path / "small.bin").read_bytes() == b"hello world"
+        assert "missing.bin" in errors

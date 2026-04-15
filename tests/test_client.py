@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -13,12 +14,12 @@ from mscompress import MSZFile, MZMLFile
 from mscompress.mszx import MSZXFile
 
 from mstransfer.client.sender import (
-    _counting_generator,
-    _file_chunk_generator,
-    resolve_inputs,
+    async_send_batch,
+    async_send_file,
     send_batch,
     send_file,
 )
+from mstransfer.client.utils import ThrottledCallback, resolve_inputs
 from mstransfer.server.app import create_app
 
 # ---------------------------------------------------------------------------
@@ -84,55 +85,53 @@ class TestResolveInputs:
 
 
 # ---------------------------------------------------------------------------
-# _counting_generator
+# ThrottledCallback
 # ---------------------------------------------------------------------------
 
 
-class TestCountingGenerator:
-    def test_yields_all_chunks(self):
-        chunks = [b"aaa", b"bb", b"c"]
-        result = list(_counting_generator(iter(chunks)))
-        assert result == chunks
+class TestThrottledCallback:
+    def test_accumulates_below_threshold(self):
+        """Deltas below threshold are accumulated, not forwarded."""
+        forwarded: list[int] = []
+        cb = ThrottledCallback(forwarded.append, threshold=100)
+        cb(30)
+        cb(30)
+        assert forwarded == []
+        assert cb._accumulated == 60
 
-    def test_callback_called_with_lengths(self):
-        chunks = [b"aaa", b"bb", b"c"]
-        sizes = []
-        list(_counting_generator(iter(chunks), callback=sizes.append))
-        assert sizes == [3, 2, 1]
+    def test_forwards_at_threshold(self):
+        """Callback fires once accumulated bytes reach the threshold."""
+        forwarded: list[int] = []
+        cb = ThrottledCallback(forwarded.append, threshold=100)
+        cb(60)
+        cb(50)  # 110 >= 100 → forward
+        assert forwarded == [110]
+        assert cb._accumulated == 0
 
-    def test_no_callback(self):
-        chunks = [b"hello"]
-        result = list(_counting_generator(iter(chunks), callback=None))
-        assert result == chunks
+    def test_flush_sends_remainder(self):
+        """flush() forwards any leftover accumulated bytes."""
+        forwarded: list[int] = []
+        cb = ThrottledCallback(forwarded.append, threshold=100)
+        cb(40)
+        cb.flush()
+        assert forwarded == [40]
+        assert cb._accumulated == 0
 
+    def test_flush_noop_when_empty(self):
+        """flush() does nothing if there are no accumulated bytes."""
+        forwarded: list[int] = []
+        cb = ThrottledCallback(forwarded.append, threshold=100)
+        cb.flush()
+        assert forwarded == []
 
-# ---------------------------------------------------------------------------
-# _file_chunk_generator
-# ---------------------------------------------------------------------------
-
-
-class TestFileChunkGenerator:
-    def test_reads_full_file(self, tmp_path):
-        f = tmp_path / "data.bin"
-        content = b"x" * 100
-        f.write_bytes(content)
-        result = b"".join(_file_chunk_generator(f, chunk_size=1024))
-        assert result == content
-
-    def test_chunked_reads(self, tmp_path):
-        f = tmp_path / "data.bin"
-        content = b"abcdefghij"
-        f.write_bytes(content)
-        chunks = list(_file_chunk_generator(f, chunk_size=3))
-        assert len(chunks) == 4  # 3+3+3+1
-        assert b"".join(chunks) == content
-
-    def test_callback_reports_sizes(self, tmp_path):
-        f = tmp_path / "data.bin"
-        f.write_bytes(b"abcdefghij")
-        sizes = []
-        list(_file_chunk_generator(f, chunk_size=4, callback=sizes.append))
-        assert sizes == [4, 4, 2]
+    def test_total_bytes_preserved(self):
+        """Sum of forwarded deltas equals sum of input deltas after flush."""
+        forwarded: list[int] = []
+        cb = ThrottledCallback(forwarded.append, threshold=50)
+        for _ in range(100):
+            cb(7)
+        cb.flush()
+        assert sum(forwarded) == 700
 
 
 # ---------------------------------------------------------------------------
@@ -275,24 +274,22 @@ class TestSendFile:
         assert result.bytes_received > 0
 
     def test_chunk_size_affects_generator(self, test_msz, _live_server):
-        """Smaller chunk_size should produce more progress callbacks."""
-        small_deltas = []
+        """Both small and large chunk sizes should transfer the full file."""
+        small_deltas: list[int] = []
         send_file(
             test_msz,
             _live_server["base_url"],
             progress_callback=small_deltas.append,
             chunk_size=256,
         )
-        large_deltas = []
+        large_deltas: list[int] = []
         send_file(
             test_msz,
             _live_server["base_url"],
             progress_callback=large_deltas.append,
             chunk_size=1_048_576,
         )
-        # Smaller chunks should produce at least as many callbacks
-        assert len(small_deltas) >= len(large_deltas)
-        # Both should transfer the full file
+        # Both should transfer the full file regardless of chunk size
         assert sum(small_deltas) == test_msz.stat().st_size
         assert sum(large_deltas) == test_msz.stat().st_size
 
@@ -404,10 +401,14 @@ class TestSendBatch:
         assert r1.response.state == "done"
 
     def test_error_captured_in_results(self, test_msz, _live_server):
-        """When send_file raises, the error is captured in the results list."""
+        """When async_send_file raises, the error is captured in the results list."""
+
+        async def _explode(*args, **kwargs):
+            raise ConnectionError("server exploded")
+
         with patch(
-            "mstransfer.client.sender.send_file",
-            side_effect=ConnectionError("server exploded"),
+            "mstransfer.client.sender.async_send_file",
+            side_effect=_explode,
         ):
             results = send_batch(
                 [test_msz],
@@ -425,17 +426,23 @@ class TestSendBatch:
         good_file = tmp_path / "good.msz"
         good_file.write_bytes(test_msz.read_bytes())
 
-        original_send = send_file
+        original_send = async_send_file
 
-        def flaky_send(file_path, *args, **kwargs):
-            if file_path.name == "bad.msz":
+        async def flaky_send(source, *args, **kwargs):
+            if isinstance(source, MSZXFile):
+                name = source.archive_path.name
+            elif isinstance(source, Path):
+                name = source.name
+            else:
+                name = Path(source.path.decode()).name
+            if name == "bad.msz":
                 raise ConnectionError("boom")
-            return original_send(file_path, *args, **kwargs)
+            return await original_send(source, *args, **kwargs)
 
         bad_file = tmp_path / "bad.msz"
         bad_file.write_bytes(test_msz.read_bytes())
 
-        with patch("mstransfer.client.sender.send_file", side_effect=flaky_send):
+        with patch("mstransfer.client.sender.async_send_file", side_effect=flaky_send):
             results = send_batch(
                 [good_file, bad_file],
                 _live_server["base_url"],
@@ -447,23 +454,23 @@ class TestSendBatch:
         assert by_name["bad.msz"].error is not None
 
     def test_parallel_capped_to_file_count(self, test_msz, _live_server):
-        """Workers should not exceed the number of files."""
+        """Semaphore should not exceed the number of files."""
         with patch(
-            "mstransfer.client.sender.ThreadPoolExecutor",
-            wraps=ThreadPoolExecutor,
-        ) as mock_pool:
+            "asyncio.Semaphore",
+            wraps=asyncio.Semaphore,
+        ) as mock_sem:
             send_batch(
                 [test_msz],
                 _live_server["base_url"],
                 parallel=8,
             )
-            mock_pool.assert_called_once_with(max_workers=1)
+            mock_sem.assert_called_once_with(1)
 
     def test_chunk_size_passed_to_send_file(self, test_msz, _live_server):
-        """send_batch should forward chunk_size to send_file."""
+        """send_batch should forward chunk_size to async_send_file."""
         with patch(
-            "mstransfer.client.sender.send_file",
-            wraps=send_file,
+            "mstransfer.client.sender.async_send_file",
+            wraps=async_send_file,
         ) as mock_send:
             send_batch(
                 [test_msz],
@@ -516,6 +523,134 @@ class TestSendBatch:
         assert len(results) == 2
         names = {r.filename for r in results}
         assert names == {"test.msz", "test.mszx"}
+        for r in results:
+            assert r.response is not None
+            assert r.response.state == "done"
+
+
+# ---------------------------------------------------------------------------
+# async_send_file
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestAsyncSendFile:
+    async def test_send_msz_file(self, test_msz, _live_server):
+        """Send a real .msz file to the server (async)."""
+        result = await async_send_file(
+            test_msz,
+            _live_server["base_url"],
+        )
+        assert result.state == "done"
+        assert result.filename == "test.msz"
+        assert result.bytes_received == test_msz.stat().st_size
+
+        written = _live_server["output_dir"] / "test.msz"
+        assert written.exists()
+        assert written.read_bytes() == test_msz.read_bytes()
+
+    async def test_send_mzml_file(self, test_mzml, _live_server):
+        """Send a real .mzML file — sender compresses on the fly (async)."""
+        result = await async_send_file(
+            test_mzml,
+            _live_server["base_url"],
+        )
+        assert result.state == "done"
+        assert result.filename == "test.mzML"
+        assert result.bytes_received > 0
+
+        written = _live_server["output_dir"] / "test.msz"
+        assert written.exists()
+        assert written.stat().st_size > 0
+
+    async def test_send_file_progress_callback(self, test_msz, _live_server):
+        """Progress callback should be invoked with byte deltas (async)."""
+        deltas: list[int] = []
+        await async_send_file(
+            test_msz,
+            _live_server["base_url"],
+            progress_callback=deltas.append,
+        )
+        assert len(deltas) > 0
+        assert sum(deltas) == test_msz.stat().st_size
+
+    async def test_send_mzmlfile_object(self, test_mzml, _live_server):
+        """async_send_file accepts an MZMLFile object directly."""
+        mzml = MZMLFile(str(test_mzml).encode())
+        result = await async_send_file(mzml, _live_server["base_url"])
+        assert result.state == "done"
+        assert result.filename == "test.mzML"
+        assert result.bytes_received > 0
+
+    async def test_send_mszfile_object(self, test_msz, _live_server):
+        """async_send_file accepts an MSZFile object directly."""
+        msz = MSZFile(str(test_msz).encode())
+        result = await async_send_file(msz, _live_server["base_url"])
+        assert result.state == "done"
+        assert result.filename == "test.msz"
+        assert result.bytes_received == test_msz.stat().st_size
+
+    async def test_send_mszxfile_object(self, test_mszx, _live_server):
+        """async_send_file accepts an MSZXFile object directly."""
+        mszx = MSZXFile.open(test_mszx)
+        result = await async_send_file(mszx, _live_server["base_url"])
+        assert result.state == "done"
+        assert result.filename == "test.mszx"
+        assert result.bytes_received == test_mszx.stat().st_size
+        mszx.close()
+
+    async def test_send_file_rejects_invalid_type(self, _live_server):
+        """async_send_file raises TypeError for unsupported input types."""
+        with pytest.raises(TypeError, match="Unsupported source type"):
+            await async_send_file("not_a_path_or_file", _live_server["base_url"])  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
+# async_send_batch
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestAsyncSendBatch:
+    async def test_single_file(self, test_msz, _live_server):
+        """async_send_batch with a single file returns a one-element result list."""
+        results = await async_send_batch(
+            [test_msz],
+            _live_server["base_url"],
+            parallel=1,
+        )
+        assert len(results) == 1
+        r = results[0]
+        assert r.response is not None
+        assert r.response.state == "done"
+        assert r.filename == "test.msz"
+
+    async def test_multiple_files(self, test_msz, _live_server, tmp_path):
+        """async_send_batch sends multiple files concurrently."""
+        copies = []
+        for i in range(3):
+            copy = tmp_path / f"copy_{i}.msz"
+            copy.write_bytes(test_msz.read_bytes())
+            copies.append(copy)
+
+        results = await async_send_batch(
+            copies,
+            _live_server["base_url"],
+            parallel=2,
+        )
+        assert len(results) == 3
+        for r in results:
+            assert r.response is not None
+            assert r.response.state == "done"
+
+    async def test_mixed_msz_and_mzml(self, test_msz, test_mzml, _live_server):
+        """async_send_batch handles a mix of .msz and .mzML files."""
+        results = await async_send_batch(
+            [test_msz, test_mzml],
+            _live_server["base_url"],
+            parallel=2,
+        )
+        assert len(results) == 2
         for r in results:
             assert r.response is not None
             assert r.response.state == "done"

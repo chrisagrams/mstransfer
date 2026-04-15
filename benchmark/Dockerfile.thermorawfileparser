@@ -1,0 +1,12 @@
+FROM --platform=linux/amd64 mcr.microsoft.com/dotnet/aspnet:8.0
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends wget unzip \
+    && wget -q https://github.com/CompOmics/ThermoRawFileParser/releases/download/v.2.0.0-dev/ThermoRawFileParser-v.2.0.0-dev-net8.zip -O /tmp/trfp.zip \
+    && unzip /tmp/trfp.zip -d /opt/ThermoRawFileParser \
+    && rm /tmp/trfp.zip \
+    && apt-get purge -y wget unzip \
+    && apt-get autoremove -y \
+    && rm -rf /var/lib/apt/lists/*
+
+ENTRYPOINT ["dotnet", "/opt/ThermoRawFileParser/ThermoRawFileParser.dll"]

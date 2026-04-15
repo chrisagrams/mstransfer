@@ -1,46 +1,92 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
-from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
 
+import aiofiles
 import httpx
 from mscompress import MSZFile, MZMLFile
+from mscompress.mszx import MSZXFile
+
+from mstransfer.client.utils import ThrottledCallback, optional_client
 
 if TYPE_CHECKING:
-    from mstransfer.server.models import StoreFormat
+    from collections.abc import Callable
 
 logger = logging.getLogger(__name__)
 
+# Output formats the client can produce on disk after download.
+DownloadFormat = Literal["msz", "mzml", "mszx"]
 
-def _detect_source_format(url: str) -> str | None:
+# Mapping of format to canonical file extension for naming converted outputs.
+_FORMAT_EXT: dict[DownloadFormat, str] = {
+    "msz": ".msz",
+    "mzml": ".mzML",
+    "mszx": ".mszx",
+}
+
+# Reverse mapping of lowercase extension to format for source format inference.
+_EXT_FORMAT: dict[str, DownloadFormat] = {v.lower(): k for k, v in _FORMAT_EXT.items()}
+
+
+def _msz_to_mzml(src: Path, dst: Path) -> None:
+    """Lambda wrapper msz -> mzml for use in async thread executor."""
+    MSZFile(str(src).encode()).decompress(str(dst))
+
+
+def _mzml_to_msz(src: Path, dst: Path) -> None:
+    """Lambda wrapper mzml -> msz for use in async thread executor."""
+    MZMLFile(str(src).encode()).compress(str(dst))
+
+
+def _mszx_to_mzml(src: Path, dst: Path) -> None:
+    """Lambda wrapper mszx -> mzml for use in async thread executor."""
+    with MSZXFile.open(src) as mszx:
+        mszx.decompress(str(dst))
+
+
+def _mszx_to_msz(src: Path, dst: Path) -> None:
+    """Lambda wrapper mszx -> msz for use in async thread executor."""
+    with MSZXFile.open(src) as mszx:
+        shutil.move(mszx.path.decode(), dst)
+
+
+# Mapping of (source_format, target_format) to converter function.
+_CONVERTERS: dict[
+    tuple[DownloadFormat, DownloadFormat], Callable[[Path, Path], None]
+] = {
+    ("msz", "mzml"): _msz_to_mzml,
+    ("mzml", "msz"): _mzml_to_msz,
+    ("mszx", "mzml"): _mszx_to_mzml,
+    ("mszx", "msz"): _mszx_to_msz,
+}
+
+
+def _detect_source_format(url: str) -> DownloadFormat | None:
     """Infer the source format from the URL filename extension.
 
-    Returns ``"msz"``, ``"mzml"``, or *None* if the format cannot be
-    determined.
+    Returns ``"msz"``, ``"mzml"``, ``"mszx"``, or *None* if the format
+    cannot be determined.
     """
     # Strip query params and fragments before inspecting extension.
     path = url.split("?", 1)[0].split("#", 1)[0]
-    ext = Path(path).suffix.lower()
-    if ext == ".msz":
-        return "msz"
-    if ext == ".mzml":
-        return "mzml"
-    return None
+    return _EXT_FORMAT.get(Path(path).suffix.lower())
 
 
 def _resolve_dest(
-    dest: Path, store_as: StoreFormat | None, source_fmt: str | None
+    dest: Path,
+    store_as: DownloadFormat | None,
+    source_fmt: DownloadFormat | None,
 ) -> Path:
     """Adjust *dest* extension when *store_as* differs from the source."""
     if store_as is None or source_fmt is None or store_as == source_fmt:
         return dest
-    # Replace the extension to match the target format.
-    ext = ".msz" if store_as == "msz" else ".mzML"
-    return dest.with_suffix(ext)
+    return dest.with_suffix(_FORMAT_EXT[store_as])
 
 
 @runtime_checkable
@@ -68,19 +114,20 @@ class DownloadRequest:
     dest: Path
 
 
-def download_file(
+async def async_download_file(
     url: str,
     dest: Path,
     *,
-    store_as: StoreFormat | None = None,
+    store_as: DownloadFormat | None = None,
     chunk_size: int = 1_048_576,
     connect_timeout: float = 10.0,
     read_timeout: float = 300.0,
     progress_callback: DownloadProgressCallback | None = None,
     skip_existing: bool = False,
     force: bool = False,
+    client: httpx.AsyncClient | None = None,
 ) -> Path:
-    """Download a single file from *url* to *dest*.
+    """Download a single file from *url* to *dest* (async).
 
     The file is streamed to a temporary ``.part`` file first, then atomically
     renamed (or converted) to the final destination on success.
@@ -94,9 +141,11 @@ def download_file(
         requires a format conversion, the extension will be adjusted
         automatically.
     store_as:
-        Desired output format — ``"msz"``, ``"mzml"``, or *None* to keep
-        the file as-is.  When set, the downloaded file is compressed or
-        decompressed after download using **mscompress**.
+        Desired output format — ``"msz"``, ``"mzml"``, ``"mszx"``, or
+        *None* to keep the file as-is.  When set, the downloaded file
+        is converted after download using **mscompress**.  Conversion
+        *to* ``"mszx"`` is only supported when the source is already
+        ``.mszx`` (no-op); other combos raise :class:`NotImplementedError`.
     chunk_size:
         Number of bytes per read chunk (default 1 MiB).
     connect_timeout:
@@ -121,6 +170,12 @@ def download_file(
     source_fmt = _detect_source_format(url)
     final_dest = _resolve_dest(dest, store_as, source_fmt)
 
+    # Fail fast on unsupported conversion combinations before any I/O.
+    if store_as == "mszx" and source_fmt is not None and source_fmt != "mszx":
+        raise NotImplementedError(
+            f"Conversion from {source_fmt} to mszx is not supported"
+        )
+
     # Skip if file already exists and we're not forcing.
     if not force and skip_existing and final_dest.exists():
         logger.info("Skipping existing file: %s", final_dest)
@@ -134,52 +189,63 @@ def download_file(
 
     timeout = httpx.Timeout(read_timeout, connect=connect_timeout)
 
-    with httpx.Client(timeout=timeout) as client, client.stream("GET", url) as resp:
-        resp.raise_for_status()
-
-        with open(part_path, "wb") as f:
-            for chunk in resp.iter_bytes(chunk_size=chunk_size):
-                f.write(chunk)
-                if progress_callback:
-                    progress_callback.on_progress(len(chunk))
-
-    # Determine whether a format conversion is needed.
-    needs_conversion = (
-        store_as is not None and source_fmt is not None and store_as != source_fmt
+    # Throttle progress callbacks to reduce overhead (default: every 8 MiB).
+    throttled = (
+        ThrottledCallback(progress_callback.on_progress) if progress_callback else None
     )
 
-    if not needs_conversion:
-        # No conversion — atomic rename to final destination.
+    async with (
+        optional_client(client, timeout=timeout) as c,
+        c.stream("GET", url) as resp,
+    ):
+        resp.raise_for_status()
+
+        async with aiofiles.open(part_path, "wb") as f:
+            async for chunk in resp.aiter_bytes(chunk_size=chunk_size):
+                await f.write(chunk)
+                if throttled:
+                    throttled(len(chunk))
+
+        if throttled:
+            throttled.flush()
+
+    # No conversion needed — atomic rename to final destination.
+    if store_as is None or source_fmt is None or store_as == source_fmt:
         part_path.rename(final_dest)
         return final_dest
 
-    # Conversion required — give the temp file the correct source extension
-    # so mscompress can recognise its format, then convert.
-    src_ext = ".msz" if source_fmt == "msz" else ".mzML"
-    tmp_source = part_path.with_suffix(src_ext)
+    converter = _CONVERTERS.get((source_fmt, store_as))
+    if converter is None:
+        part_path.unlink(missing_ok=True)
+        raise NotImplementedError(
+            f"Conversion from {source_fmt} to {store_as} is not supported"
+        )
+
+    # Give the temp file the correct source extension so mscompress can
+    # recognise its format, then convert.
+    tmp_source = part_path.with_suffix(_FORMAT_EXT[source_fmt])
     part_path.rename(tmp_source)
 
+    # Stage converted output; atomically rename to final_dest on success.
+    staging = final_dest.with_suffix(final_dest.suffix + ".part")
+
     try:
-        if source_fmt == "msz" and store_as == "mzml":
-            msz = MSZFile(str(tmp_source).encode())
-            msz.decompress(str(final_dest))
-            logger.info("Decompressed %s → %s", tmp_source.name, final_dest.name)
-        elif source_fmt == "mzml" and store_as == "msz":
-            mzml = MZMLFile(str(tmp_source).encode())
-            mzml.compress(str(final_dest))
-            logger.info("Compressed %s → %s", tmp_source.name, final_dest.name)
+        await asyncio.to_thread(converter, tmp_source, staging)
+        staging.replace(final_dest)
+        logger.info("Converted %s → %s", tmp_source.name, final_dest.name)
     finally:
-        # Clean up the intermediate source file.
+        if staging.exists():
+            staging.unlink()
         if tmp_source.exists():
             os.remove(tmp_source)
 
     return final_dest
 
 
-def download_batch(
+async def async_download_batch(
     files: list[DownloadRequest],
     *,
-    store_as: StoreFormat | None = None,
+    store_as: DownloadFormat | None = None,
     parallel: int = 4,
     chunk_size: int = 1_048_576,
     connect_timeout: float = 10.0,
@@ -187,16 +253,18 @@ def download_batch(
     progress: BatchDownloadProgress | None = None,
     skip_existing: bool = False,
     force: bool = False,
+    client: httpx.AsyncClient | None = None,
 ) -> list[Path]:
-    """Download multiple files in parallel.
+    """Download multiple files in parallel (async).
 
     Parameters
     ----------
     files:
         List of :class:`DownloadRequest` objects (url + dest pairs).
     store_as:
-        Desired output format — ``"msz"``, ``"mzml"``, or *None* to keep
-        files as-is.  Forwarded to each :func:`download_file` call.
+        Desired output format — ``"msz"``, ``"mzml"``, ``"mszx"``, or
+        *None* to keep files as-is.  Forwarded to each
+        :func:`async_download_file` call.
     parallel:
         Maximum number of concurrent downloads (capped to file count).
     chunk_size:
@@ -215,27 +283,31 @@ def download_batch(
     Returns
     -------
     list[Path]
-        List of final destination paths (in completion order).
+        List of final destination paths (in input order, errors excluded).
     """
     workers = min(parallel, len(files))
-    results: list[Path] = []
+    sem = asyncio.Semaphore(workers)
 
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures: dict[Future[Path], DownloadRequest] = {}
+    # Pre-allocate results list indexed by position for deterministic ordering.
+    results: list[Path | None] = [None] * len(files)
 
-        for req in files:
-            filename = req.dest.name
+    async def _download_one(idx: int, req: DownloadRequest) -> None:
+        filename = req.dest.name
 
+        async with sem:
             # Try to determine total bytes from a HEAD request (best-effort).
             total_bytes: int | None = None
             if progress:
                 try:
-                    head_resp = httpx.head(
-                        req.url, timeout=connect_timeout, follow_redirects=True
-                    )
-                    cl = head_resp.headers.get("content-length")
-                    if cl is not None:
-                        total_bytes = int(cl)
+                    async with optional_client(
+                        client, timeout=connect_timeout
+                    ) as head_client:
+                        head_resp = await head_client.head(
+                            req.url, follow_redirects=True
+                        )
+                        cl = head_resp.headers.get("content-length")
+                        if cl is not None:
+                            total_bytes = int(cl)
                 except Exception:  # noqa: BLE001
                     pass
                 progress.on_file_start(filename, total_bytes)
@@ -246,26 +318,20 @@ def download_batch(
             if progress:
                 file_progress = _FileProgressAdapter(filename, progress)
 
-            future = pool.submit(
-                download_file,
-                req.url,
-                req.dest,
-                store_as=store_as,
-                chunk_size=chunk_size,
-                connect_timeout=connect_timeout,
-                read_timeout=read_timeout,
-                progress_callback=file_progress,
-                skip_existing=skip_existing,
-                force=force,
-            )
-            futures[future] = req
-
-        for future in as_completed(futures):
-            req = futures[future]
-            filename = req.dest.name
             try:
-                result = future.result()
-                results.append(result)
+                result = await async_download_file(
+                    req.url,
+                    req.dest,
+                    store_as=store_as,
+                    chunk_size=chunk_size,
+                    connect_timeout=connect_timeout,
+                    read_timeout=read_timeout,
+                    progress_callback=file_progress,
+                    skip_existing=skip_existing,
+                    force=force,
+                    client=client,
+                )
+                results[idx] = result
                 if progress:
                     progress.on_file_complete(filename)
             except Exception as exc:
@@ -273,7 +339,75 @@ def download_batch(
                     progress.on_file_error(filename, exc)
                 logger.error("Failed to download %s: %s", filename, exc)
 
-    return results
+    await asyncio.gather(*[_download_one(i, req) for i, req in enumerate(files)])
+
+    return [r for r in results if r is not None]
+
+
+def download_file(
+    url: str,
+    dest: Path,
+    *,
+    store_as: DownloadFormat | None = None,
+    chunk_size: int = 1_048_576,
+    connect_timeout: float = 10.0,
+    read_timeout: float = 300.0,
+    progress_callback: DownloadProgressCallback | None = None,
+    skip_existing: bool = False,
+    force: bool = False,
+    client: httpx.AsyncClient | None = None,
+) -> Path:
+    """Download a single file from *url* to *dest*.
+
+    This is a synchronous wrapper around :func:`async_download_file`.
+    """
+    return asyncio.run(
+        async_download_file(
+            url,
+            dest,
+            store_as=store_as,
+            chunk_size=chunk_size,
+            connect_timeout=connect_timeout,
+            read_timeout=read_timeout,
+            progress_callback=progress_callback,
+            skip_existing=skip_existing,
+            force=force,
+            client=client,
+        )
+    )
+
+
+def download_batch(
+    files: list[DownloadRequest],
+    *,
+    store_as: DownloadFormat | None = None,
+    parallel: int = 4,
+    chunk_size: int = 1_048_576,
+    connect_timeout: float = 10.0,
+    read_timeout: float = 300.0,
+    progress: BatchDownloadProgress | None = None,
+    skip_existing: bool = False,
+    force: bool = False,
+    client: httpx.AsyncClient | None = None,
+) -> list[Path]:
+    """Download multiple files in parallel.
+
+    This is a synchronous wrapper around :func:`async_download_batch`.
+    """
+    return asyncio.run(
+        async_download_batch(
+            files,
+            store_as=store_as,
+            parallel=parallel,
+            chunk_size=chunk_size,
+            connect_timeout=connect_timeout,
+            read_timeout=read_timeout,
+            progress=progress,
+            skip_existing=skip_existing,
+            force=force,
+            client=client,
+        )
+    )
 
 
 class _FileProgressAdapter:
