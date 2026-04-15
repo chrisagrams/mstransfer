@@ -6,7 +6,7 @@ import os
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
 
 import aiofiles
 import httpx
@@ -14,6 +14,9 @@ from mscompress import MSZFile, MZMLFile
 from mscompress.mszx import MSZXFile
 
 from mstransfer.client.utils import ThrottledCallback, optional_client
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 DownloadFormat = Literal["msz", "mzml", "mszx"]
 """Output formats the client can produce on disk after download."""
@@ -26,6 +29,39 @@ _FORMAT_EXT: dict[DownloadFormat, str] = {
     "mszx": ".mszx",
 }
 _EXT_FORMAT: dict[str, DownloadFormat] = {v.lower(): k for k, v in _FORMAT_EXT.items()}
+
+
+def _msz_to_mzml(src: Path, dst: Path) -> None:
+    """Lambda wrapper msz -> mzml for use in async thread executor."""
+    MSZFile(str(src).encode()).decompress(str(dst))
+
+
+def _mzml_to_msz(src: Path, dst: Path) -> None:
+    """Lambda wrapper mzml -> msz for use in async thread executor."""
+    MZMLFile(str(src).encode()).compress(str(dst))
+
+
+def _mszx_to_mzml(src: Path, dst: Path) -> None:
+    """Lambda wrapper mszx -> mzml for use in async thread executor."""
+    with MSZXFile.open(src) as mszx:
+        mszx.decompress(str(dst))
+
+
+def _mszx_to_msz(src: Path, dst: Path) -> None:
+    """Lambda wrapper mszx -> msz for use in async thread executor."""
+    with MSZXFile.open(src) as mszx:
+        shutil.move(mszx.path.decode(), dst)
+
+
+# Mapping of (source_format, target_format) to converter function.
+_CONVERTERS: dict[
+    tuple[DownloadFormat, DownloadFormat], Callable[[Path, Path], None]
+] = {
+    ("msz", "mzml"): _msz_to_mzml,
+    ("mzml", "msz"): _mzml_to_msz,
+    ("mszx", "mzml"): _mszx_to_mzml,
+    ("mszx", "msz"): _mszx_to_msz,
+}
 
 
 def _detect_source_format(url: str) -> DownloadFormat | None:
@@ -175,8 +211,15 @@ async def async_download_file(
         part_path.rename(final_dest)
         return final_dest
 
-    # Conversion required — give the temp file the correct source extension
-    # so mscompress can recognise its format, then convert.
+    converter = _CONVERTERS.get((source_fmt, store_as))
+    if converter is None:
+        part_path.unlink(missing_ok=True)
+        raise NotImplementedError(
+            f"Conversion from {source_fmt} to {store_as} is not supported"
+        )
+
+    # Give the temp file the correct source extension so mscompress can
+    # recognise its format, then convert.
     tmp_source = part_path.with_suffix(_FORMAT_EXT[source_fmt])
     part_path.rename(tmp_source)
 
@@ -184,30 +227,7 @@ async def async_download_file(
     staging = final_dest.with_suffix(final_dest.suffix + ".part")
 
     try:
-        if source_fmt == "msz" and store_as == "mzml":
-            msz = MSZFile(str(tmp_source).encode())
-            await asyncio.to_thread(msz.decompress, str(staging))
-        elif source_fmt == "mzml" and store_as == "msz":
-            mzml = MZMLFile(str(tmp_source).encode())
-            await asyncio.to_thread(mzml.compress, str(staging))
-        elif source_fmt == "mszx" and store_as == "mzml":
-
-            def _decompress_mszx() -> None:
-                with MSZXFile.open(tmp_source) as mszx:
-                    mszx.decompress(str(staging))
-
-            await asyncio.to_thread(_decompress_mszx)
-        elif source_fmt == "mszx" and store_as == "msz":
-
-            def _extract_inner_msz() -> None:
-                with MSZXFile.open(tmp_source) as mszx:
-                    shutil.move(mszx.path.decode(), staging)
-
-            await asyncio.to_thread(_extract_inner_msz)
-        else:
-            raise NotImplementedError(
-                f"Conversion from {source_fmt} to {store_as} is not supported"
-            )
+        await asyncio.to_thread(converter, tmp_source, staging)
         staging.replace(final_dest)
         logger.info("Converted %s → %s", tmp_source.name, final_dest.name)
     finally:
