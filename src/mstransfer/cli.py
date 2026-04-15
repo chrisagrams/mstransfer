@@ -362,7 +362,7 @@ def main() -> None:
     )
     dp.add_argument(
         "--store-as",
-        choices=["msz", "mzml"],
+        choices=["msz", "mzml", "mszx"],
         default=None,
         help="Convert downloaded files to this format (default: keep as-is)",
     )

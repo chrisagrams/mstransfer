@@ -3,27 +3,35 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Protocol, runtime_checkable
+from typing import Literal, Protocol, runtime_checkable
 
 import aiofiles
 import httpx
 from mscompress import MSZFile, MZMLFile
+from mscompress.mszx import MSZXFile
 
 from mstransfer.client.utils import ThrottledCallback, optional_client
 
-if TYPE_CHECKING:
-    from mstransfer.server.models import StoreFormat
+DownloadFormat = Literal["msz", "mzml", "mszx"]
+"""Output formats the client can produce on disk after download."""
 
 logger = logging.getLogger(__name__)
 
+_FORMAT_EXT: dict[DownloadFormat, str] = {
+    "msz": ".msz",
+    "mzml": ".mzML",
+    "mszx": ".mszx",
+}
 
-def _detect_source_format(url: str) -> str | None:
+
+def _detect_source_format(url: str) -> DownloadFormat | None:
     """Infer the source format from the URL filename extension.
 
-    Returns ``"msz"``, ``"mzml"``, or *None* if the format cannot be
-    determined.
+    Returns ``"msz"``, ``"mzml"``, ``"mszx"``, or *None* if the format
+    cannot be determined.
     """
     # Strip query params and fragments before inspecting extension.
     path = url.split("?", 1)[0].split("#", 1)[0]
@@ -32,18 +40,20 @@ def _detect_source_format(url: str) -> str | None:
         return "msz"
     if ext == ".mzml":
         return "mzml"
+    if ext == ".mszx":
+        return "mszx"
     return None
 
 
 def _resolve_dest(
-    dest: Path, store_as: StoreFormat | None, source_fmt: str | None
+    dest: Path,
+    store_as: DownloadFormat | None,
+    source_fmt: DownloadFormat | None,
 ) -> Path:
     """Adjust *dest* extension when *store_as* differs from the source."""
     if store_as is None or source_fmt is None or store_as == source_fmt:
         return dest
-    # Replace the extension to match the target format.
-    ext = ".msz" if store_as == "msz" else ".mzML"
-    return dest.with_suffix(ext)
+    return dest.with_suffix(_FORMAT_EXT[store_as])
 
 
 @runtime_checkable
@@ -75,7 +85,7 @@ async def async_download_file(
     url: str,
     dest: Path,
     *,
-    store_as: StoreFormat | None = None,
+    store_as: DownloadFormat | None = None,
     chunk_size: int = 1_048_576,
     connect_timeout: float = 10.0,
     read_timeout: float = 300.0,
@@ -98,9 +108,11 @@ async def async_download_file(
         requires a format conversion, the extension will be adjusted
         automatically.
     store_as:
-        Desired output format — ``"msz"``, ``"mzml"``, or *None* to keep
-        the file as-is.  When set, the downloaded file is compressed or
-        decompressed after download using **mscompress**.
+        Desired output format — ``"msz"``, ``"mzml"``, ``"mszx"``, or
+        *None* to keep the file as-is.  When set, the downloaded file
+        is converted after download using **mscompress**.  Conversion
+        *to* ``"mszx"`` is only supported when the source is already
+        ``.mszx`` (no-op); other combos raise :class:`NotImplementedError`.
     chunk_size:
         Number of bytes per read chunk (default 1 MiB).
     connect_timeout:
@@ -124,6 +136,12 @@ async def async_download_file(
     """
     source_fmt = _detect_source_format(url)
     final_dest = _resolve_dest(dest, store_as, source_fmt)
+
+    # Fail fast on unsupported conversion combinations before any I/O.
+    if store_as == "mszx" and source_fmt is not None and source_fmt != "mszx":
+        raise NotImplementedError(
+            f"Conversion from {source_fmt} to mszx is not supported"
+        )
 
     # Skip if file already exists and we're not forcing.
     if not force and skip_existing and final_dest.exists():
@@ -158,33 +176,49 @@ async def async_download_file(
         if throttled:
             throttled.flush()
 
-    # Determine whether a format conversion is needed.
-    needs_conversion = (
-        store_as is not None and source_fmt is not None and store_as != source_fmt
-    )
-
-    if not needs_conversion:
-        # No conversion — atomic rename to final destination.
+    # No conversion needed — atomic rename to final destination.
+    if store_as is None or source_fmt is None or store_as == source_fmt:
         part_path.rename(final_dest)
         return final_dest
 
     # Conversion required — give the temp file the correct source extension
     # so mscompress can recognise its format, then convert.
-    src_ext = ".msz" if source_fmt == "msz" else ".mzML"
-    tmp_source = part_path.with_suffix(src_ext)
+    tmp_source = part_path.with_suffix(_FORMAT_EXT[source_fmt])
     part_path.rename(tmp_source)
+
+    # Stage converted output; atomically rename to final_dest on success.
+    staging = final_dest.with_suffix(final_dest.suffix + ".part")
 
     try:
         if source_fmt == "msz" and store_as == "mzml":
             msz = MSZFile(str(tmp_source).encode())
-            await asyncio.to_thread(msz.decompress, str(final_dest))
-            logger.info("Decompressed %s → %s", tmp_source.name, final_dest.name)
+            await asyncio.to_thread(msz.decompress, str(staging))
         elif source_fmt == "mzml" and store_as == "msz":
             mzml = MZMLFile(str(tmp_source).encode())
-            await asyncio.to_thread(mzml.compress, str(final_dest))
-            logger.info("Compressed %s → %s", tmp_source.name, final_dest.name)
+            await asyncio.to_thread(mzml.compress, str(staging))
+        elif source_fmt == "mszx" and store_as == "mzml":
+
+            def _decompress_mszx() -> None:
+                with MSZXFile.open(tmp_source) as mszx:
+                    mszx.decompress(str(staging))
+
+            await asyncio.to_thread(_decompress_mszx)
+        elif source_fmt == "mszx" and store_as == "msz":
+
+            def _extract_inner_msz() -> None:
+                with MSZXFile.open(tmp_source) as mszx:
+                    shutil.move(mszx.path.decode(), staging)
+
+            await asyncio.to_thread(_extract_inner_msz)
+        else:
+            raise NotImplementedError(
+                f"Conversion from {source_fmt} to {store_as} is not supported"
+            )
+        staging.replace(final_dest)
+        logger.info("Converted %s → %s", tmp_source.name, final_dest.name)
     finally:
-        # Clean up the intermediate source file.
+        if staging.exists():
+            staging.unlink()
         if tmp_source.exists():
             os.remove(tmp_source)
 
@@ -194,7 +228,7 @@ async def async_download_file(
 async def async_download_batch(
     files: list[DownloadRequest],
     *,
-    store_as: StoreFormat | None = None,
+    store_as: DownloadFormat | None = None,
     parallel: int = 4,
     chunk_size: int = 1_048_576,
     connect_timeout: float = 10.0,
@@ -211,8 +245,9 @@ async def async_download_batch(
     files:
         List of :class:`DownloadRequest` objects (url + dest pairs).
     store_as:
-        Desired output format — ``"msz"``, ``"mzml"``, or *None* to keep
-        files as-is.  Forwarded to each :func:`async_download_file` call.
+        Desired output format — ``"msz"``, ``"mzml"``, ``"mszx"``, or
+        *None* to keep files as-is.  Forwarded to each
+        :func:`async_download_file` call.
     parallel:
         Maximum number of concurrent downloads (capped to file count).
     chunk_size:
@@ -296,7 +331,7 @@ def download_file(
     url: str,
     dest: Path,
     *,
-    store_as: StoreFormat | None = None,
+    store_as: DownloadFormat | None = None,
     chunk_size: int = 1_048_576,
     connect_timeout: float = 10.0,
     read_timeout: float = 300.0,
@@ -328,7 +363,7 @@ def download_file(
 def download_batch(
     files: list[DownloadRequest],
     *,
-    store_as: StoreFormat | None = None,
+    store_as: DownloadFormat | None = None,
     parallel: int = 4,
     chunk_size: int = 1_048_576,
     connect_timeout: float = 10.0,
