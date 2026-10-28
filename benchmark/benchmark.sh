@@ -3,23 +3,27 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DATA_DIR="$SCRIPT_DIR/data"
+DOWNLOAD_DIR="$SCRIPT_DIR/downloads"
 ALL_TARGETS=(mstransfer sftp s3)
+ALL_OPERATIONS=(upload download)
 BANDWIDTH=""
+OPERATION="both"
 
 usage() {
     echo "Usage: $(basename "$0") [options] [target ...]"
     echo ""
     echo "Options:"
-    echo "  -b, --bandwidth <mbit>  Throttle upload bandwidth using tc (in mbit/s)"
-    echo "  -h, --help              Show this help message"
+    echo "  -b, --bandwidth <mbit>     Throttle bandwidth using tc (in mbit/s)"
+    echo "  -o, --operation <op>       upload, download, or both (default: both)"
+    echo "  -h, --help                 Show this help message"
     echo ""
     echo "Targets: mstransfer, sftp, s3 (default: all)"
     echo ""
     echo "Examples:"
-    echo "  $(basename "$0")                            # run all targets"
-    echo "  $(basename "$0") mstransfer                 # mstransfer only"
-    echo "  $(basename "$0") -b 100 sftp s3             # sftp and s3, throttled to 100 mbit/s"
-    echo "  $(basename "$0") -b 1000 mstransfer         # mstransfer at 1 gbit/s"
+    echo "  $(basename "$0")                            # upload+download, all targets"
+    echo "  $(basename "$0") -o upload mstransfer       # upload only, mstransfer"
+    echo "  $(basename "$0") -o download sftp s3        # download only (assumes files exist remotely)"
+    echo "  $(basename "$0") -b 100 -o both             # throttled to 100 mbit/s, both ops"
     exit 0
 }
 
@@ -31,9 +35,18 @@ while [[ $# -gt 0 ]]; do
             BANDWIDTH="$2"
             shift 2
             ;;
+        -o|--operation)
+            OPERATION="$2"
+            shift 2
+            ;;
         *) break ;;
     esac
 done
+
+case "$OPERATION" in
+    upload|download|both) ;;
+    *) echo "ERROR: --operation must be upload, download, or both"; exit 1 ;;
+esac
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -76,7 +89,7 @@ tc_setup() {
         echo "ERROR: Could not detect network interface for tc throttling."
         exit 1
     fi
-    echo "Throttling upload bandwidth to ${BANDWIDTH}mbit on $NET_IFACE"
+    echo "Throttling bandwidth to ${BANDWIDTH}mbit on $NET_IFACE"
     sudo tc qdisc replace dev "$NET_IFACE" root tbf rate "${BANDWIDTH}mbit" burst 32kbit latency 50ms
 }
 
@@ -143,6 +156,13 @@ else
     TARGETS=("${ALL_TARGETS[@]}")
 fi
 
+# Select operations to run
+case "$OPERATION" in
+    upload)   OPERATIONS=(upload) ;;
+    download) OPERATIONS=(download) ;;
+    both)     OPERATIONS=("${ALL_OPERATIONS[@]}") ;;
+esac
+
 # Only check for CLIs needed by selected targets
 for t in "${TARGETS[@]}"; do
     cmd=$(target_cmd "$t")
@@ -160,7 +180,7 @@ if [[ -n "$BANDWIDTH" ]]; then
 else
     CSV_FILE="$RESULTS_DIR/results_$(date +%Y%m%d_%H%M%S).csv"
 fi
-echo "target,file,size_bytes,duration_s,throughput_mbps" > "$CSV_FILE"
+echo "operation,target,file,size_bytes,duration_s,throughput_mbps" > "$CSV_FILE"
 
 # ── Upload functions (single file) ───────────────────────────────────────────
 
@@ -209,14 +229,123 @@ batch_upload_s3() {
     done
 }
 
+# ── Download helpers ─────────────────────────────────────────────────────────
+
+# Discover what mstransfer has stored (server may store as .msz or .mzML).
+# Maps local basename (e.g. foo.mzML) → remote filename (e.g. foo.msz).
+declare -a MSTRANSFER_REMOTE_NAMES=()
+
+mstransfer_discover() {
+    local auth=()
+    if [[ -n "${MSTRANSFER_API_KEY:-}" ]]; then
+        auth=(-H "Authorization: Bearer $MSTRANSFER_API_KEY")
+    fi
+    local json
+    json=$(curl -sf "${auth[@]}" "$MSTRANSFER_HOST/files") || {
+        echo "ERROR: Failed to list files from $MSTRANSFER_HOST/files" >&2
+        return 1
+    }
+    # Extract "name" fields via python (available wherever uv is)
+    mapfile -t MSTRANSFER_REMOTE_NAMES < <(
+        python3 -c 'import sys,json; [print(f["name"]) for f in json.load(sys.stdin)["files"]]' <<< "$json"
+    )
+}
+
+# Given a local filename (e.g. foo.mzML), find the matching remote name.
+# Matches by stem since server may have changed the extension.
+mstransfer_remote_for() {
+    local local_name=$1
+    local stem=${local_name%.*}
+    for remote in "${MSTRANSFER_REMOTE_NAMES[@]}"; do
+        [[ "${remote%.*}" == "$stem" ]] && { echo "$remote"; return 0; }
+    done
+    # Fallback to default server storage extension
+    echo "${stem}.msz"
+}
+
+reset_download_dir() {
+    rm -rf "$DOWNLOAD_DIR"
+    mkdir -p "$DOWNLOAD_DIR"
+}
+
+# ── Download functions (single file) ─────────────────────────────────────────
+
+download_mstransfer() {
+    local file=$1
+    local fname
+    fname=$(basename "$file")
+    local remote
+    remote=$(mstransfer_remote_for "$fname")
+    local url="$MSTRANSFER_HOST/files/$remote"
+    if [[ -n "${MSTRANSFER_API_KEY:-}" ]]; then
+        mstransfer download "$url" -o "$DOWNLOAD_DIR" --store-as mzml --force \
+            --api-key "$MSTRANSFER_API_KEY"
+    else
+        mstransfer download "$url" -o "$DOWNLOAD_DIR" --store-as mzml --force
+    fi
+}
+
+download_sftp() {
+    local file=$1
+    local fname
+    fname=$(basename "$file")
+    sftp -P "$SFTP_PORT" -i "$SFTP_KEY_PATH" -b - "$SFTP_USER@$SFTP_HOST" \
+        <<< "get $SFTP_DEST_DIR/$fname $DOWNLOAD_DIR/"
+}
+
+download_s3() {
+    local file=$1
+    local fname
+    fname=$(basename "$file")
+    aws s3 cp "s3://$S3_BUCKET/${S3_PREFIX}$fname" "$DOWNLOAD_DIR/$fname" \
+        ${S3_ENDPOINT_URL:+--endpoint-url "$S3_ENDPOINT_URL"}
+}
+
+# ── Batch download functions (all files in one command) ──────────────────────
+
+batch_download_mstransfer() {
+    local urls=()
+    for file in "${FILES[@]}"; do
+        local fname remote
+        fname=$(basename "$file")
+        remote=$(mstransfer_remote_for "$fname")
+        urls+=("$MSTRANSFER_HOST/files/$remote")
+    done
+    if [[ -n "${MSTRANSFER_API_KEY:-}" ]]; then
+        mstransfer download "${urls[@]}" -o "$DOWNLOAD_DIR" --store-as mzml --force \
+            --api-key "$MSTRANSFER_API_KEY"
+    else
+        mstransfer download "${urls[@]}" -o "$DOWNLOAD_DIR" --store-as mzml --force
+    fi
+}
+
+batch_download_sftp() {
+    local cmds=""
+    for file in "${FILES[@]}"; do
+        local fname
+        fname=$(basename "$file")
+        cmds+="get $SFTP_DEST_DIR/$fname $DOWNLOAD_DIR/"$'\n'
+    done
+    sftp -P "$SFTP_PORT" -i "$SFTP_KEY_PATH" -b - "$SFTP_USER@$SFTP_HOST" <<< "$cmds"
+}
+
+batch_download_s3() {
+    for file in "${FILES[@]}"; do
+        local fname
+        fname=$(basename "$file")
+        aws s3 cp "s3://$S3_BUCKET/${S3_PREFIX}$fname" "$DOWNLOAD_DIR/$fname" \
+            ${S3_ENDPOINT_URL:+--endpoint-url "$S3_ENDPOINT_URL"}
+    done
+}
+
 # ── Benchmark runners ────────────────────────────────────────────────────────
 
 run_per_file() {
-    local target=$1
-    local upload_fn="upload_$target"
+    local op=$1 target=$2
+    local fn="${op}_${target}"
     local total_size=0 total_duration=0
 
-    echo "=== $target ==="
+    echo "=== [$op] $target ==="
 
     local idx=0
     for file in "${FILES[@]}"; do
@@ -229,7 +358,7 @@ run_per_file() {
 
         local t0 t1 dur tput
         t0=$(now)
-        $upload_fn "$file"
+        $fn "$file"
         t1=$(now)
         dur=$(awk "BEGIN { printf \"%.1f\", $t1 - $t0 }")
         tput=$(throughput "$size" "$dur")
@@ -237,10 +366,11 @@ run_per_file() {
         printf "  [%d/%d] %-45s %8s MB  %6ss  %s MB/s\n" \
             "$idx" "$FILE_COUNT" "$fname" "$(fmt_mb "$size")" "$dur" "$tput"
 
-        echo "$target,$fname,$size,$dur,$tput" >> "$CSV_FILE"
+        echo "$op,$target,$fname,$size,$dur,$tput" >> "$CSV_FILE"
     done
 
-    total_duration=$(awk -F, -v t="$target" '$1==t { sum+=$4 } END { printf "%.1f", sum }' "$CSV_FILE")
+    total_duration=$(awk -F, -v op="$op" -v t="$target" \
+        '$1==op && $2==t { sum+=$5 } END { printf "%.1f", sum }' "$CSV_FILE")
     local total_tput
     total_tput=$(throughput "$total_size" "$total_duration")
 
@@ -249,18 +379,18 @@ run_per_file() {
 }
 
 run_batch() {
-    local target=$1
+    local op=$1 target=$2
     local total_size=0
 
     for file in "${FILES[@]}"; do
         total_size=$((total_size + $(file_size "$file")))
     done
 
-    echo "=== $target ==="
+    echo "=== [$op] $target ==="
 
     local t0 t1 dur tput
     t0=$(now)
-    "batch_upload_$target"
+    "batch_${op}_${target}"
     t1=$(now)
     dur=$(awk "BEGIN { printf \"%.1f\", $t1 - $t0 }")
     tput=$(throughput "$total_size" "$dur")
@@ -268,7 +398,7 @@ run_batch() {
     printf "  %s MB in %ss — %s MB/s\n\n" \
         "$(fmt_mb "$total_size")" "$dur" "$tput"
 
-    echo "$target,ALL,$total_size,$dur,$tput" >> "$CSV_FILE"
+    echo "$op,$target,ALL,$total_size,$dur,$tput" >> "$CSV_FILE"
 }
 
 # ── Ensure S3 bucket exists ───────────────────────────────────────────────────
@@ -288,17 +418,26 @@ done
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 echo "Benchmark mode: $MODE"
+echo "Operations: ${OPERATIONS[*]}"
 echo "Targets: ${TARGETS[*]}"
 echo "Files: $FILE_COUNT mzML files in $DATA_DIR"
 echo "CSV output: $CSV_FILE"
 echo ""
 
-for target in "${TARGETS[@]}"; do
-    if [[ "$MODE" == "per-file" ]]; then
-        run_per_file "$target"
-    else
-        run_batch "$target"
-    fi
+for op in "${OPERATIONS[@]}"; do
+    for target in "${TARGETS[@]}"; do
+        if [[ "$op" == "download" ]]; then
+            reset_download_dir
+            if [[ "$target" == "mstransfer" ]]; then
+                mstransfer_discover
+            fi
+        fi
+        if [[ "$MODE" == "per-file" ]]; then
+            run_per_file "$op" "$target"
+        else
+            run_batch "$op" "$target"
+        fi
+    done
 done
 
 echo "Results written to $CSV_FILE"

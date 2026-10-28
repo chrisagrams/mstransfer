@@ -55,6 +55,9 @@ def load_csvs(paths):
         if df.empty:
             continue
         df["source"] = os.path.basename(p)
+        # Backward compat: older CSVs without an operation column are all uploads.
+        if "operation" not in df.columns:
+            df["operation"] = "upload"
         frames.append(df)
     if not frames:
         print("No data found in the provided CSV files.", file=sys.stderr)
@@ -62,7 +65,13 @@ def load_csvs(paths):
     return pd.concat(frames, ignore_index=True)
 
 
-def plot_per_file(df, output):
+def _op_suffix(output, op):
+    """Insert an operation suffix before the file extension."""
+    base, ext = os.path.splitext(output)
+    return f"{base}_{op}{ext}"
+
+
+def plot_per_file(df, output, title_suffix=""):
     """Bar chart comparing speedup per file across targets."""
     df = df.copy()
     df["short_file"] = df["file"].apply(lambda f: os.path.splitext(f)[0][:25])
@@ -111,6 +120,8 @@ def plot_per_file(df, output):
 
     ax.set_xlabel("File")
     ax.set_ylabel("Speedup")
+    if title_suffix:
+        ax.set_title(title_suffix)
     ax.set_xticks(x)
     ax.set_xticklabels(files, rotation=30, ha="right")
     ax.axhline(1.0, color="gray", linestyle=":", linewidth=0.8)
@@ -124,7 +135,7 @@ def plot_per_file(df, output):
     print(f"Saved per-file plot to {output}")
 
 
-def plot_aggregate(df, output):
+def plot_aggregate(df, output, title_suffix=""):
     """Bar chart comparing aggregate speedup across targets."""
     targets = df["target"].unique()
 
@@ -160,6 +171,8 @@ def plot_aggregate(df, output):
         )
 
     ax.set_ylabel("Speedup")
+    if title_suffix:
+        ax.set_title(title_suffix)
     ax.axhline(1.0, color="gray", linestyle=":", linewidth=0.8)
     ax.set_ylim(bottom=0, top=max(speedups.values()) * 1.15)
     ax.yaxis.grid(True, linestyle="--", alpha=0.3)
@@ -187,7 +200,7 @@ def _speedup_from_df(df):
     return agg
 
 
-def plot_bandwidth_comparison(panels, output):
+def plot_bandwidth_comparison(panels, output, suptitle=""):
     """2x2 subplot grid comparing speedup at different bandwidth limits.
 
     panels: list of (label, dataframe) tuples, one per subplot.
@@ -230,6 +243,8 @@ def plot_bandwidth_comparison(panels, output):
     for ax in axes:
         ax.set_ylim(top=max_speedup * 1.15)
 
+    if suptitle:
+        fig.suptitle(suptitle)
     fig.tight_layout()
     for ext in ("png", "pdf"):
         fig.savefig(f"{os.path.splitext(output)[0]}.{ext}")
@@ -278,13 +293,20 @@ def main():
 
     if args.bandwidth_comparison:
         labels = ["40 Mbps", "100 Mbps", "1 Gbps", "10 Gbps"]
-        panels = []
-        for path, label in zip(args.bandwidth_comparison, labels):
-            panel_df = load_csvs([path])
-            panels.append((label, panel_df[panel_df["file"] == "ALL"]))
-        plot_bandwidth_comparison(
-            panels, os.path.join(out_dir, "speedup_bandwidth.png")
-        )
+        loaded = [(label, load_csvs([path]))
+                  for path, label in zip(args.bandwidth_comparison, labels)]
+        ops = sorted({op for _, df in loaded for op in df["operation"].unique()})
+        for op in ops:
+            panels = [
+                (label, df[(df["file"] == "ALL") & (df["operation"] == op)])
+                for label, df in loaded
+            ]
+            if all(df.empty for _, df in panels):
+                continue
+            out = (os.path.join(out_dir, "speedup_bandwidth.png")
+                   if len(ops) == 1
+                   else _op_suffix(os.path.join(out_dir, "speedup_bandwidth.png"), op))
+            plot_bandwidth_comparison(panels, out, suptitle=op.capitalize())
         return
 
     df = load_csvs(csv_paths)
@@ -293,59 +315,77 @@ def main():
     batch_df = df[df["file"] == "ALL"]
 
     generate_both = not args.per_file and not args.aggregate
+    ops = sorted(df["operation"].unique())
 
-    if (args.per_file or generate_both) and not per_file_df.empty:
-        plot_per_file(per_file_df, os.path.join(out_dir, "throughput_per_file.png"))
+    for op in ops:
+        suffix = op.capitalize()
+        per_file_op = per_file_df[per_file_df["operation"] == op]
+        batch_op = batch_df[batch_df["operation"] == op]
 
-    if (args.aggregate or generate_both) and not per_file_df.empty:
-        plot_aggregate(per_file_df, os.path.join(out_dir, "throughput_aggregate.png"))
-
-    # If we only have batch data, plot that as aggregate speedup
-    if per_file_df.empty and not batch_df.empty:
-        agg = (
-            batch_df.groupby("target", sort=False)
-            .agg(
-                total_bytes=("size_bytes", "sum"),
-                total_s=("duration_s", "sum"),
+        if (args.per_file or generate_both) and not per_file_op.empty:
+            plot_per_file(
+                per_file_op,
+                _op_suffix(os.path.join(out_dir, "throughput_per_file.png"), op),
+                title_suffix=suffix,
             )
-            .reset_index()
-        )
-        agg["throughput_mbps"] = agg["total_bytes"] / 1e6 / agg["total_s"]
 
-        baseline_target = _best_baseline_target(agg["target"])
-        baseline_tput = agg.loc[
-            agg["target"] == baseline_target, "throughput_mbps"
-        ].iloc[0]
-        agg["speedup"] = agg["throughput_mbps"] / baseline_tput
-        n = len(agg)
-
-        fig, ax = plt.subplots(figsize=(max(3.5, n * 1.2), 3.5))
-        bars = ax.bar(
-            agg["target"].map(_display),
-            agg["speedup"],
-            color=COLORS[:n],
-            hatch=HATCHES[:n],
-            **BAR_EDGE,
-        )
-        for bar, s in zip(bars, agg["speedup"]):
-            ax.text(
-                bar.get_x() + bar.get_width() / 2,
-                bar.get_height() * 1.02,
-                f"{s:.1f}x",
-                ha="center",
-                va="bottom",
-                fontsize=10,
+        if (args.aggregate or generate_both) and not per_file_op.empty:
+            plot_aggregate(
+                per_file_op,
+                _op_suffix(os.path.join(out_dir, "throughput_aggregate.png"), op),
+                title_suffix=suffix,
             )
-        ax.set_ylabel("Speedup")
-        ax.axhline(1.0, color="gray", linestyle=":", linewidth=0.8)
-        ax.set_ylim(bottom=0, top=agg["speedup"].max() * 1.15)
-        ax.yaxis.grid(True, linestyle="--", alpha=0.3)
-        ax.set_axisbelow(True)
-        fig.tight_layout()
-        path = os.path.join(out_dir, "throughput_batch")
-        for ext in ("png", "pdf"):
-            fig.savefig(f"{path}.{ext}")
-        print(f"Saved batch plot to {path}.png")
+
+        # If we only have batch data for this op, plot that as aggregate speedup
+        if per_file_op.empty and not batch_op.empty:
+            agg = (
+                batch_op.groupby("target", sort=False)
+                .agg(
+                    total_bytes=("size_bytes", "sum"),
+                    total_s=("duration_s", "sum"),
+                )
+                .reset_index()
+            )
+            agg["throughput_mbps"] = agg["total_bytes"] / 1e6 / agg["total_s"]
+
+            baseline_target = _best_baseline_target(agg["target"])
+            baseline_tput = agg.loc[
+                agg["target"] == baseline_target, "throughput_mbps"
+            ].iloc[0]
+            agg["speedup"] = agg["throughput_mbps"] / baseline_tput
+            n = len(agg)
+
+            fig, ax = plt.subplots(figsize=(max(3.5, n * 1.2), 3.5))
+            bars = ax.bar(
+                agg["target"].map(_display),
+                agg["speedup"],
+                color=COLORS[:n],
+                hatch=HATCHES[:n],
+                **BAR_EDGE,
+            )
+            for bar, s in zip(bars, agg["speedup"]):
+                ax.text(
+                    bar.get_x() + bar.get_width() / 2,
+                    bar.get_height() * 1.02,
+                    f"{s:.1f}x",
+                    ha="center",
+                    va="bottom",
+                    fontsize=10,
+                )
+            ax.set_ylabel("Speedup")
+            ax.set_title(suffix)
+            ax.axhline(1.0, color="gray", linestyle=":", linewidth=0.8)
+            ax.set_ylim(bottom=0, top=agg["speedup"].max() * 1.15)
+            ax.yaxis.grid(True, linestyle="--", alpha=0.3)
+            ax.set_axisbelow(True)
+            fig.tight_layout()
+            path = _op_suffix(
+                os.path.join(out_dir, "throughput_batch.png"), op
+            )
+            base = os.path.splitext(path)[0]
+            for ext in ("png", "pdf"):
+                fig.savefig(f"{base}.{ext}")
+            print(f"Saved batch plot to {base}.png")
 
 
 if __name__ == "__main__":
