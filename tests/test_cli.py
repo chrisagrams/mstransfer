@@ -472,6 +472,7 @@ class TestCmdDownload:
             "output_dir": "./downloads",
             "store_as": None,
             "parallel": 4,
+            "connections": 1,
             "chunk_size": 1_048_576,
             "skip_existing": False,
             "force": False,
@@ -543,6 +544,21 @@ class TestCmdDownload:
         call_kwargs = mock_batch.call_args[1]
         assert call_kwargs["parallel"] == 8
         assert call_kwargs["chunk_size"] == 4_194_304
+
+    @patch("mstransfer.cli.async_download_batch", new_callable=AsyncMock)
+    def test_passes_connections(self, mock_batch, tmp_path):
+        mock_batch.return_value = [tmp_path / "file.msz"]
+
+        args = self._make_args(
+            ["http://host/file.msz"],
+            output_dir=str(tmp_path),
+            connections=8,
+        )
+        cmd_download(args)
+
+        call_kwargs = mock_batch.call_args[1]
+        assert call_kwargs["connections"] == 8
+        assert call_kwargs["parallel"] == 4
 
     @patch("mstransfer.cli.async_download_batch", new_callable=AsyncMock)
     def test_passes_skip_existing_and_force(self, mock_batch, tmp_path):

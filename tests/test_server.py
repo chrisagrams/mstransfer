@@ -491,3 +491,128 @@ async def test_download_auth_required(authed_client):
     """File download requires auth when configured."""
     resp = await authed_client.get("/v1/files/test.msz")
     assert resp.status_code == 401
+
+
+# ---------------------------------------------------------------------------
+# Range requests on /files/{filename}
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def range_payload(tmp_output, test_msz) -> bytes:
+    """Place test.msz in the server's output dir and return its bytes."""
+    payload = test_msz.read_bytes()
+    (tmp_output / "test.msz").write_bytes(payload)
+    return payload
+
+
+@pytest.mark.asyncio
+async def test_download_advertises_accept_ranges(msz_client, range_payload):
+    """Full responses advertise byte-range support."""
+    resp = await msz_client.get("/v1/files/test.msz")
+    assert resp.status_code == 200
+    assert resp.headers["accept-ranges"] == "bytes"
+    assert resp.content == range_payload
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("header", "start", "end"),
+    [
+        ("bytes=0-9", 0, 9),
+        ("bytes=100-199", 100, 199),
+        ("bytes=0-0", 0, 0),
+        ("bytes=50-", 50, None),
+        ("bytes=-10", -10, None),
+    ],
+)
+async def test_download_range_partial_content(
+    msz_client, range_payload, header, start, end
+):
+    """Single byte ranges return 206 with the requested slice."""
+    size = len(range_payload)
+    first = start if start >= 0 else size + start
+    last = size - 1 if end is None else end
+    expected = range_payload[first : last + 1]
+
+    resp = await msz_client.get("/v1/files/test.msz", headers={"Range": header})
+    assert resp.status_code == 206
+    assert resp.content == expected
+    assert resp.headers["content-length"] == str(len(expected))
+    assert resp.headers["content-range"] == f"bytes {first}-{last}/{size}"
+    assert resp.headers["accept-ranges"] == "bytes"
+
+
+@pytest.mark.asyncio
+async def test_download_range_end_clamped_to_size(msz_client, range_payload):
+    """An end position past EOF is clamped to the last byte."""
+    size = len(range_payload)
+    resp = await msz_client.get(
+        "/v1/files/test.msz", headers={"Range": f"bytes=10-{size + 1000}"}
+    )
+    assert resp.status_code == 206
+    assert resp.content == range_payload[10:]
+    assert resp.headers["content-range"] == f"bytes 10-{size - 1}/{size}"
+
+
+@pytest.mark.asyncio
+async def test_download_suffix_larger_than_file(msz_client, range_payload):
+    """A suffix longer than the file returns the whole file as 206."""
+    size = len(range_payload)
+    resp = await msz_client.get(
+        "/v1/files/test.msz", headers={"Range": f"bytes=-{size * 2}"}
+    )
+    assert resp.status_code == 206
+    assert resp.content == range_payload
+    assert resp.headers["content-range"] == f"bytes 0-{size - 1}/{size}"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "header", ["bytes={size}-", "bytes={size}-{bigger}", "bytes=-0"]
+)
+async def test_download_range_unsatisfiable(msz_client, range_payload, header):
+    """Ranges starting at/after EOF (or empty suffixes) return 416."""
+    size = len(range_payload)
+    resp = await msz_client.get(
+        "/v1/files/test.msz",
+        headers={"Range": header.format(size=size, bigger=size + 10)},
+    )
+    assert resp.status_code == 416
+    assert resp.headers["content-range"] == f"bytes */{size}"
+
+
+@pytest.mark.asyncio
+async def test_download_range_on_empty_file(msz_client, tmp_output):
+    """Any range on an empty file is unsatisfiable."""
+    (tmp_output / "empty.msz").write_bytes(b"")
+    resp = await msz_client.get("/v1/files/empty.msz", headers={"Range": "bytes=0-"})
+    assert resp.status_code == 416
+    assert resp.headers["content-range"] == "bytes */0"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "header",
+    [
+        "bytes=0-9,20-29",  # multi-range: unsupported, full file
+        "bytes=abc-def",  # malformed
+        "bytes=10-5",  # last < first is invalid
+        "bytes=-",  # no positions
+        "items=0-9",  # unknown unit
+        "bytes 0-9",  # missing '='
+    ],
+)
+async def test_download_range_ignored(msz_client, range_payload, header):
+    """Unsupported or malformed Range headers fall back to a full 200."""
+    resp = await msz_client.get("/v1/files/test.msz", headers={"Range": header})
+    assert resp.status_code == 200
+    assert resp.content == range_payload
+    assert resp.headers["content-length"] == str(len(range_payload))
+
+
+@pytest.mark.asyncio
+async def test_download_range_auth_required(authed_client):
+    """Ranged downloads still require auth when configured."""
+    resp = await authed_client.get("/v1/files/test.msz", headers={"Range": "bytes=0-9"})
+    assert resp.status_code == 401
