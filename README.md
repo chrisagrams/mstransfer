@@ -55,18 +55,20 @@ mstransfer serve [--host 0.0.0.0] [--port 1319] [--output-dir ./received] [--sto
 Upload files to a server. Accepts any mix of files and directories. The last positional argument is the target.
 
 ```
-mstransfer upload <paths...> <host[:port]> [--recursive] [--parallel 4]
+mstransfer upload <paths...> <host[:port]> [--recursive] [--parallel 4] [--connections 1]
 ```
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--recursive`, `-r` | off | Recurse into directories |
-| `--parallel`, `-p` | `4` | Number of concurrent uploads |
+| `--parallel`, `-p` | `4` | Number of files uploaded concurrently |
+| `--connections`, `-c` | `1` | Concurrent connections per MSZ/MSZX file (multipart upload) |
+| `--chunk-size` | `1048576` | Read/stream chunk size in bytes |
 
 Supported file types: `.mzML`, `.msz`, `.mszx`.
 
 - **mzML files** are compressed to MSZ on-the-fly via `compress_stream()` and streamed directly into the HTTP request — no temp files on the sender.
-- **MSZ / MSZX files** are streamed as-is.
+- **MSZ / MSZX files** are streamed as-is. With `--connections N` (N > 1), files of at least 16 MiB are split into up to N byte-range parts (each at least 8 MiB) that are uploaded concurrently over separate connections. This can improve throughput on high-latency or per-connection rate-limited links. `--connections` is independent of `--parallel`, so up to `parallel × connections` requests may be in flight.
 
 ## Programmatic access
 
@@ -98,6 +100,9 @@ send_batch(
     "http://remote-host:1319",
     parallel=4,
 )
+
+# Split a large MSZ file across 8 concurrent connections
+send_file(Path("big.msz"), "http://remote-host:1319", connections=8)
 ```
 
 `send_file` and `send_batch` accept any mix of `Path`, `MZMLFile`, `MSZFile`, and `MSZXFile` inputs.
@@ -110,7 +115,21 @@ The server exposes a REST API under `/v1/`:
 |----------|--------|-------------|
 | `/v1/health` | GET | Server status, version, storage mode |
 | `/v1/upload` | POST | Upload a file (streamed MSZ body) |
+| `/v1/uploads` | POST | Initiate a multipart upload |
+| `/v1/uploads/{id}/parts/{n}` | PUT | Upload part `n` of a multipart upload |
+| `/v1/uploads/{id}/complete` | POST | Verify all parts and finalize the file |
+| `/v1/uploads/{id}` | DELETE | Abort a multipart upload |
 | `/v1/transfer/{id}/status` | GET | Poll transfer state |
+
+### Multipart uploads
+
+Files whose size is known up front (MSZ / MSZX) can be uploaded in parts over several concurrent connections:
+
+1. `POST /v1/uploads` with JSON `{"transfer_id", "filename", "total_size", "part_size"}`. The server preallocates the output file and returns `part_count`. Part `n` covers bytes `[n * part_size, min((n + 1) * part_size, total_size))`.
+2. `PUT /v1/uploads/{id}/parts/{n}` with exactly that byte range as the body. Parts may arrive concurrently and in any order, and each one is written in place at its offset. Re-sending a part overwrites it, so a failed part can be retried. A body of the wrong size is rejected with `400`, and two concurrent requests for the same part are rejected with `409`.
+3. `POST /v1/uploads/{id}/complete` returns `409` until every part has been fully received. After that, the file goes through the same store/decompress path as `/v1/upload`.
+
+`DELETE /v1/uploads/{id}` aborts the upload: the transfer moves to `error` and the partial file is removed. While a multipart upload is in progress, `/v1/transfer/{id}/status` reports `total_bytes` and per-part progress in `parts`.
 
 ### Embedding in another app
 

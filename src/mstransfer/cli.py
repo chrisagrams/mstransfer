@@ -56,6 +56,14 @@ def parse_target(target: str) -> str:
     return f"http://{target}:{default_port}"
 
 
+def _positive_int(value: str) -> int:
+    """argparse type for integers >= 1."""
+    number = int(value)
+    if number < 1:
+        raise argparse.ArgumentTypeError(f"must be >= 1, got {number}")
+    return number
+
+
 def cmd_serve(args: argparse.Namespace) -> None:
     setup_logging()
 
@@ -152,7 +160,8 @@ def cmd_upload(args: argparse.Namespace) -> None:
 
     console.print(
         f"Sending [bold]{len(file_paths)}[/] file(s) to "
-        f"[cyan]{base_url}[/] (parallel={args.parallel})"
+        f"[cyan]{base_url}[/] (parallel={args.parallel}, "
+        f"connections={args.connections})"
     )
 
     display = UploadProgressDisplay(len(file_paths))
@@ -169,6 +178,7 @@ def cmd_upload(args: argparse.Namespace) -> None:
                 progress=display,
                 api_key=args.api_key,
                 client=client,
+                connections=args.connections,
             )
 
     with Live(display.table, console=console, refresh_per_second=10):
@@ -320,6 +330,16 @@ def main() -> None:
         type=int,
         default=4,
         help="Concurrent uploads (default: 4)",
+    )
+    sp.add_argument(
+        "--connections",
+        "-c",
+        type=_positive_int,
+        default=1,
+        help=(
+            "Concurrent connections per MSZ/MSZX file; large files are split "
+            "into parts uploaded in parallel (default: 1)"
+        ),
     )
     sp.add_argument(
         "--chunk-size",

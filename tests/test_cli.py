@@ -204,6 +204,7 @@ class TestCmdUpload:
             "parallel": 4,
             "chunk_size": 1_048_576,
             "api_key": None,
+            "connections": 1,
         }
         defaults.update(overrides)
         return argparse.Namespace(**defaults)

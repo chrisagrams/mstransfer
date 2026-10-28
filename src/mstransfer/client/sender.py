@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Sequence
+    from collections.abc import AsyncIterator, Callable, Sequence
 
 import httpx
 from mscompress import MSZFile, MZMLFile
@@ -19,13 +19,24 @@ from mstransfer.client.utils import (
     ThrottledCallback,
     async_counting_generator,
     async_file_chunk_generator,
+    async_file_range_generator,
     async_iter_from_sync,
     normalize_source,
     optional_client,
 )
-from mstransfer.server.models import TransferRecord, TransferState, UploadResponse
+from mstransfer.server.models import (
+    MultipartInitRequest,
+    MultipartInitResponse,
+    TransferRecord,
+    TransferState,
+    UploadResponse,
+)
 
 logger = logging.getLogger(__name__)
+
+# Smallest part a multipart upload will be split into.  Files smaller than
+# ``2 * MIN_PART_SIZE`` are always sent over a single connection.
+MIN_PART_SIZE = 8_388_608
 
 
 @runtime_checkable
@@ -58,11 +69,19 @@ async def async_send_file(
     chunk_size: int = 1_048_576,
     api_key: str | None = None,
     client: httpx.AsyncClient | None = None,
+    connections: int = 1,
+    min_part_size: int = MIN_PART_SIZE,
 ) -> UploadResponse:
     """Send a single file to the mstransfer listener (async).
 
     Accepts a file path, or an already-opened MZMLFile / MSZFile / MSZXFile
     from mscompress.  Returns the final transfer status from the server.
+
+    When *connections* > 1 and the source is an already-compressed MSZ / MSZX
+    file of at least ``2 * min_part_size`` bytes, the file is split into up to
+    *connections* parts that are uploaded concurrently (multipart upload).
+    mzML sources are compressed on the fly, so their size is unknown and they
+    always use a single stream.
     """
 
     # Generate a unique transfer ID.
@@ -74,15 +93,26 @@ async def async_send_file(
     # Throttle progress callbacks to reduce overhead (default: every 8 MiB).
     throttled = ThrottledCallback(progress_callback) if progress_callback else None
 
-    # Build the upload stream.
+    auth_headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+
+    # Decide whether to split the upload across multiple connections.
+    # Only MSZ / MSZX have a known size up front, so only they can be split.
+    total_size = 0
+    part_size: int | None = None
+    if mzml_obj is None:
+        total_size = file_path.stat().st_size
+        part_size = plan_part_size(total_size, connections, min_part_size)
+
+    # Build the upload stream (multipart uploads stream each part separately).
     # If its an mzML file, we can use the compress_stream for on-the-fly compression.
+    stream: AsyncIterator[bytes] | None = None
     if mzml_obj is not None:
         stream = async_counting_generator(
             async_iter_from_sync(mzml_obj.compress_stream(chunk_size=chunk_size)),
             throttled,
         )
     # Otherwise, we stream the file in chunks.
-    else:
+    elif part_size is None:
         stream = async_file_chunk_generator(
             file_path,
             chunk_size=chunk_size,
@@ -96,20 +126,32 @@ async def async_send_file(
         "X-Source-Format": filetype,
         "Content-Type": "application/octet-stream",
     }
-    if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
+    headers.update(auth_headers)
 
     # Send the POST request with streaming upload and handle the response.
     async with optional_client(
         client, timeout=httpx.Timeout(timeout, connect=10.0)
     ) as c:
-        resp = await c.post(
-            f"{base_url}/v1/upload",
-            headers=headers,
-            content=stream,
-        )
-        resp.raise_for_status()
-        upload_result = UploadResponse.model_validate(resp.json())
+        if part_size is not None:
+            upload_result = await _async_send_multipart(
+                c,
+                base_url,
+                file_path,
+                transfer_id,
+                total_size=total_size,
+                part_size=part_size,
+                chunk_size=chunk_size,
+                headers=auth_headers,
+                callback=throttled,
+            )
+        else:
+            resp = await c.post(
+                f"{base_url}/v1/upload",
+                headers=headers,
+                content=stream,
+            )
+            resp.raise_for_status()
+            upload_result = UploadResponse.model_validate(resp.json())
 
     # Flush any remaining accumulated progress.
     if throttled:
@@ -117,17 +159,101 @@ async def async_send_file(
 
     # Poll for server-side processing completion
     if upload_result.state not in (TransferState.DONE, TransferState.ERROR):
-        poll_headers = {"Authorization": f"Bearer {api_key}"} if api_key else None
         state = await _async_poll_status(
             base_url,
             transfer_id,
             timeout=timeout,
-            headers=poll_headers,
+            headers=auth_headers or None,
             client=client,
         )
         upload_result.state = state
 
     return upload_result
+
+
+def plan_part_size(total_size: int, connections: int, min_part_size: int) -> int | None:
+    """Return the part size for a multipart upload, or ``None`` for single-stream.
+
+    The file is split into at most *connections* equal parts, none smaller
+    than *min_part_size*.  If that leaves fewer than two parts, splitting is
+    not worthwhile and ``None`` is returned.
+    """
+    if connections <= 1 or min_part_size <= 0:
+        return None
+    parts = min(connections, total_size // min_part_size)
+    if parts < 2:
+        return None
+    return -(-total_size // parts)  # ceil division
+
+
+async def _async_send_multipart(
+    client: httpx.AsyncClient,
+    base_url: str,
+    file_path: Path,
+    transfer_id: str,
+    total_size: int,
+    part_size: int,
+    chunk_size: int,
+    headers: dict[str, str],
+    callback: Callable[[int], None] | None,
+) -> UploadResponse:
+    """Upload *file_path* as concurrent byte-range parts (init → parts → complete).
+
+    If any part fails, the remaining parts are cancelled and the upload is
+    aborted on the server (moving it to the ERROR state) before re-raising.
+    """
+    upload_url = f"{base_url}/v1/uploads/{transfer_id}"
+
+    # Initiate the upload; the server preallocates the output file.
+    init_body = MultipartInitRequest(
+        transfer_id=transfer_id,
+        filename=file_path.name,
+        total_size=total_size,
+        part_size=part_size,
+    )
+    resp = await client.post(
+        f"{base_url}/v1/uploads",
+        json=init_body.model_dump(),
+        headers=headers,
+    )
+    resp.raise_for_status()
+    init = MultipartInitResponse.model_validate(resp.json())
+
+    async def _send_part(index: int) -> None:
+        offset = index * init.part_size
+        size = min(init.part_size, init.total_size - offset)
+        part_resp = await client.put(
+            f"{upload_url}/parts/{index}",
+            headers={
+                **headers,
+                "Content-Type": "application/octet-stream",
+                # An explicit length lets the server validate the part up front.
+                "Content-Length": str(size),
+            },
+            content=async_file_range_generator(
+                file_path, offset, size, chunk_size=chunk_size, callback=callback
+            ),
+        )
+        part_resp.raise_for_status()
+
+    # Upload all parts concurrently; on the first failure cancel the rest.
+    tasks = [asyncio.create_task(_send_part(i)) for i in range(init.part_count)]
+    try:
+        await asyncio.gather(*tasks)
+    except BaseException:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        try:
+            await client.delete(upload_url, headers=headers)
+        except httpx.HTTPError as exc:
+            logger.warning("Failed to abort upload %s: %s", transfer_id, exc)
+        raise
+
+    # Ask the server to verify the parts and finalize the file.
+    resp = await client.post(f"{upload_url}/complete", headers=headers)
+    resp.raise_for_status()
+    return UploadResponse.model_validate(resp.json())
 
 
 async def _async_poll_status(
@@ -182,8 +308,13 @@ async def async_send_batch(
     progress: BatchProgressCallback | None = None,
     api_key: str | None = None,
     client: httpx.AsyncClient | None = None,
+    connections: int = 1,
 ) -> list[FileResult]:
-    """Send multiple files with configurable parallelism (async)."""
+    """Send multiple files with configurable parallelism (async).
+
+    *parallel* bounds how many files are in flight at once; *connections*
+    bounds how many concurrent part uploads each MSZ / MSZX file may use.
+    """
     workers = min(parallel, len(sources))
     sem = asyncio.Semaphore(workers)
 
@@ -231,6 +362,7 @@ async def async_send_batch(
                     chunk_size=chunk_size,
                     api_key=api_key,
                     client=client,
+                    connections=connections,
                 )
                 results[idx] = FileResult(filename=fpath.name, response=result)
                 if progress:
@@ -254,6 +386,7 @@ def send_file(
     chunk_size: int = 1_048_576,
     api_key: str | None = None,
     client: httpx.AsyncClient | None = None,
+    connections: int = 1,
 ) -> UploadResponse:
     """Send a single file to the mstransfer listener.
 
@@ -271,6 +404,7 @@ def send_file(
             chunk_size=chunk_size,
             api_key=api_key,
             client=client,
+            connections=connections,
         )
     )
 
@@ -283,6 +417,7 @@ def send_batch(
     progress: BatchProgressCallback | None = None,
     api_key: str | None = None,
     client: httpx.AsyncClient | None = None,
+    connections: int = 1,
 ) -> list[FileResult]:
     """Send multiple files with configurable parallelism.
 
@@ -297,5 +432,6 @@ def send_batch(
             progress=progress,
             api_key=api_key,
             client=client,
+            connections=connections,
         )
     )
