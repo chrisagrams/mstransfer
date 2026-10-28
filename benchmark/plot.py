@@ -142,7 +142,7 @@ def plot_aggregate(df, output):
     n = len(targets)
     fig, ax = plt.subplots(figsize=(max(3.5, n * 1.2), 3.5))
     bars = ax.bar(
-        [_display(t) for t in speedups.keys()],
+        [_display(t) for t in speedups],
         list(speedups.values()),
         color=COLORS[:n],
         hatch=[HATCHES[i % len(HATCHES)] for i in range(n)],
