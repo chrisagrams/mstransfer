@@ -576,6 +576,27 @@ class TestFormatConversion:
         with pytest.raises(NotImplementedError, match="2-member"):
             _mszx_to_msz(src, tmp_path / "out.msz")
 
+    def test_mszx_to_msz_rejects_non_file_entry(self, tmp_path):
+        """A manifest entry that isn't a regular tar member raises ValueError."""
+        src = tmp_path / "bad.mszx"
+        manifest = json.dumps(
+            {
+                "version": "2.0",
+                "container": "batch",
+                "spectra_files": [{"entry": "spectra.msz"}],
+            }
+        ).encode()
+        with tarfile.open(src, "w") as tar:
+            info = tarfile.TarInfo(name="manifest.json")
+            info.size = len(manifest)
+            tar.addfile(info, io.BytesIO(manifest))
+            entry = tarfile.TarInfo(name="spectra.msz")
+            entry.type = tarfile.DIRTYPE
+            tar.addfile(entry)
+
+        with pytest.raises(ValueError, match="Missing MSZ entry"):
+            _mszx_to_msz(src, tmp_path / "out.msz")
+
     def test_download_mszx_store_as_mszx_no_conversion(
         self, served_ms_files, test_mszx, tmp_path
     ):
