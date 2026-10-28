@@ -124,6 +124,21 @@ class TestRegistryMultipart:
         assert reg.get("t1") is None
         assert reg.get_multipart("t1") is None
 
+    def test_update_part_unknown_transfer_is_noop(self):
+        reg = TransferRegistry()
+        reg.update_part("nope", 0, 4)
+        assert reg.get("nope") is None
+
+    def test_complete_rejected_while_part_in_flight(self, tmp_path):
+        reg = TransferRegistry()
+        reg.create_multipart("t1", "f.msz", tmp_path / "f.msz", 4, 4)
+        reg.begin_part("t1", 0)
+        reg.update_part("t1", 0, 4)
+        with pytest.raises(PartError) as exc_info:
+            reg.complete_multipart("t1")
+        assert exc_info.value.status_code == 409
+        assert "still uploading" in exc_info.value.detail
+
 
 # ---------------------------------------------------------------------------
 # Server routes (via ASGI transport)
@@ -350,6 +365,106 @@ async def test_legacy_upload_still_works(msz_client, tmp_output, test_msz):
     assert status["parts"] is None
 
 
+@pytest.mark.asyncio
+async def test_init_allocation_failure(msz_client, tmp_output):
+    # A directory in the way makes opening the output file fail.
+    (tmp_output / "test.msz").mkdir()
+    resp = await _init(msz_client, "mp15", 8, 4)
+    assert resp.status_code == 500
+    status = (await msz_client.get("/v1/transfer/mp15/status")).json()
+    assert status["state"] == "error"
+
+
+@pytest.mark.asyncio
+async def test_part_progress_updated_while_streaming(msz_client, tmp_output):
+    """Bodies with many chunks report progress before the part finishes."""
+    await _init(msz_client, "mp16", 100, 100)
+
+    async def _body():
+        for _ in range(100):
+            yield b"x"
+
+    resp = await msz_client.put("/v1/uploads/mp16/parts/0", content=_body())
+    assert resp.status_code == 200
+    assert resp.json()["bytes_received"] == 100
+    assert (tmp_output / "test.msz").read_bytes() == b"x" * 100
+
+
+@pytest.mark.asyncio
+async def test_part_short_without_content_length(msz_client):
+    await _init(msz_client, "mp17", 8, 4)
+
+    async def _body():
+        yield b"AA"
+
+    resp = await msz_client.put("/v1/uploads/mp17/parts/0", content=_body())
+    assert resp.status_code == 400
+    assert "incomplete" in resp.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_part_rejected_if_aborted_mid_stream(msz_app, msz_client):
+    await _init(msz_client, "mp18", 4, 4)
+
+    async def _body():
+        yield b"AB"
+        msz_app.state.transfers.abort_multipart("mp18", reason="test")
+        yield b"CD"
+
+    resp = await msz_client.put("/v1/uploads/mp18/parts/0", content=_body())
+    assert resp.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_abort_record_missing(msz_app, msz_client):
+    await _init(msz_client, "mp19", 4, 4)
+    registry = msz_app.state.transfers
+    real_abort = registry.abort_multipart
+
+    def _abort_then_forget(transfer_id, reason):
+        # Simulate the record vanishing (e.g. evicted) right after the abort.
+        upload = real_abort(transfer_id, reason=reason)
+        registry._records.pop(transfer_id)
+        return upload
+
+    with patch.object(registry, "abort_multipart", _abort_then_forget):
+        resp = await msz_client.delete("/v1/uploads/mp19")
+    assert resp.status_code == 404
+    assert resp.json()["detail"] == "Transfer not found"
+
+
+@pytest.mark.asyncio
+async def test_complete_decompression_failure(mzml_client, test_msz):
+    payload = test_msz.read_bytes()
+    await _init(mzml_client, "mp20", len(payload), len(payload))
+    await _put_part(mzml_client, "mp20", 0, payload)
+
+    with patch("mstransfer.server.routes.MSZFile", side_effect=RuntimeError("corrupt")):
+        resp = await mzml_client.post("/v1/uploads/mp20/complete")
+    assert resp.status_code == 200
+    assert resp.json()["state"] == "error"
+    status = (await mzml_client.get("/v1/transfer/mp20/status")).json()
+    assert status["error"] == "corrupt"
+
+
+@pytest.mark.asyncio
+async def test_complete_record_missing(msz_app, msz_client):
+    await _init(msz_client, "mp21", 4, 4)
+    await _put_part(msz_client, "mp21", 0, b"abcd")
+    registry = msz_app.state.transfers
+    real_complete = registry.complete_multipart
+
+    def _complete_then_forget(transfer_id):
+        # Simulate the record vanishing (e.g. evicted) during finalization.
+        upload = real_complete(transfer_id)
+        registry._records.pop(transfer_id)
+        return upload
+
+    with patch.object(registry, "complete_multipart", _complete_then_forget):
+        resp = await msz_client.post("/v1/uploads/mp21/complete")
+    assert resp.status_code == 500
+
+
 # ---------------------------------------------------------------------------
 # Client helpers
 # ---------------------------------------------------------------------------
@@ -383,6 +498,14 @@ async def test_file_range_generator(tmp_path):
     ]
     assert b"".join(chunks) == bytes(range(10, 35))
     assert seen == [7, 7, 7, 4]
+
+
+@pytest.mark.asyncio
+async def test_file_range_generator_stops_at_eof(tmp_path):
+    path = tmp_path / "f.bin"
+    path.write_bytes(bytes(range(20)))
+    chunks = [c async for c in async_file_range_generator(path, 15, 50, chunk_size=4)]
+    assert b"".join(chunks) == bytes(range(15, 20))
 
 
 # ---------------------------------------------------------------------------
@@ -493,6 +616,34 @@ class TestClientMultipart:
         status = await _status(_live_server["base_url"], str(transfer_id))
         assert status["state"] == "error"
         assert not (_live_server["output_dir"] / "test.msz").exists()
+
+    @pytest.mark.asyncio
+    async def test_abort_failure_still_raises_part_error(
+        self,
+        test_msz,
+        _live_server,  # noqa: F811
+    ):
+        """A failed abort request is logged; the original part error propagates."""
+
+        async def _broken(path, offset, length, **kwargs):
+            raise OSError("disk on fire")
+            yield b""  # pragma: no cover - makes this an async generator
+
+        with (
+            patch.object(sender, "async_file_range_generator", _broken),
+            patch.object(
+                httpx.AsyncClient,
+                "delete",
+                AsyncMock(side_effect=httpx.ConnectError("unreachable")),
+            ),
+            pytest.raises(OSError, match="disk on fire"),
+        ):
+            await async_send_file(
+                test_msz,
+                _live_server["base_url"],
+                connections=4,
+                min_part_size=100_000,
+            )
 
     @pytest.mark.asyncio
     async def test_batch_forwards_connections(self, test_msz, _live_server):  # noqa: F811
