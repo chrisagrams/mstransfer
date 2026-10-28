@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import http.server
+import io
+import json
 import posixpath
 import shutil
+import tarfile
 import threading
 import urllib.parse
 from unittest.mock import patch
@@ -17,6 +20,7 @@ from mstransfer.client.downloader import (
     DownloadRequest,
     _detect_source_format,
     _FileProgressAdapter,
+    _mszx_to_msz,
     _resolve_dest,
     async_download_batch,
     async_download_file,
@@ -551,6 +555,26 @@ class TestFormatConversion:
         assert result.exists()
         # Inner spectra.msz is a byte-for-byte copy of test.msz (conftest).
         assert result.read_bytes() == test_msz.read_bytes()
+
+    def test_mszx_to_msz_rejects_multi_member_batch(self, test_msz, tmp_path):
+        """A v2 batch .mszx with several members can't become one .msz."""
+        src = tmp_path / "batch.mszx"
+        manifest = json.dumps(
+            {
+                "version": "2.0",
+                "container": "batch",
+                "spectra_files": [{"entry": "a.msz"}, {"entry": "b.msz"}],
+            }
+        ).encode()
+        with tarfile.open(src, "w") as tar:
+            info = tarfile.TarInfo(name="manifest.json")
+            info.size = len(manifest)
+            tar.addfile(info, io.BytesIO(manifest))
+            tar.add(str(test_msz), arcname="a.msz")
+            tar.add(str(test_msz), arcname="b.msz")
+
+        with pytest.raises(NotImplementedError, match="2-member"):
+            _mszx_to_msz(src, tmp_path / "out.msz")
 
     def test_download_mszx_store_as_mszx_no_conversion(
         self, served_ms_files, test_mszx, tmp_path

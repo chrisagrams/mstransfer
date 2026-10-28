@@ -730,7 +730,7 @@ requires-dist = [
     { name = "aiofiles" },
     { name = "fastapi" },
     { name = "httpx" },
-    { name = "mscompress", specifier = ">=1.0.13" },
+    { name = "mscompress", specifier = ">=1.2.0" },
     { name = "pydantic", specifier = ">=2.0" },
     { name = "python-multipart" },
     { name = "rich" },

@@ -4,6 +4,7 @@ import asyncio
 import logging
 import os
 import shutil
+import tarfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
@@ -12,6 +13,7 @@ import aiofiles
 import httpx
 from mscompress import MSZFile, MZMLFile
 from mscompress.mszx import MSZXFile
+from mscompress.mszx.batch import read_archive_manifest
 
 from mstransfer.client.utils import ThrottledCallback, optional_client
 
@@ -51,9 +53,18 @@ def _mszx_to_mzml(src: Path, dst: Path) -> None:
 
 
 def _mszx_to_msz(src: Path, dst: Path) -> None:
-    """Lambda wrapper mszx -> msz for use in async thread executor."""
-    with MSZXFile.open(src) as mszx:
-        shutil.move(mszx.path.decode(), dst)
+    """Extract the embedded .msz payload from an .mszx archive."""
+    entries = read_archive_manifest(src).spectra_files
+    if len(entries) != 1:
+        raise NotImplementedError(
+            f"Cannot store a {len(entries)}-member .mszx as a single .msz"
+        )
+    with tarfile.open(src) as tar:
+        member = tar.extractfile(entries[0].entry)
+        if member is None:
+            raise ValueError(f"Missing MSZ entry {entries[0].entry!r} in {src}")
+        with member, dst.open("wb") as out:
+            shutil.copyfileobj(member, out)
 
 
 # Mapping of (source_format, target_format) to converter function.
