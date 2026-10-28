@@ -68,6 +68,26 @@ Supported file types: `.mzML`, `.msz`, `.mszx`.
 - **mzML files** are compressed to MSZ on-the-fly via `compress_stream()` and streamed directly into the HTTP request — no temp files on the sender.
 - **MSZ / MSZX files** are streamed as-is.
 
+### `mstransfer download`
+
+Download files by URL (e.g. `http://host:1319/v1/files/<name>`).
+
+```
+mstransfer download <urls...> [--output-dir ./downloads] [--parallel 4] [--connections 1]
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--output-dir`, `-o` | `./downloads` | Where downloaded files are written |
+| `--parallel`, `-p` | `4` | Number of files downloaded concurrently |
+| `--connections`, `-c` | `1` | HTTP connections per file (split via `Range` requests) |
+| `--chunk-size` | `1048576` | Read chunk size in bytes |
+| `--store-as` | keep as-is | Convert to `msz`, `mzml`, or `mszx` after download |
+| `--skip-existing` | off | Skip files whose destination already exists |
+| `--force` | off | Re-download even if the destination exists |
+
+With `--connections N` (N > 1), each file is split into up to N byte ranges fetched concurrently and written into a preallocated `.part` file. Each part is at least 8 MiB (`min_part_size` in the Python API), so small files use fewer connections. If the server does not support `Range` requests, the download falls back to a single stream. `--connections` is independent of `--parallel`: up to `parallel × connections` requests may be open at once.
+
 ## Programmatic access
 
 You can use mstransfer as a library to send files from your own Python code:
@@ -111,6 +131,8 @@ The server exposes a REST API under `/v1/`:
 | `/v1/health` | GET | Server status, version, storage mode |
 | `/v1/upload` | POST | Upload a file (streamed MSZ body) |
 | `/v1/transfer/{id}/status` | GET | Poll transfer state |
+| `/v1/files` | GET | List files available for download |
+| `/v1/files/{filename}` | GET | Download a file; supports single `Range: bytes=...` requests (`206`/`416`) |
 
 ### Embedding in another app
 

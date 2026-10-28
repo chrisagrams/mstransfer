@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import http.server
+import os
 import posixpath
 import shutil
 import threading
@@ -15,14 +16,18 @@ import pytest
 
 from mstransfer.client.downloader import (
     DownloadRequest,
+    PartialDownloadError,
     _detect_source_format,
     _FileProgressAdapter,
+    _parse_content_range,
     _resolve_dest,
+    _split_ranges,
     async_download_batch,
     async_download_file,
     download_batch,
     download_file,
 )
+from mstransfer.server.app import create_app
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -814,3 +819,282 @@ class TestAsyncDownloadBatch:
         assert results[0] == tmp_path / "small.bin"
         assert (tmp_path / "small.bin").read_bytes() == b"hello world"
         assert "missing.bin" in errors
+
+
+# ---------------------------------------------------------------------------
+# Split (ranged) downloads
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def range_server(tmp_path, test_msz):
+    """mstransfer app (which supports Range) serving a few files over ASGI.
+
+    Returns a dict with an ``httpx.AsyncClient`` factory, the served
+    payloads, and a list recording the ``Range`` header of every request.
+    """
+    serve_dir = tmp_path / "range_serve"
+    serve_dir.mkdir()
+    big = os.urandom(200_003)  # odd size so parts are uneven
+    (serve_dir / "big.msz").write_bytes(big)
+    shutil.copy(test_msz, serve_dir / "test.msz")
+
+    app = create_app(output_dir=str(serve_dir), store_as="msz")
+    ranges: list[str | None] = []
+
+    async def _record(request: httpx.Request) -> None:
+        ranges.append(request.headers.get("range"))
+
+    def make_client() -> httpx.AsyncClient:
+        return httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://test",
+            event_hooks={"request": [_record]},
+        )
+
+    return {"client": make_client, "big": big, "ranges": ranges}
+
+
+class TestRangeHelpers:
+    def test_split_ranges_even(self):
+        assert _split_ranges(100, 4) == [(0, 24), (25, 49), (50, 74), (75, 99)]
+
+    def test_split_ranges_uneven_covers_all_bytes(self):
+        ranges = _split_ranges(10, 3)
+        assert ranges == [(0, 3), (4, 7), (8, 9)]
+
+    def test_parse_content_range(self):
+        assert _parse_content_range("bytes 0-0/1234") == (0, 0, 1234)
+
+    @pytest.mark.parametrize(
+        "value", [None, "", "bytes */1234", "items 0-1/2", "bytes 0-1/*"]
+    )
+    def test_parse_content_range_invalid(self, value):
+        assert _parse_content_range(value) is None
+
+
+@pytest.mark.asyncio
+class TestSplitDownload:
+    async def test_split_download_byte_identical(self, range_server, tmp_path):
+        """A file split across N connections matches the source exactly."""
+        dest = tmp_path / "out" / "big.msz"
+        async with range_server["client"]() as client:
+            result = await async_download_file(
+                "http://test/v1/files/big.msz",
+                dest,
+                connections=4,
+                min_part_size=1024,
+                chunk_size=4096,
+                client=client,
+            )
+
+        assert result == dest
+        assert dest.read_bytes() == range_server["big"]
+        assert not dest.with_suffix(".msz.part").exists()
+
+        # One probe followed by one ranged GET per part.
+        size = len(range_server["big"])
+        expected_parts = [f"bytes={s}-{e}" for s, e in _split_ranges(size, 4)]
+        assert range_server["ranges"][0] == "bytes=0-0"
+        assert sorted(range_server["ranges"][1:]) == sorted(expected_parts)
+
+    async def test_split_progress_sums_to_size(self, range_server, tmp_path):
+        """Progress deltas from all parts add up to the file size."""
+        deltas: list[int] = []
+
+        class Tracker:
+            def on_progress(self, bytes_delta: int) -> None:
+                deltas.append(bytes_delta)
+
+        async with range_server["client"]() as client:
+            await async_download_file(
+                "http://test/v1/files/big.msz",
+                tmp_path / "big.msz",
+                connections=3,
+                min_part_size=1024,
+                progress_callback=Tracker(),
+                client=client,
+            )
+        assert sum(deltas) == len(range_server["big"])
+
+    async def test_parts_capped_by_min_part_size(self, range_server, tmp_path):
+        """Fewer parts than connections are used for smaller files."""
+        async with range_server["client"]() as client:
+            await async_download_file(
+                "http://test/v1/files/big.msz",
+                tmp_path / "big.msz",
+                connections=16,
+                min_part_size=100_000,
+                client=client,
+            )
+        # 200_003 // 100_000 == 2 parts, plus the probe.
+        assert len(range_server["ranges"]) == 3
+        assert (tmp_path / "big.msz").read_bytes() == range_server["big"]
+
+    async def test_small_file_falls_back_to_single_stream(self, range_server, tmp_path):
+        """Files below 2 * min_part_size are fetched with one plain GET."""
+        async with range_server["client"]() as client:
+            await async_download_file(
+                "http://test/v1/files/big.msz",
+                tmp_path / "big.msz",
+                connections=4,
+                client=client,
+            )
+        # Probe, then a single un-ranged GET.
+        assert range_server["ranges"] == ["bytes=0-0", None]
+        assert (tmp_path / "big.msz").read_bytes() == range_server["big"]
+
+    async def test_split_with_conversion(self, range_server, test_mzml, tmp_path):
+        """Split downloads still go through the store_as conversion step."""
+        async with range_server["client"]() as client:
+            result = await async_download_file(
+                "http://test/v1/files/test.msz",
+                tmp_path / "test.msz",
+                store_as="mzml",
+                connections=4,
+                min_part_size=1024,
+                client=client,
+            )
+        assert result == tmp_path / "test.mzML"
+        assert result.stat().st_size == test_mzml.stat().st_size
+        assert len(range_server["ranges"]) > 2
+        assert list(tmp_path.glob("*.part")) == []
+        assert not (tmp_path / "test.msz").exists()
+
+    async def test_fallback_when_server_ignores_range(self, served_files, tmp_path):
+        """A server without Range support is downloaded in a single request."""
+        ranges: list[str | None] = []
+
+        async def _record(request: httpx.Request) -> None:
+            ranges.append(request.headers.get("range"))
+
+        dest = tmp_path / "medium.bin"
+        async with httpx.AsyncClient(event_hooks={"request": [_record]}) as client:
+            await async_download_file(
+                f"{served_files['base_url']}/medium.bin",
+                dest,
+                connections=4,
+                min_part_size=100,
+                client=client,
+            )
+        assert dest.read_bytes() == b"x" * 10_000
+        # The 200 probe response is reused as the download itself.
+        assert ranges == ["bytes=0-0"]
+
+    async def test_short_part_raises_and_cleans_up(self, tmp_path):
+        """A part with too few bytes fails the download and removes .part."""
+        size = 4096
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            header = request.headers["range"]
+            if header == "bytes=0-0":
+                return httpx.Response(
+                    206,
+                    content=b"x",
+                    headers={"Content-Range": f"bytes 0-0/{size}"},
+                )
+            start, end = (int(v) for v in header.removeprefix("bytes=").split("-"))
+            # Return one byte short of the requested range.
+            return httpx.Response(
+                206,
+                content=b"x" * (end - start),
+                headers={"Content-Range": f"bytes {start}-{end}/{size}"},
+            )
+
+        dest = tmp_path / "f.msz"
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as c:
+            with pytest.raises(PartialDownloadError):
+                await async_download_file(
+                    "http://test/f.msz",
+                    dest,
+                    connections=4,
+                    min_part_size=1024,
+                    client=c,
+                )
+        assert not dest.exists()
+        assert not dest.with_suffix(".msz.part").exists()
+
+    async def test_mismatched_content_range_raises(self, tmp_path):
+        """A part whose Content-Range differs from the request is rejected."""
+        size = 4096
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            # Always answer with the first bytes regardless of the range.
+            return httpx.Response(
+                206,
+                content=b"x",
+                headers={"Content-Range": f"bytes 0-0/{size}"},
+            )
+
+        dest = tmp_path / "f.msz"
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as c:
+            with pytest.raises(PartialDownloadError, match="Requested range"):
+                await async_download_file(
+                    "http://test/f.msz",
+                    dest,
+                    connections=2,
+                    min_part_size=1024,
+                    client=c,
+                )
+        assert not dest.with_suffix(".msz.part").exists()
+
+    async def test_invalid_connections_raises(self, tmp_path):
+        with pytest.raises(ValueError, match="connections"):
+            await async_download_file(
+                "http://test/f.msz", tmp_path / "f.msz", connections=0
+            )
+
+    async def test_batch_forwards_connections(self, range_server, tmp_path):
+        """Batch downloads split each file independently of `parallel`."""
+        requests = [
+            DownloadRequest(
+                url="http://test/v1/files/big.msz", dest=tmp_path / "a.msz"
+            ),
+            DownloadRequest(
+                url="http://test/v1/files/big.msz", dest=tmp_path / "b.msz"
+            ),
+        ]
+        async with range_server["client"]() as client:
+            results = await async_download_batch(
+                requests,
+                parallel=2,
+                connections=2,
+                min_part_size=1024,
+                client=client,
+            )
+        assert len(results) == 2
+        for path in results:
+            assert path.read_bytes() == range_server["big"]
+        # Two files × (probe + 2 parts) — the progress-less batch skips HEAD.
+        assert len(range_server["ranges"]) == 6
+
+    async def test_batch_ignores_failed_head_content_length(
+        self, range_server, tmp_path
+    ):
+        """A non-2xx HEAD (405 on GET-only routes) does not set total_bytes."""
+        totals: list[int | None] = []
+
+        class Tracker:
+            def on_file_start(self, filename: str, total_bytes: int | None) -> None:
+                totals.append(total_bytes)
+
+            def on_file_progress(self, filename: str, bytes_delta: int) -> None:
+                pass
+
+            def on_file_complete(self, filename: str) -> None:
+                pass
+
+            def on_file_error(self, filename: str, error: Exception) -> None:
+                pass
+
+        async with range_server["client"]() as client:
+            await async_download_batch(
+                [
+                    DownloadRequest(
+                        url="http://test/v1/files/big.msz", dest=tmp_path / "a.msz"
+                    )
+                ],
+                progress=Tracker(),
+                client=client,
+            )
+        assert totals == [None]

@@ -241,7 +241,8 @@ def cmd_download(args: argparse.Namespace) -> None:
 
     console.print(
         f"Downloading [bold]{len(requests)}[/] file(s) to "
-        f"[cyan]{output_dir}[/] (parallel={args.parallel})"
+        f"[cyan]{output_dir}[/] (parallel={args.parallel}, "
+        f"connections={args.connections})"
     )
 
     display = DownloadProgressDisplay(len(requests))
@@ -254,6 +255,7 @@ def cmd_download(args: argparse.Namespace) -> None:
                 requests,
                 store_as=args.store_as,
                 parallel=args.parallel,
+                connections=args.connections,
                 chunk_size=args.chunk_size,
                 progress=display,
                 skip_existing=args.skip_existing,
@@ -353,6 +355,13 @@ def main() -> None:
         type=int,
         default=4,
         help="Concurrent downloads (default: 4)",
+    )
+    dp.add_argument(
+        "--connections",
+        "-c",
+        type=int,
+        default=1,
+        help=("Split each file across this many ranged HTTP connections (default: 1)"),
     )
     dp.add_argument(
         "--chunk-size",

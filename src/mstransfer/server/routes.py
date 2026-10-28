@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Any
 import aiofiles
 import aiofiles.os
 from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 from mscompress import MSZFile
 
 from mstransfer import __version__
@@ -236,41 +236,128 @@ def make_router(
         files = await state.files.list_files()
         return FileListResponse(files=files)
 
-    @router.get("/files/{filename}", dependencies=protected)
+    @router.get("/files/{filename}", dependencies=protected, response_model=None)
     async def download_file(
-        filename: str, state: AppState = state_dep
-    ) -> StreamingResponse:
-        """Download a single file by name."""
+        filename: str, request: Request, state: AppState = state_dep
+    ) -> StreamingResponse | Response:
+        """Download a single file by name.
+
+        Supports single-range ``Range: bytes=...`` requests (``a-b``,
+        ``a-`` and suffix ``-n``), answering with ``206 Partial Content``.
+        Unsatisfiable ranges get ``416``.  Multi-range requests and
+        malformed headers are ignored and the full file is returned.
+        """
         path = await state.files.get_file(filename)
         if path is None:
             raise HTTPException(status_code=404, detail="File not found")
 
         stat = await aiofiles.os.stat(path)
+        size = stat.st_size
         content_type = (
             "application/xml"
             if path.suffix.lower() == ".mzml"
             else "application/octet-stream"
         )
+        headers = {
+            "Accept-Ranges": "bytes",
+            "Content-Disposition": f'attachment; filename="{path.name}"',
+        }
+
+        range_header = request.headers.get("range")
+        byte_range = _parse_range(range_header, size) if range_header else None
+
+        if byte_range == _UNSATISFIABLE:
+            return Response(
+                status_code=416,
+                headers={**headers, "Content-Range": f"bytes */{size}"},
+            )
+
+        if byte_range is not None:
+            start, end = byte_range
+            length = end - start + 1
+            return StreamingResponse(
+                _stream_file(path, start=start, length=length),
+                status_code=206,
+                media_type=content_type,
+                headers={
+                    **headers,
+                    "Content-Length": str(length),
+                    "Content-Range": f"bytes {start}-{end}/{size}",
+                },
+            )
 
         return StreamingResponse(
             _stream_file(path),
             media_type=content_type,
-            headers={
-                "Content-Length": str(stat.st_size),
-                "Content-Disposition": f'attachment; filename="{path.name}"',
-            },
+            headers={**headers, "Content-Length": str(size)},
         )
 
     return router
 
 
+# Sentinel returned by _parse_range for a syntactically valid but
+# unsatisfiable range (answered with 416).
+_UNSATISFIABLE: tuple[int, int] = (-1, -1)
+
+
+def _parse_range(header: str, size: int) -> tuple[int, int] | None:
+    """Parse a single ``bytes=`` range against a file of *size* bytes.
+
+    Returns an inclusive ``(start, end)`` tuple, :data:`_UNSATISFIABLE`
+    when the range cannot be served, or *None* when the header should be
+    ignored (unknown unit, malformed, or multi-range) and the full file
+    returned instead.
+    """
+    unit, _, spec = header.partition("=")
+    if unit.strip().lower() != "bytes" or not spec or "," in spec:
+        return None
+
+    first, sep, last = spec.strip().partition("-")
+    if not sep:
+        return None
+    first, last = first.strip(), last.strip()
+    if (first and not first.isdigit()) or (last and not last.isdigit()):
+        return None
+
+    if not first:
+        # Suffix range: the final *n* bytes of the file.
+        if not last:
+            return None
+        suffix = int(last)
+        if suffix == 0 or size == 0:
+            return _UNSATISFIABLE
+        return max(size - suffix, 0), size - 1
+
+    start = int(first)
+    if last and int(last) < start:
+        return None
+    if start >= size:
+        return _UNSATISFIABLE
+    end = int(last) if last else size - 1
+    return start, min(end, size - 1)
+
+
 async def _stream_file(
-    path: Path, chunk_size: int = 1_048_576
+    path: Path,
+    chunk_size: int = 1_048_576,
+    *,
+    start: int = 0,
+    length: int | None = None,
 ) -> AsyncGenerator[bytes, None]:
-    """Async generator that reads a file in chunks."""
+    """Async generator that reads a file in chunks.
+
+    When *length* is given, only ``length`` bytes starting at *start*
+    are yielded.
+    """
+    remaining = length
     async with aiofiles.open(path, "rb") as f:
-        while True:
-            chunk = await f.read(chunk_size)
+        if start:
+            await f.seek(start)
+        while remaining is None or remaining > 0:
+            to_read = chunk_size if remaining is None else min(chunk_size, remaining)
+            chunk = await f.read(to_read)
             if not chunk:
                 break
+            if remaining is not None:
+                remaining -= len(chunk)
             yield chunk
