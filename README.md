@@ -124,6 +124,7 @@ app = create_app(output_dir="/data/ms", store_as="mzml")
 
 # Mount in an existing FastAPI app
 from fastapi import FastAPI
+
 main_app = FastAPI()
 main_app.mount("/transfer", create_app())
 ```
