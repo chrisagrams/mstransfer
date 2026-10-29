@@ -48,7 +48,7 @@ def resolve_inputs(paths: list[str], recursive: bool = False) -> list[Path]:
 def normalize_source(
     source: Path | MZMLFile | MSZFile | MSZXFile,
 ) -> tuple[Path, str, MZMLFile | None]:
-    """Return ``(file_path, filetype, mzml_obj | None)`` from *source*."""
+    """Return `(file_path, filetype, mzml_obj | None)` from *source*."""
     if isinstance(source, MZMLFile):
         return Path(source.path.decode()), "mzML", source
     if isinstance(source, MSZFile):
@@ -82,8 +82,8 @@ async def async_iter_from_sync(
 ) -> AsyncIterator[bytes]:
     """Bridge a blocking sync iterator into an async iterator.
 
-    Each ``next()`` call is offloaded to a thread via ``asyncio.to_thread``
-    so that blocking reads (e.g. OS-pipe reads from ``compress_stream``)
+    Each `next()` call is offloaded to a thread via `asyncio.to_thread`
+    so that blocking reads (e.g. OS-pipe reads from `compress_stream`)
     do not stall the event loop.
     """
 

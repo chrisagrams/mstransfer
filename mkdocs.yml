@@ -85,8 +85,7 @@ plugins:
             show_signature_annotations: true
             signature_crossrefs: true
             line_length: 60
-            # Source mixes Google (Args:) and numpy (Parameters/----) styles.
-            docstring_style: auto
+            docstring_style: google
             merge_init_into_class: true
             filters:
               - "!^_"

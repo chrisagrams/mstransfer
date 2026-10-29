@@ -77,7 +77,7 @@ def _mszx_to_msz(src: Path, dst: Path) -> None:
 def _member_stem(entry: str) -> str:
     """Return the output stem for archive *entry*, without any directory part.
 
-    Raises :class:`ValueError` for names that would be empty or hidden.
+    Raises `ValueError` for names that would be empty or hidden.
     """
     # PureWindowsPath splits on both "/" and "\\", so no entry can name a
     # path outside the archive directory on any platform.
@@ -94,7 +94,7 @@ def _mszx_member_targets(
 ) -> list[tuple[str, str]]:
     """Map each .mszx spectra entry to an output file name.
 
-    Raises :class:`ValueError` if two entries map to the same output name.
+    Raises `ValueError` if two entries map to the same output name.
     """
     targets: list[tuple[str, str]] = []
     seen: dict[str, str] = {}
@@ -191,7 +191,7 @@ _CONVERTERS: dict[
 def _detect_source_format(url: str) -> DownloadFormat | None:
     """Infer the source format from the URL filename extension.
 
-    Returns ``"msz"``, ``"mzml"``, ``"mszx"``, or *None* if the format
+    Returns `"msz"`, `"mzml"`, `"mszx"`, or *None* if the format
     cannot be determined.
     """
     # Strip query params and fragments before inspecting extension.
@@ -250,51 +250,47 @@ async def async_download_file(
 ) -> Path:
     """Download a single file from *url* to *dest* (async).
 
-    The file is streamed to a temporary ``.part`` file first, then atomically
+    The file is streamed to a temporary `.part` file first, then atomically
     renamed (or converted) to the final destination on success.
 
-    Parameters
-    ----------
-    url:
-        The URL to download from.
-    dest:
-        The local path where the file should be saved.  If *store_as*
-        requires a format conversion, the extension will be adjusted
-        automatically.
-    store_as:
-        Desired output format — ``"msz"``, ``"mzml"``, ``"mszx"``, or
-        *None* to keep the file as-is.  When set, the downloaded file
-        is converted after download using **mscompress**.  Conversion
-        *to* ``"mszx"`` is only supported when the source is already
-        ``.mszx`` (no-op); other combos raise :class:`NotImplementedError`.
-        When a multi-member (batch) ``.mszx`` is stored as ``"msz"`` or
-        ``"mzml"``, its members are written to a directory named after
-        the archive, ``dest.parent/<dest stem>/<entry stem>.<ext>``.  The
-        directory appears only once every member is written, and replaces
-        any existing directory of that name.  Members whose names collide
-        raise :class:`ValueError` before anything is written.
-    chunk_size:
-        Number of bytes per read chunk (default 1 MiB).
-    connect_timeout:
-        Timeout in seconds for establishing the connection.
-    read_timeout:
-        Timeout in seconds for reading the response body.
-    progress_callback:
-        Optional callback invoked with byte deltas per chunk.
-    skip_existing:
-        If *True* and the final destination already exists, skip the
-        download.  For an ``.mszx`` stored as ``"msz"`` or ``"mzml"``, an
-        existing archive directory (see *store_as*) also counts.
-    force:
-        If *True*, re-download even if the destination already exists
-        (overrides *skip_existing*).
+    Args:
+        url: The URL to download from.
+        dest: The local path where the file should be saved.  If *store_as*
+            requires a format conversion, the extension will be adjusted
+            automatically.
+        store_as: Desired output format — `"msz"`, `"mzml"`, `"mszx"`, or
+            *None* to keep the file as-is.  When set, the downloaded file
+            is converted after download using **mscompress**.  Conversion
+            *to* `"mszx"` is only supported when the source is already
+            `.mszx` (no-op).  When a multi-member (batch) `.mszx` is
+            stored as `"msz"` or `"mzml"`, its members are written to a
+            directory named after the archive,
+            `dest.parent/<dest stem>/<entry stem>.<ext>`.  The directory
+            appears only once every member is written, and replaces any
+            existing directory of that name.
+        chunk_size: Number of bytes per read chunk (default 1 MiB).
+        connect_timeout: Timeout in seconds for establishing the connection.
+        read_timeout: Timeout in seconds for reading the response body.
+        progress_callback: Optional callback invoked with byte deltas per
+            chunk.
+        skip_existing: If *True* and the final destination already exists,
+            skip the download.  For an `.mszx` stored as `"msz"` or
+            `"mzml"`, an existing archive directory (see *store_as*) also
+            counts.
+        force: If *True*, re-download even if the destination already exists
+            (overrides *skip_existing*).
+        client: Optional `httpx.AsyncClient` to reuse; a temporary one is
+            created and closed otherwise.
 
-    Returns
-    -------
-    Path
-        The final destination path (may differ from *dest* if the
-        extension was adjusted for format conversion), or the archive
-        directory for a multi-member ``.mszx``.
+    Returns:
+        The final destination path (may differ from *dest* if the extension
+        was adjusted for format conversion), or the archive directory for a
+        multi-member `.mszx`.
+
+    Raises:
+        NotImplementedError: The source cannot be converted to *store_as*.
+        ValueError: Two members of a multi-member `.mszx` map to the same
+            output name; raised before anything is written.
     """
     source_fmt = _detect_source_format(url)
     final_dest = _resolve_dest(dest, store_as, source_fmt)
@@ -404,34 +400,25 @@ async def async_download_batch(
 ) -> list[Path]:
     """Download multiple files in parallel (async).
 
-    Parameters
-    ----------
-    files:
-        List of :class:`DownloadRequest` objects (url + dest pairs).
-    store_as:
-        Desired output format — ``"msz"``, ``"mzml"``, ``"mszx"``, or
-        *None* to keep files as-is.  Forwarded to each
-        :func:`async_download_file` call.
-    parallel:
-        Maximum number of concurrent downloads (capped to file count).
-    chunk_size:
-        Number of bytes per read chunk.
-    connect_timeout:
-        Timeout in seconds for establishing each connection.
-    read_timeout:
-        Timeout in seconds for reading each response body.
-    progress:
-        Optional batch progress callback.
-    skip_existing:
-        If *True*, skip files whose destination already exists.
-    force:
-        If *True*, re-download even if destination exists.
+    Args:
+        files: List of `DownloadRequest` objects (url + dest pairs).
+        store_as: Desired output format — `"msz"`, `"mzml"`, `"mszx"`, or
+            *None* to keep files as-is.  Forwarded to each
+            `async_download_file` call.
+        parallel: Maximum number of concurrent downloads (capped to file
+            count).
+        chunk_size: Number of bytes per read chunk.
+        connect_timeout: Timeout in seconds for establishing each connection.
+        read_timeout: Timeout in seconds for reading each response body.
+        progress: Optional batch progress callback.
+        skip_existing: If *True*, skip files whose destination already exists.
+        force: If *True*, re-download even if destination exists.
+        client: Optional `httpx.AsyncClient` shared by every download; a
+            temporary one is created per request otherwise.
 
-    Returns
-    -------
-    list[Path]
+    Returns:
         List of final destination paths (in input order, errors excluded).
-        A multi-member ``.mszx`` contributes its archive directory.
+        A multi-member `.mszx` contributes its archive directory.
     """
     workers = min(parallel, len(files))
     sem = asyncio.Semaphore(workers)
@@ -507,7 +494,7 @@ def download_file(
 ) -> Path:
     """Download a single file from *url* to *dest*.
 
-    This is a synchronous wrapper around :func:`async_download_file`.
+    This is a synchronous wrapper around `async_download_file`.
     """
     return asyncio.run(
         async_download_file(
@@ -540,7 +527,7 @@ def download_batch(
 ) -> list[Path]:
     """Download multiple files in parallel.
 
-    This is a synchronous wrapper around :func:`async_download_batch`.
+    This is a synchronous wrapper around `async_download_batch`.
     """
     return asyncio.run(
         async_download_batch(
@@ -559,7 +546,7 @@ def download_batch(
 
 
 class _FileProgressAdapter:
-    """Adapts :class:`BatchDownloadProgress` to :class:`DownloadProgressCallback`."""
+    """Adapts `BatchDownloadProgress` to `DownloadProgressCallback`."""
 
     def __init__(self, filename: str, batch: BatchDownloadProgress) -> None:
         self._filename = filename

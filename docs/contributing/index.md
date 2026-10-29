@@ -24,6 +24,14 @@ uv run mypy src/                 # type check (strict)
 CI runs all of these on Python 3.10 through 3.14 for every PR into `dev`,
 `stage`, and `main`.
 
+## Docstrings
+
+Docstrings use [Google style](https://google.github.io/styleguide/pyguide.html#38-comments-and-docstrings)
+(`Args:`, `Returns:`, `Raises:`) with Markdown inline code (single
+backticks), since the [API Reference](../reference/index.md) renders them
+with mkdocstrings. Ruff's pydocstyle rules (`D`, Google convention) check the
+format; missing docstrings are not flagged.
+
 ## Branches and releases
 
 Work branches off `dev` and PRs target `dev`. PR titles follow

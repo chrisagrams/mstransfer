@@ -22,8 +22,8 @@ VALID_EXTENSIONS: dict[str, StoreFormat] = {
 class FileProvider(Protocol):
     """Contract that file providers must satisfy.
 
-    Implementations may return :class:`FileInfo` subclasses from
-    :meth:`list_files`; the return type is :class:`~collections.abc.Sequence`
+    Implementations may return `FileInfo` subclasses from
+    `list_files`; the return type is `Sequence`
     so that subclass lists are accepted without type errors.
     """
 
