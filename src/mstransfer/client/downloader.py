@@ -2,212 +2,30 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
-import shutil
-import tarfile
-import tempfile
-import uuid
 from dataclasses import dataclass
-from pathlib import Path, PureWindowsPath
-from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 import aiofiles
 import httpx
-from mscompress import MSZFile, MZMLFile
-from mscompress.mszx import MSZXFile
-from mscompress.mszx.batch import MSZXBatchFile, read_archive_manifest
 
+from mstransfer.client.store import DownloadFormat, StorePlan
 from mstransfer.client.utils import ThrottledCallback, optional_client
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from pathlib import Path
+
+__all__ = [
+    "BatchDownloadProgress",
+    "DownloadFormat",
+    "DownloadProgressCallback",
+    "DownloadRequest",
+    "async_download_batch",
+    "async_download_file",
+    "download_batch",
+    "download_file",
+]
 
 logger = logging.getLogger(__name__)
-
-# Output formats the client can produce on disk after download.
-DownloadFormat = Literal["msz", "mzml", "mszx"]
-
-# Mapping of format to canonical file extension for naming converted outputs.
-_FORMAT_EXT: dict[DownloadFormat, str] = {
-    "msz": ".msz",
-    "mzml": ".mzML",
-    "mszx": ".mszx",
-}
-
-# Reverse mapping of lowercase extension to format for source format inference.
-_EXT_FORMAT: dict[str, DownloadFormat] = {v.lower(): k for k, v in _FORMAT_EXT.items()}
-
-
-def _msz_to_mzml(src: Path, dst: Path) -> None:
-    """Lambda wrapper msz -> mzml for use in async thread executor."""
-    MSZFile(str(src).encode()).decompress(str(dst))
-
-
-def _mzml_to_msz(src: Path, dst: Path) -> None:
-    """Lambda wrapper mzml -> msz for use in async thread executor."""
-    MZMLFile(str(src).encode()).compress(str(dst))
-
-
-def _mszx_to_mzml(src: Path, dst: Path) -> None:
-    """Lambda wrapper mszx -> mzml for use in async thread executor."""
-    with MSZXFile.open(src) as mszx:
-        mszx.decompress(str(dst))
-
-
-def _extract_msz_entry(tar: tarfile.TarFile, entry: str, dst: Path) -> None:
-    """Stream the MSZ member *entry* of an open .mszx tar to *dst*."""
-    member = tar.extractfile(entry)
-    if member is None:
-        raise ValueError(f"Missing MSZ entry {entry!r}")
-    with member, dst.open("wb") as out:
-        shutil.copyfileobj(member, out)
-
-
-def _mszx_to_msz(src: Path, dst: Path) -> None:
-    """Extract the embedded .msz payload from an .mszx archive."""
-    entries = read_archive_manifest(src).spectra_files
-    if len(entries) != 1:
-        raise NotImplementedError(
-            f"Cannot store a {len(entries)}-member .mszx as a single .msz"
-        )
-    with tarfile.open(src) as tar:
-        _extract_msz_entry(tar, entries[0].entry, dst)
-
-
-def _member_stem(entry: str) -> str:
-    """Return the output stem for archive *entry*, without any directory part.
-
-    Raises :class:`ValueError` for names that would be empty or hidden.
-    """
-    # PureWindowsPath splits on both "/" and "\\", so no entry can name a
-    # path outside the archive directory on any platform.
-    name = PureWindowsPath(entry).name
-    if name.lower().endswith(".msz"):
-        name = name[: -len(".msz")]
-    if not name or name.startswith("."):
-        raise ValueError(f"Unsafe .mszx entry name {entry!r}")
-    return name
-
-
-def _mszx_member_targets(
-    entries: list[str], store_as: DownloadFormat
-) -> list[tuple[str, str]]:
-    """Map each .mszx spectra entry to an output file name.
-
-    Raises :class:`ValueError` if two entries map to the same output name.
-    """
-    targets: list[tuple[str, str]] = []
-    seen: dict[str, str] = {}
-    for entry in entries:
-        name = f"{_member_stem(entry)}{_FORMAT_EXT[store_as]}"
-        # Compare case-insensitively: macOS and Windows filesystems are.
-        key = name.casefold()
-        if key in seen:
-            raise ValueError(
-                f"Archive entries {seen[key]!r} and {entry!r} both map to {name}"
-            )
-        seen[key] = entry
-        targets.append((entry, name))
-    return targets
-
-
-def _mszx_extract_members(
-    src: Path, targets: list[tuple[str, Path]], store_as: DownloadFormat
-) -> None:
-    """Write each (entry, path) in *targets* out of *src* as msz or mzML."""
-    if store_as == "msz":
-        with tarfile.open(src) as tar:
-            for entry, target in targets:
-                _extract_msz_entry(tar, entry, target)
-    else:
-        with MSZXBatchFile.open(src) as batch:
-            for entry, target in targets:
-                batch.get(entry).decompress(str(target))
-
-
-def _replace_dir(staging: Path, target: Path) -> None:
-    """Move directory *staging* to *target*, replacing any existing directory.
-
-    An existing *target* is moved aside first and restored if the swap
-    fails, so *target* is never left half-written.
-    """
-    if not target.exists():
-        staging.rename(target)
-        return
-    if not target.is_dir():
-        raise FileExistsError(f"{target} exists and is not a directory")
-    backup = target.with_name(f".{target.name}.{uuid.uuid4().hex}.old")
-    target.rename(backup)
-    try:
-        staging.rename(target)
-    except BaseException:
-        backup.rename(target)
-        raise
-    shutil.rmtree(backup, ignore_errors=True)
-
-
-async def _store_mszx_members(
-    src: Path,
-    targets: list[tuple[str, str]],
-    archive_dir: Path,
-    store_as: DownloadFormat,
-) -> Path:
-    """Store every member of a multi-member .mszx in *archive_dir*.
-
-    Members are extracted into a uniquely named staging directory that is
-    renamed to *archive_dir* only once all of them succeed, so a failure
-    leaves no partial output behind and concurrent downloads never share
-    staging files.
-    """
-    staging = Path(
-        tempfile.mkdtemp(
-            dir=archive_dir.parent, prefix=f".{archive_dir.name}.", suffix=".part"
-        )
-    )
-    try:
-        staged = [(entry, staging / name) for entry, name in targets]
-        await asyncio.to_thread(_mszx_extract_members, src, staged, store_as)
-        _replace_dir(staging, archive_dir)
-    finally:
-        shutil.rmtree(staging, ignore_errors=True)
-
-    logger.info(
-        "Extracted %d members from %s into %s", len(targets), src.name, archive_dir
-    )
-    return archive_dir
-
-
-# Mapping of (source_format, target_format) to converter function.
-_CONVERTERS: dict[
-    tuple[DownloadFormat, DownloadFormat], Callable[[Path, Path], None]
-] = {
-    ("msz", "mzml"): _msz_to_mzml,
-    ("mzml", "msz"): _mzml_to_msz,
-    ("mszx", "mzml"): _mszx_to_mzml,
-    ("mszx", "msz"): _mszx_to_msz,
-}
-
-
-def _detect_source_format(url: str) -> DownloadFormat | None:
-    """Infer the source format from the URL filename extension.
-
-    Returns ``"msz"``, ``"mzml"``, ``"mszx"``, or *None* if the format
-    cannot be determined.
-    """
-    # Strip query params and fragments before inspecting extension.
-    path = url.split("?", 1)[0].split("#", 1)[0]
-    return _EXT_FORMAT.get(Path(path).suffix.lower())
-
-
-def _resolve_dest(
-    dest: Path,
-    store_as: DownloadFormat | None,
-    source_fmt: DownloadFormat | None,
-) -> Path:
-    """Adjust *dest* extension when *store_as* differs from the source."""
-    if store_as is None or source_fmt is None or store_as == source_fmt:
-        return dest
-    return dest.with_suffix(_FORMAT_EXT[store_as])
 
 
 @runtime_checkable
@@ -296,35 +114,18 @@ async def async_download_file(
         extension was adjusted for format conversion), or the archive
         directory for a multi-member ``.mszx``.
     """
-    source_fmt = _detect_source_format(url)
-    final_dest = _resolve_dest(dest, store_as, source_fmt)
+    plan = StorePlan.for_download(url, dest, store_as)
 
-    # Fail fast on unsupported conversion combinations before any I/O.
-    if store_as == "mszx" and source_fmt is not None and source_fmt != "mszx":
-        raise NotImplementedError(
-            f"Conversion from {source_fmt} to mszx is not supported"
-        )
-
-    # Where the members of a multi-member .mszx go, if this turns out to be one.
-    archive_dir = final_dest.with_suffix("")
-    may_expand = source_fmt == "mszx" and store_as in ("msz", "mzml")
-
-    # Skip if file already exists and we're not forcing.
-    if not force and skip_existing:
-        if final_dest.exists():
-            logger.info("Skipping existing file: %s", final_dest)
-            return final_dest
-        # The archive directory only ever appears complete, so it is safe
-        # to trust without downloading the archive again.
-        if may_expand and archive_dir.is_dir():
-            logger.info("Skipping existing archive directory: %s", archive_dir)
-            return archive_dir
+    # Skip if the output already exists and we're not forcing.
+    if not force and skip_existing and (existing := plan.existing()) is not None:
+        logger.info("Skipping existing output: %s", existing)
+        return existing
 
     # Ensure the parent directory exists.
-    final_dest.parent.mkdir(parents=True, exist_ok=True)
+    plan.final_dest.parent.mkdir(parents=True, exist_ok=True)
 
     # Write to a temp .part file to avoid partial downloads.
-    part_path = dest.with_suffix(dest.suffix + ".part")
+    part_path = plan.part_path
 
     timeout = httpx.Timeout(read_timeout, connect=connect_timeout)
 
@@ -348,45 +149,7 @@ async def async_download_file(
         if throttled:
             throttled.flush()
 
-    # No conversion needed — atomic rename to final destination.
-    if store_as is None or source_fmt is None or store_as == source_fmt:
-        part_path.rename(final_dest)
-        return final_dest
-
-    converter = _CONVERTERS.get((source_fmt, store_as))
-    if converter is None:
-        part_path.unlink(missing_ok=True)
-        raise NotImplementedError(
-            f"Conversion from {source_fmt} to {store_as} is not supported"
-        )
-
-    # Give the temp file the correct source extension so mscompress can
-    # recognise its format, then convert.
-    tmp_source = part_path.with_suffix(_FORMAT_EXT[source_fmt])
-    part_path.rename(tmp_source)
-
-    # Stage converted output; atomically rename to final_dest on success.
-    staging = final_dest.with_suffix(final_dest.suffix + ".part")
-
-    try:
-        if may_expand:
-            manifest = await asyncio.to_thread(read_archive_manifest, tmp_source)
-            entries = [spectra.entry for spectra in manifest.spectra_files]
-            if len(entries) > 1:
-                targets = _mszx_member_targets(entries, store_as)
-                return await _store_mszx_members(
-                    tmp_source, targets, archive_dir, store_as
-                )
-        await asyncio.to_thread(converter, tmp_source, staging)
-        staging.replace(final_dest)
-        logger.info("Converted %s → %s", tmp_source.name, final_dest.name)
-    finally:
-        if staging.exists():
-            staging.unlink()
-        if tmp_source.exists():
-            os.remove(tmp_source)
-
-    return final_dest
+    return await plan.finalize(part_path)
 
 
 async def async_download_batch(
