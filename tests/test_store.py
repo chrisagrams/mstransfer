@@ -8,7 +8,12 @@ import tarfile
 
 import pytest
 
-from mstransfer.client.store import StorePlan, detect_source_format, mszx_to_msz
+from mstransfer.client.store import (
+    MszxExpansion,
+    StorePlan,
+    detect_source_format,
+    mszx_to_msz,
+)
 
 # ---------------------------------------------------------------------------
 # Format detection and destination resolution
@@ -134,6 +139,35 @@ class TestStorePlan:
     def test_existing_ignores_dir_without_expansion(self, tmp_path):
         (tmp_path / "run").mkdir()
         assert StorePlan(tmp_path / "run.msz", "msz", "mzml").existing() is None
+
+
+class TestMszxExpansion:
+    def test_targets_use_entry_stem_and_target_ext(self, tmp_path):
+        expansion = MszxExpansion(tmp_path / "a.mszx", ("a.msz", "B.MSZ"), "mzml")
+        assert expansion.targets == [("a.msz", "a.mzML"), ("B.MSZ", "B.mzML")]
+
+    def test_targets_strip_directories(self, tmp_path):
+        entries = ("../x.msz", "sub/y.msz", "..\\w.msz")
+        expansion = MszxExpansion(tmp_path / "a.mszx", entries, "msz")
+        assert [name for _, name in expansion.targets] == ["x.msz", "y.msz", "w.msz"]
+
+    def test_targets_reject_case_insensitive_collisions(self, tmp_path):
+        expansion = MszxExpansion(tmp_path / "a.mszx", ("a.msz", "sub/A.msz"), "msz")
+        with pytest.raises(ValueError, match="both map to"):
+            _ = expansion.targets
+
+    @pytest.mark.parametrize("entry", [".msz", "..", "sub/.hidden.msz"])
+    def test_targets_reject_unsafe_names(self, tmp_path, entry):
+        expansion = MszxExpansion(tmp_path / "a.mszx", ("ok.msz", entry), "msz")
+        with pytest.raises(ValueError, match="Unsafe"):
+            _ = expansion.targets
+
+    @pytest.mark.asyncio
+    async def test_write_validates_before_touching_disk(self, tmp_path):
+        expansion = MszxExpansion(tmp_path / "a.mszx", (".msz", "b.msz"), "msz")
+        with pytest.raises(ValueError, match="Unsafe"):
+            await expansion.write(tmp_path / "a")
+        assert list(tmp_path.iterdir()) == []
 
 
 class TestMszxToMsz:

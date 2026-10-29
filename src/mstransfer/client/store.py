@@ -8,6 +8,7 @@ import shutil
 import tarfile
 import tempfile
 from dataclasses import dataclass
+from functools import cached_property
 from pathlib import Path, PureWindowsPath
 from typing import TYPE_CHECKING, Literal
 
@@ -68,6 +69,15 @@ def mszx_to_mzml(src: Path, dst: Path) -> None:
         mszx.decompress(str(dst))
 
 
+def _extract_msz_entry(tar: tarfile.TarFile, entry: str, dst: Path) -> None:
+    """Stream the MSZ member *entry* of an open .mszx tar to *dst*."""
+    member = tar.extractfile(entry)
+    if member is None:
+        raise ValueError(f"Missing MSZ entry {entry!r}")
+    with member, dst.open("wb") as out:
+        shutil.copyfileobj(member, out)
+
+
 def mszx_to_msz(src: Path, dst: Path) -> None:
     """Extract the embedded .msz payload from an .mszx archive."""
     entries = read_archive_manifest(src).spectra_files
@@ -91,68 +101,97 @@ CONVERTERS: dict[
 
 
 # ---------------------------------------------------------------------------
-# Multi-member .mszx helpers
+# Multi-member .mszx expansion
 # ---------------------------------------------------------------------------
 
 
-def _extract_msz_entry(tar: tarfile.TarFile, entry: str, dst: Path) -> None:
-    """Stream the MSZ member *entry* of an open .mszx tar to *dst*."""
-    member = tar.extractfile(entry)
-    if member is None:
-        raise ValueError(f"Missing MSZ entry {entry!r}")
-    with member, dst.open("wb") as out:
-        shutil.copyfileobj(member, out)
+@dataclass(frozen=True)
+class MszxExpansion:
+    """Writes every member of a multi-member .mszx into one directory.
 
-
-def _member_stem(entry: str) -> str:
-    """Return the output stem for archive *entry*, without any directory part.
-
-    Raises :class:`ValueError` for names that would be empty or hidden.
+    Each spectra *entry* of *src* becomes ``<entry stem>.<ext>`` stored as
+    *target* (``"msz"`` or ``"mzml"``).
     """
-    # PureWindowsPath splits on both "/" and "\\", so no entry can name a
-    # path outside the archive directory on any platform.
-    name = PureWindowsPath(entry).name
-    if name.lower().endswith(".msz"):
-        name = name[: -len(".msz")]
-    if not name or name.startswith("."):
-        raise ValueError(f"Unsafe .mszx entry name {entry!r}")
-    return name
 
+    src: Path
+    entries: tuple[str, ...]
+    target: DownloadFormat
 
-def _member_targets(
-    entries: list[str], store_as: DownloadFormat
-) -> list[tuple[str, str]]:
-    """Map each .mszx spectra entry to an output file name.
+    @cached_property
+    def targets(self) -> list[tuple[str, str]]:
+        """Map each spectra entry to an output file name.
 
-    Raises :class:`ValueError` if two entries map to the same output name.
-    """
-    targets: list[tuple[str, str]] = []
-    seen: dict[str, str] = {}
-    for entry in entries:
-        name = f"{_member_stem(entry)}{FORMAT_EXT[store_as]}"
-        # Compare case-insensitively: macOS and Windows filesystems are.
-        key = name.casefold()
-        if key in seen:
-            raise ValueError(
-                f"Archive entries {seen[key]!r} and {entry!r} both map to {name}"
+        Raises :class:`ValueError` for unsafe names, or if two entries map
+        to the same output name.
+        """
+        targets: list[tuple[str, str]] = []
+        seen: dict[str, str] = {}
+        for entry in self.entries:
+            name = f"{self._member_stem(entry)}{FORMAT_EXT[self.target]}"
+            # Compare case-insensitively: macOS and Windows filesystems are.
+            key = name.casefold()
+            if key in seen:
+                raise ValueError(
+                    f"Archive entries {seen[key]!r} and {entry!r} both map to {name}"
+                )
+            seen[key] = entry
+            targets.append((entry, name))
+        return targets
+
+    def extract_to(self, directory: Path) -> None:
+        """Write every member into *directory* (blocking)."""
+        if self.target == "msz":
+            with tarfile.open(self.src) as tar:
+                for entry, name in self.targets:
+                    _extract_msz_entry(tar, entry, directory / name)
+        else:
+            with MSZXBatchFile.open(self.src) as batch:
+                for entry, name in self.targets:
+                    batch.get(entry).decompress(str(directory / name))
+
+    async def write(self, archive_dir: Path) -> Path:
+        """Store every member in *archive_dir*.
+
+        Members are extracted into a uniquely named staging directory that
+        is renamed to *archive_dir* only once all of them succeed, so a
+        failure leaves no partial output behind and concurrent downloads
+        never share staging files.  Names are validated before anything
+        is written.
+        """
+        targets = self.targets
+        staging = Path(
+            tempfile.mkdtemp(
+                dir=archive_dir.parent, prefix=f".{archive_dir.name}.", suffix=".part"
             )
-        seen[key] = entry
-        targets.append((entry, name))
-    return targets
+        )
+        try:
+            await asyncio.to_thread(self.extract_to, staging)
+            replace_dir(staging, archive_dir)
+        finally:
+            shutil.rmtree(staging, ignore_errors=True)
 
+        logger.info(
+            "Extracted %d members from %s into %s",
+            len(targets),
+            self.src.name,
+            archive_dir,
+        )
+        return archive_dir
 
-def _extract_members(
-    src: Path, targets: list[tuple[str, Path]], store_as: DownloadFormat
-) -> None:
-    """Write each (entry, path) in *targets* out of *src* as msz or mzML."""
-    if store_as == "msz":
-        with tarfile.open(src) as tar:
-            for entry, target in targets:
-                _extract_msz_entry(tar, entry, target)
-    else:
-        with MSZXBatchFile.open(src) as batch:
-            for entry, target in targets:
-                batch.get(entry).decompress(str(target))
+    @staticmethod
+    def _member_stem(entry: str) -> str:
+        """Return the output stem for archive *entry*, without any directory part.
+
+        Raises :class:`ValueError` for names that would be empty or hidden.
+        """
+        # PureWindowsPath splits on both "/" and "\\", so no entry can name a
+        # path outside the archive directory on any platform.
+        name = PureWindowsPath(entry).name
+        if name.lower().endswith(".msz"):
+            name = name[: -len(".msz")]
+        if not name or name.startswith("."):
+            raise ValueError(f"Unsafe .mszx entry name {entry!r}")
+        return name
 
 
 # ---------------------------------------------------------------------------
@@ -245,9 +284,10 @@ class StorePlan:
         try:
             if self.may_expand:
                 manifest = await asyncio.to_thread(read_archive_manifest, src)
-                entries = [spectra.entry for spectra in manifest.spectra_files]
+                entries = tuple(spectra.entry for spectra in manifest.spectra_files)
                 if len(entries) > 1:
-                    return await self._expand(src, entries, target)
+                    expansion = MszxExpansion(src, entries, target)
+                    return await expansion.write(self.archive_dir)
             return await self._convert(src, CONVERTERS[conversion])
         finally:
             src.unlink(missing_ok=True)
@@ -265,32 +305,3 @@ class StorePlan:
             staging.unlink(missing_ok=True)
         logger.info("Converted %s → %s", src.name, final_dest.name)
         return final_dest
-
-    async def _expand(
-        self, src: Path, entries: list[str], target: DownloadFormat
-    ) -> Path:
-        """Store every member of a multi-member .mszx in :attr:`archive_dir`.
-
-        Members are extracted into a uniquely named staging directory that
-        is renamed to :attr:`archive_dir` only once all of them succeed, so
-        a failure leaves no partial output behind and concurrent downloads
-        never share staging files.
-        """
-        targets = _member_targets(entries, target)
-        archive_dir = self.archive_dir
-        staging = Path(
-            tempfile.mkdtemp(
-                dir=archive_dir.parent, prefix=f".{archive_dir.name}.", suffix=".part"
-            )
-        )
-        try:
-            staged = [(entry, staging / name) for entry, name in targets]
-            await asyncio.to_thread(_extract_members, src, staged, target)
-            replace_dir(staging, archive_dir)
-        finally:
-            shutil.rmtree(staging, ignore_errors=True)
-
-        logger.info(
-            "Extracted %d members from %s into %s", len(targets), src.name, archive_dir
-        )
-        return archive_dir
