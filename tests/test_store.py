@@ -15,10 +15,6 @@ from mstransfer.client.store import (
     StorePlan,
 )
 
-# ---------------------------------------------------------------------------
-# Format detection and destination resolution
-# ---------------------------------------------------------------------------
-
 
 class TestMSFormatFromUrl:
     def test_msz_url(self):

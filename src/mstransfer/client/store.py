@@ -64,11 +64,6 @@ _FORMAT_EXT: dict[MSFormat, str] = {
 _EXT_FORMAT: dict[str, MSFormat] = {v.lower(): k for k, v in _FORMAT_EXT.items()}
 
 
-# ---------------------------------------------------------------------------
-# Single-file conversions
-# ---------------------------------------------------------------------------
-
-
 def _extract_msz_entry(tar: tarfile.TarFile, entry: str, dst: Path) -> None:
     """Stream the MSZ member *entry* of an open .mszx tar to *dst*."""
     member = tar.extractfile(entry)
@@ -130,11 +125,6 @@ class Conversion:
         (MSFormat.MSZX, MSFormat.MZML): _mszx_to_mzml,
         (MSFormat.MSZX, MSFormat.MSZ): _mszx_to_msz,
     }
-
-
-# ---------------------------------------------------------------------------
-# Multi-member .mszx expansion
-# ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
@@ -224,11 +214,6 @@ class MszxExpansion:
         if not name or name.startswith("."):
             raise ValueError(f"Unsafe .mszx entry name {entry!r}")
         return name
-
-
-# ---------------------------------------------------------------------------
-# Store plan
-# ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
