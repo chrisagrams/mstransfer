@@ -200,6 +200,7 @@ class DownloadProgressDisplay:
         self.table.add_row(self.overall)
         self.table.add_row(self.files)
         self._task_ids: dict[str, TaskID] = {}
+        self.failed = 0
 
     def on_file_start(self, filename: str, total_bytes: int | None) -> None:
         task_id = self.files.add_task(filename, total=total_bytes)
@@ -219,6 +220,7 @@ class DownloadProgressDisplay:
         desc = self.files.tasks[task_id].description
         self.files.update(task_id, description=f"[red]{desc}")
         self.overall.advance(self.overall_task)
+        self.failed += 1
 
 
 def cmd_download(args: argparse.Namespace) -> None:
@@ -262,10 +264,11 @@ def cmd_download(args: argparse.Namespace) -> None:
             )
 
     with Live(display.table, console=console, refresh_per_second=10):
-        results = asyncio.run(_run())
+        asyncio.run(_run())
 
-    ok = len(results)
-    fail = len(requests) - ok
+    # Failures are counted by the display, one per request.
+    fail = display.failed
+    ok = len(requests) - fail
     if fail:
         console.print(f"\n[green]{ok} succeeded[/], [red]{fail} failed[/]")
     else:
