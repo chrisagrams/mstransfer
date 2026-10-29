@@ -32,6 +32,15 @@ class TestMSFormatFromUrl:
     def test_no_extension(self):
         assert MSFormat.from_url("http://host/data/file") is None
 
+    def test_host_is_not_a_filename(self):
+        assert MSFormat.from_url("http://data.msz") is None
+
+    def test_percent_encoded_path(self):
+        assert MSFormat.from_url("http://host/my%20file%2EmzML") == "mzml"
+
+    def test_extension_in_query_ignored(self):
+        assert MSFormat.from_url("http://host/download?file=x.msz") is None
+
     def test_query_params_stripped(self):
         assert MSFormat.from_url("http://h/f.msz?token=abc") == "msz"
 

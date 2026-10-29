@@ -10,8 +10,9 @@ import tempfile
 from dataclasses import dataclass
 from enum import Enum
 from functools import cached_property
-from pathlib import Path, PureWindowsPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import TYPE_CHECKING, ClassVar, Literal
+from urllib.parse import unquote, urlsplit
 
 from mscompress import MSZFile, MZMLFile
 from mscompress.mszx import MSZXFile
@@ -49,11 +50,10 @@ class MSFormat(str, Enum):
     @classmethod
     def from_url(cls, url: str) -> MSFormat | None:
         """Infer the format from the URL filename extension, or *None*."""
-        # Strip query params and fragments before inspecting extension.
-        path = url.split("?", 1)[0].split("#", 1)[0]
+        suffix = PurePosixPath(unquote(urlsplit(url).path)).suffix
         # Every format's lowercased extension is "." + its value.
         try:
-            return cls(Path(path).suffix.lower().removeprefix("."))
+            return cls(suffix.lower().removeprefix("."))
         except ValueError:
             return None
 
