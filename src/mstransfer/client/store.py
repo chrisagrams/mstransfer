@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from enum import Enum
 from functools import cached_property
 from pathlib import Path, PureWindowsPath
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, ClassVar, Literal
 
 from mscompress import MSZFile, MZMLFile
 from mscompress.mszx import MSZXFile
@@ -65,24 +65,8 @@ _EXT_FORMAT: dict[str, MSFormat] = {v.lower(): k for k, v in _FORMAT_EXT.items()
 
 
 # ---------------------------------------------------------------------------
-# Single-file converters (run in a worker thread)
+# Single-file conversions
 # ---------------------------------------------------------------------------
-
-
-def msz_to_mzml(src: Path, dst: Path) -> None:
-    """Decompress an .msz file to mzML."""
-    MSZFile(str(src).encode()).decompress(str(dst))
-
-
-def mzml_to_msz(src: Path, dst: Path) -> None:
-    """Compress an mzML file to .msz."""
-    MZMLFile(str(src).encode()).compress(str(dst))
-
-
-def mszx_to_mzml(src: Path, dst: Path) -> None:
-    """Decompress the spectra of a single-member .mszx archive to mzML."""
-    with MSZXFile.open(src) as mszx:
-        mszx.decompress(str(dst))
 
 
 def _extract_msz_entry(tar: tarfile.TarFile, entry: str, dst: Path) -> None:
@@ -92,26 +76,6 @@ def _extract_msz_entry(tar: tarfile.TarFile, entry: str, dst: Path) -> None:
         raise ValueError(f"Missing MSZ entry {entry!r}")
     with member, dst.open("wb") as out:
         shutil.copyfileobj(member, out)
-
-
-def mszx_to_msz(src: Path, dst: Path) -> None:
-    """Extract the embedded .msz payload from an .mszx archive."""
-    entries = read_archive_manifest(src).spectra_files
-    if len(entries) != 1:
-        raise NotImplementedError(
-            f"Cannot store a {len(entries)}-member .mszx as a single .msz"
-        )
-    with tarfile.open(src) as tar:
-        _extract_msz_entry(tar, entries[0].entry, dst)
-
-
-# Mapping of (source_format, target_format) to converter function.
-_CONVERTERS: dict[tuple[MSFormat, MSFormat], Callable[[Path, Path], None]] = {
-    (MSFormat.MSZ, MSFormat.MZML): msz_to_mzml,
-    (MSFormat.MZML, MSFormat.MSZ): mzml_to_msz,
-    (MSFormat.MSZX, MSFormat.MZML): mszx_to_mzml,
-    (MSFormat.MSZX, MSFormat.MSZ): mszx_to_msz,
-}
 
 
 @dataclass(frozen=True)
@@ -124,11 +88,48 @@ class Conversion:
     @property
     def supported(self) -> bool:
         """Whether a converter exists for this pair of formats."""
-        return (self.source, self.target) in _CONVERTERS
+        return (self.source, self.target) in self._CONVERTERS
 
     def run(self, src: Path, dst: Path) -> None:
-        """Convert *src* to *dst* (blocking)."""
-        _CONVERTERS[(self.source, self.target)](src, dst)
+        """Convert *src* to *dst* (blocking; run in a worker thread)."""
+        self._CONVERTERS[(self.source, self.target)](src, dst)
+
+    @staticmethod
+    def _msz_to_mzml(src: Path, dst: Path) -> None:
+        """Decompress an .msz file to mzML."""
+        MSZFile(str(src).encode()).decompress(str(dst))
+
+    @staticmethod
+    def _mzml_to_msz(src: Path, dst: Path) -> None:
+        """Compress an mzML file to .msz."""
+        MZMLFile(str(src).encode()).compress(str(dst))
+
+    @staticmethod
+    def _mszx_to_mzml(src: Path, dst: Path) -> None:
+        """Decompress the spectra of a single-member .mszx archive to mzML."""
+        with MSZXFile.open(src) as mszx:
+            mszx.decompress(str(dst))
+
+    @staticmethod
+    def _mszx_to_msz(src: Path, dst: Path) -> None:
+        """Extract the embedded .msz payload from an .mszx archive."""
+        entries = read_archive_manifest(src).spectra_files
+        if len(entries) != 1:
+            raise NotImplementedError(
+                f"Cannot store a {len(entries)}-member .mszx as a single .msz"
+            )
+        with tarfile.open(src) as tar:
+            _extract_msz_entry(tar, entries[0].entry, dst)
+
+    # Mapping of (source_format, target_format) to converter function.
+    _CONVERTERS: ClassVar[
+        dict[tuple[MSFormat, MSFormat], Callable[[Path, Path], None]]
+    ] = {
+        (MSFormat.MSZ, MSFormat.MZML): _msz_to_mzml,
+        (MSFormat.MZML, MSFormat.MSZ): _mzml_to_msz,
+        (MSFormat.MSZX, MSFormat.MZML): _mszx_to_mzml,
+        (MSFormat.MSZX, MSFormat.MSZ): _mszx_to_msz,
+    }
 
 
 # ---------------------------------------------------------------------------

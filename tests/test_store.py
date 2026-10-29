@@ -13,7 +13,6 @@ from mstransfer.client.store import (
     MSFormat,
     MszxExpansion,
     StorePlan,
-    mszx_to_msz,
 )
 
 # ---------------------------------------------------------------------------
@@ -226,7 +225,7 @@ class TestMszxExpansion:
         assert list(tmp_path.iterdir()) == []
 
 
-class TestMszxToMsz:
+class TestMszxToMszConversion:
     def test_mszx_to_msz_rejects_multi_member_batch(self, test_msz, tmp_path):
         """A v2 batch .mszx with several members can't become one .msz."""
         src = tmp_path / "batch.mszx"
@@ -245,7 +244,7 @@ class TestMszxToMsz:
             tar.add(str(test_msz), arcname="b.msz")
 
         with pytest.raises(NotImplementedError, match="2-member"):
-            mszx_to_msz(src, tmp_path / "out.msz")
+            Conversion(MSFormat.MSZX, MSFormat.MSZ).run(src, tmp_path / "out.msz")
 
     def test_mszx_to_msz_rejects_non_file_entry(self, tmp_path):
         """A manifest entry that isn't a regular tar member raises ValueError."""
@@ -266,4 +265,4 @@ class TestMszxToMsz:
             tar.addfile(entry)
 
         with pytest.raises(ValueError, match="Missing MSZ entry"):
-            mszx_to_msz(src, tmp_path / "out.msz")
+            Conversion(MSFormat.MSZX, MSFormat.MSZ).run(src, tmp_path / "out.msz")
