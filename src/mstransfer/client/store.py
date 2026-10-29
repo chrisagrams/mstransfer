@@ -58,13 +58,41 @@ class MSFormat(str, Enum):
             return None
 
 
-def _extract_msz_entry(tar: tarfile.TarFile, entry: str, dst: Path) -> None:
-    """Stream the MSZ member *entry* of an open .mszx tar to *dst*."""
-    member = tar.extractfile(entry)
-    if member is None:
-        raise ValueError(f"Missing MSZ entry {entry!r}")
-    with member, dst.open("wb") as out:
-        shutil.copyfileobj(member, out)
+class MszxArchive:
+    """Raw access to the spectra members of an .mszx tar.
+
+    TODO: Replace with ``MSZXBatchFile.extract_msz()`` once mscompress
+    provides it (https://github.com/chrisagrams/mscompress/issues/277).
+    """
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.entries = self.read_entries(path)
+        # Closed by close() / __exit__; this class is the context manager.
+        self._tar = tarfile.open(path)  # noqa: SIM115
+
+    @staticmethod
+    def read_entries(path: Path) -> tuple[str, ...]:
+        """Return the spectra entry names listed in the manifest of *path*."""
+        manifest = read_archive_manifest(path)
+        return tuple(spectra.entry for spectra in manifest.spectra_files)
+
+    def extract_msz(self, entry: str, dst: Path) -> None:
+        """Stream the raw MSZ member *entry* to *dst*."""
+        member = self._tar.extractfile(entry)
+        if member is None:
+            raise ValueError(f"Missing MSZ entry {entry!r}")
+        with member, dst.open("wb") as out:
+            shutil.copyfileobj(member, out)
+
+    def close(self) -> None:
+        self._tar.close()
+
+    def __enter__(self) -> MszxArchive:
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        self.close()
 
 
 @dataclass(frozen=True)
@@ -103,13 +131,13 @@ class Conversion:
     @staticmethod
     def _mszx_to_msz(src: Path, dst: Path) -> None:
         """Extract the embedded .msz payload from an .mszx archive."""
-        entries = read_archive_manifest(src).spectra_files
-        if len(entries) != 1:
-            raise NotImplementedError(
-                f"Cannot store a {len(entries)}-member .mszx as a single .msz"
-            )
-        with tarfile.open(src) as tar:
-            _extract_msz_entry(tar, entries[0].entry, dst)
+        with MszxArchive(src) as archive:
+            if len(archive.entries) != 1:
+                raise NotImplementedError(
+                    f"Cannot store a {len(archive.entries)}-member .mszx "
+                    "as a single .msz"
+                )
+            archive.extract_msz(archive.entries[0], dst)
 
     # Mapping of (source_format, target_format) to converter function.
     _CONVERTERS: ClassVar[
@@ -158,9 +186,9 @@ class MszxExpansion:
     def _extract_to(self, directory: Path) -> None:
         """Write every member into *directory* (blocking)."""
         if self.target is MSFormat.MSZ:
-            with tarfile.open(self.src) as tar:
+            with MszxArchive(self.src) as archive:
                 for entry, name in self.targets:
-                    _extract_msz_entry(tar, entry, directory / name)
+                    archive.extract_msz(entry, directory / name)
         else:
             with MSZXBatchFile.open(self.src) as batch:
                 for entry, name in self.targets:
@@ -300,8 +328,7 @@ class StorePlan:
         part.rename(src)
         try:
             if self.may_expand:
-                manifest = await asyncio.to_thread(read_archive_manifest, src)
-                entries = tuple(spectra.entry for spectra in manifest.spectra_files)
+                entries = await asyncio.to_thread(MszxArchive.read_entries, src)
                 if len(entries) > 1:
                     expansion = MszxExpansion(src, entries, conversion.target)
                     return await expansion.write(self.archive_dir)
