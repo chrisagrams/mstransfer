@@ -238,7 +238,8 @@ class TestMszxExpansion:
 
 
 class TestMszxToMszConversion:
-    def test_mszx_to_msz_rejects_multi_member_batch(self, test_msz, tmp_path):
+    @pytest.mark.asyncio
+    async def test_mszx_to_msz_rejects_multi_member_batch(self, test_msz, tmp_path):
         """A v2 batch .mszx with several members can't become one .msz."""
         src = tmp_path / "batch.mszx"
         manifest = json.dumps(
@@ -256,9 +257,10 @@ class TestMszxToMszConversion:
             tar.add(str(test_msz), arcname="b.msz")
 
         with pytest.raises(NotImplementedError, match="2-member"):
-            Conversion(MSFormat.MSZX, MSFormat.MSZ).run(src, tmp_path / "out.msz")
+            await Conversion(MSFormat.MSZX, MSFormat.MSZ).run(src, tmp_path / "out.msz")
 
-    def test_mszx_to_msz_rejects_non_file_entry(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_mszx_to_msz_rejects_non_file_entry(self, tmp_path):
         """A manifest entry that isn't a regular tar member raises ValueError."""
         src = tmp_path / "bad.mszx"
         manifest = json.dumps(
@@ -277,4 +279,4 @@ class TestMszxToMszConversion:
             tar.addfile(entry)
 
         with pytest.raises(ValueError, match="Missing MSZ entry"):
-            Conversion(MSFormat.MSZX, MSFormat.MSZ).run(src, tmp_path / "out.msz")
+            await Conversion(MSFormat.MSZX, MSFormat.MSZ).run(src, tmp_path / "out.msz")

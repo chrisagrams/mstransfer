@@ -79,9 +79,10 @@ class Conversion:
         """Whether a converter exists for this pair of formats."""
         return (self.source, self.target) in self._CONVERTERS
 
-    def run(self, src: Path, dst: Path) -> None:
-        """Convert *src* to *dst* (blocking; run in a worker thread)."""
-        self._CONVERTERS[(self.source, self.target)](src, dst)
+    async def run(self, src: Path, dst: Path) -> None:
+        """Convert *src* to *dst* in a worker thread."""
+        converter = self._CONVERTERS[(self.source, self.target)]
+        await asyncio.to_thread(converter, src, dst)
 
     @staticmethod
     def _msz_to_mzml(src: Path, dst: Path) -> None:
@@ -154,7 +155,7 @@ class MszxExpansion:
             targets.append((entry, name))
         return targets
 
-    def extract_to(self, directory: Path) -> None:
+    def _extract_to(self, directory: Path) -> None:
         """Write every member into *directory* (blocking)."""
         if self.target is MSFormat.MSZ:
             with tarfile.open(self.src) as tar:
@@ -181,7 +182,7 @@ class MszxExpansion:
             )
         )
         try:
-            await asyncio.to_thread(self.extract_to, staging)
+            await asyncio.to_thread(self._extract_to, staging)
             replace_dir(staging, archive_dir)
         finally:
             shutil.rmtree(staging, ignore_errors=True)
@@ -313,7 +314,7 @@ class StorePlan:
         final_dest = self.final_dest
         staging = final_dest.with_suffix(final_dest.suffix + ".part")
         try:
-            await asyncio.to_thread(conversion.run, src, staging)
+            await conversion.run(src, staging)
             staging.replace(final_dest)
         finally:
             staging.unlink(missing_ok=True)
