@@ -44,24 +44,18 @@ class MSFormat(str, Enum):
     @property
     def ext(self) -> str:
         """The canonical file extension, used to name converted outputs."""
-        return _FORMAT_EXT[self]
+        return ".mzML" if self is MSFormat.MZML else f".{self.value}"
 
     @classmethod
     def from_url(cls, url: str) -> MSFormat | None:
         """Infer the format from the URL filename extension, or *None*."""
         # Strip query params and fragments before inspecting extension.
         path = url.split("?", 1)[0].split("#", 1)[0]
-        return _EXT_FORMAT.get(Path(path).suffix.lower())
-
-
-_FORMAT_EXT: dict[MSFormat, str] = {
-    MSFormat.MSZ: ".msz",
-    MSFormat.MZML: ".mzML",
-    MSFormat.MSZX: ".mszx",
-}
-
-# Reverse mapping of lowercase extension to format for source format inference.
-_EXT_FORMAT: dict[str, MSFormat] = {v.lower(): k for k, v in _FORMAT_EXT.items()}
+        # Every format's lowercased extension is "." + its value.
+        try:
+            return cls(Path(path).suffix.lower().removeprefix("."))
+        except ValueError:
+            return None
 
 
 def _extract_msz_entry(tar: tarfile.TarFile, entry: str, dst: Path) -> None:

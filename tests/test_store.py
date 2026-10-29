@@ -29,6 +29,9 @@ class TestMSFormatFromUrl:
     def test_unknown_extension(self):
         assert MSFormat.from_url("http://host/data/file.bin") is None
 
+    def test_no_extension(self):
+        assert MSFormat.from_url("http://host/data/file") is None
+
     def test_query_params_stripped(self):
         assert MSFormat.from_url("http://h/f.msz?token=abc") == "msz"
 
@@ -50,8 +53,12 @@ class TestMSFormat:
     def test_str_is_value(self):
         assert str(MSFormat.MSZX) == "mszx"
 
-    def test_ext(self):
-        assert MSFormat.MZML.ext == ".mzML"
+    @pytest.mark.parametrize(
+        ("fmt", "ext"),
+        [(MSFormat.MSZ, ".msz"), (MSFormat.MZML, ".mzML"), (MSFormat.MSZX, ".mszx")],
+    )
+    def test_ext(self, fmt, ext):
+        assert fmt.ext == ext
 
 
 class TestConversion:
