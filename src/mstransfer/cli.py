@@ -266,7 +266,7 @@ def cmd_download(args: argparse.Namespace) -> None:
     with Live(display.table, console=console, refresh_per_second=10):
         asyncio.run(_run())
 
-    # Count per request: a batch .mszx can expand into several result paths.
+    # Failures are counted by the display, one per request.
     fail = display.failed
     ok = len(requests) - fail
     if fail:

@@ -5,8 +5,10 @@ import logging
 import os
 import shutil
 import tarfile
+import tempfile
+import uuid
 from dataclasses import dataclass
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PureWindowsPath
 from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
 
 import aiofiles
@@ -52,6 +54,15 @@ def _mszx_to_mzml(src: Path, dst: Path) -> None:
         mszx.decompress(str(dst))
 
 
+def _extract_msz_entry(tar: tarfile.TarFile, entry: str, dst: Path) -> None:
+    """Stream the MSZ member *entry* of an open .mszx tar to *dst*."""
+    member = tar.extractfile(entry)
+    if member is None:
+        raise ValueError(f"Missing MSZ entry {entry!r}")
+    with member, dst.open("wb") as out:
+        shutil.copyfileobj(member, out)
+
+
 def _mszx_to_msz(src: Path, dst: Path) -> None:
     """Extract the embedded .msz payload from an .mszx archive."""
     entries = read_archive_manifest(src).spectra_files
@@ -60,35 +71,43 @@ def _mszx_to_msz(src: Path, dst: Path) -> None:
             f"Cannot store a {len(entries)}-member .mszx as a single .msz"
         )
     with tarfile.open(src) as tar:
-        member = tar.extractfile(entries[0].entry)
-        if member is None:
-            raise ValueError(f"Missing MSZ entry {entries[0].entry!r} in {src}")
-        with member, dst.open("wb") as out:
-            shutil.copyfileobj(member, out)
+        _extract_msz_entry(tar, entries[0].entry, dst)
+
+
+def _member_stem(entry: str) -> str:
+    """Return the output stem for archive *entry*, without any directory part.
+
+    Raises :class:`ValueError` for names that would be empty or hidden.
+    """
+    # PureWindowsPath splits on both "/" and "\\", so no entry can name a
+    # path outside the archive directory on any platform.
+    name = PureWindowsPath(entry).name
+    if name.lower().endswith(".msz"):
+        name = name[: -len(".msz")]
+    if not name or name.startswith("."):
+        raise ValueError(f"Unsafe .mszx entry name {entry!r}")
+    return name
 
 
 def _mszx_member_targets(
-    src: Path, out_dir: Path, store_as: DownloadFormat
-) -> list[tuple[str, Path]]:
-    """Map each spectra entry of an .mszx archive to ``out_dir/<stem>.<ext>``.
+    entries: list[str], store_as: DownloadFormat
+) -> list[tuple[str, str]]:
+    """Map each .mszx spectra entry to an output file name.
 
     Raises :class:`ValueError` if two entries map to the same output name.
     """
-    targets: list[tuple[str, Path]] = []
+    targets: list[tuple[str, str]] = []
     seen: dict[str, str] = {}
-    for spectra in read_archive_manifest(src).spectra_files:
-        # Drop any directory part so entries can't write outside out_dir.
-        stem = PurePosixPath(spectra.entry).name.removesuffix(".msz")
-        target = out_dir / f"{stem}{_FORMAT_EXT[store_as]}"
+    for entry in entries:
+        name = f"{_member_stem(entry)}{_FORMAT_EXT[store_as]}"
         # Compare case-insensitively: macOS and Windows filesystems are.
-        key = target.name.casefold()
+        key = name.casefold()
         if key in seen:
             raise ValueError(
-                f"Archive entries {seen[key]!r} and {spectra.entry!r} "
-                f"both map to {target.name} in {src}"
+                f"Archive entries {seen[key]!r} and {entry!r} both map to {name}"
             )
-        seen[key] = spectra.entry
-        targets.append((spectra.entry, target))
+        seen[key] = entry
+        targets.append((entry, name))
     return targets
 
 
@@ -99,46 +118,63 @@ def _mszx_extract_members(
     if store_as == "msz":
         with tarfile.open(src) as tar:
             for entry, target in targets:
-                member = tar.extractfile(entry)
-                if member is None:
-                    raise ValueError(f"Missing MSZ entry {entry!r} in {src}")
-                with member, target.open("wb") as out:
-                    shutil.copyfileobj(member, out)
+                _extract_msz_entry(tar, entry, target)
     else:
         with MSZXBatchFile.open(src) as batch:
             for entry, target in targets:
                 batch.get(entry).decompress(str(target))
 
 
+def _replace_dir(staging: Path, target: Path) -> None:
+    """Move directory *staging* to *target*, replacing any existing directory.
+
+    An existing *target* is moved aside first and restored if the swap
+    fails, so *target* is never left half-written.
+    """
+    if not target.exists():
+        staging.rename(target)
+        return
+    if not target.is_dir():
+        raise FileExistsError(f"{target} exists and is not a directory")
+    backup = target.with_name(f".{target.name}.{uuid.uuid4().hex}.old")
+    target.rename(backup)
+    try:
+        staging.rename(target)
+    except BaseException:
+        backup.rename(target)
+        raise
+    shutil.rmtree(backup, ignore_errors=True)
+
+
 async def _store_mszx_members(
     src: Path,
-    targets: list[tuple[str, Path]],
+    targets: list[tuple[str, str]],
+    archive_dir: Path,
     store_as: DownloadFormat,
-    *,
-    skip_existing: bool,
-    force: bool,
-) -> list[Path]:
-    """Store every member of a multi-member .mszx at its target path.
+) -> Path:
+    """Store every member of a multi-member .mszx in *archive_dir*.
 
-    Members are staged as ``.part`` files and only renamed into place once
-    all of them succeed, so a failure leaves no partial output behind.
+    Members are extracted into a uniquely named staging directory that is
+    renamed to *archive_dir* only once all of them succeed, so a failure
+    leaves no partial output behind and concurrent downloads never share
+    staging files.
     """
-    paths = [target for _, target in targets]
-    if not force and skip_existing and all(p.exists() for p in paths):
-        logger.info("Skipping existing members of %s", src.name)
-        return paths
-
-    staged = [(entry, p.with_suffix(p.suffix + ".part")) for entry, p in targets]
+    staging = Path(
+        tempfile.mkdtemp(
+            dir=archive_dir.parent, prefix=f".{archive_dir.name}.", suffix=".part"
+        )
+    )
     try:
+        staged = [(entry, staging / name) for entry, name in targets]
         await asyncio.to_thread(_mszx_extract_members, src, staged, store_as)
-        for (_, staging), final in zip(staged, paths, strict=True):
-            staging.replace(final)
+        _replace_dir(staging, archive_dir)
     finally:
-        for _, staging in staged:
-            staging.unlink(missing_ok=True)
+        shutil.rmtree(staging, ignore_errors=True)
 
-    logger.info("Extracted %d members from %s", len(paths), src.name)
-    return paths
+    logger.info(
+        "Extracted %d members from %s into %s", len(targets), src.name, archive_dir
+    )
+    return archive_dir
 
 
 # Mapping of (source_format, target_format) to converter function.
@@ -211,7 +247,7 @@ async def async_download_file(
     skip_existing: bool = False,
     force: bool = False,
     client: httpx.AsyncClient | None = None,
-) -> Path | list[Path]:
+) -> Path:
     """Download a single file from *url* to *dest* (async).
 
     The file is streamed to a temporary ``.part`` file first, then atomically
@@ -232,10 +268,11 @@ async def async_download_file(
         *to* ``"mszx"`` is only supported when the source is already
         ``.mszx`` (no-op); other combos raise :class:`NotImplementedError`.
         When a multi-member (batch) ``.mszx`` is stored as ``"msz"`` or
-        ``"mzml"``, each member is written to
-        ``dest.parent/<entry stem>.<ext>``; existing files there are
-        overwritten unless *skip_existing* applies, and members whose
-        names collide raise :class:`ValueError` before anything is written.
+        ``"mzml"``, its members are written to a directory named after
+        the archive, ``dest.parent/<dest stem>/<entry stem>.<ext>``.  The
+        directory appears only once every member is written, and replaces
+        any existing directory of that name.  Members whose names collide
+        raise :class:`ValueError` before anything is written.
     chunk_size:
         Number of bytes per read chunk (default 1 MiB).
     connect_timeout:
@@ -246,17 +283,18 @@ async def async_download_file(
         Optional callback invoked with byte deltas per chunk.
     skip_existing:
         If *True* and the final destination already exists, skip the
-        download.
+        download.  For an ``.mszx`` stored as ``"msz"`` or ``"mzml"``, an
+        existing archive directory (see *store_as*) also counts.
     force:
         If *True*, re-download even if the destination already exists
         (overrides *skip_existing*).
 
     Returns
     -------
-    Path | list[Path]
+    Path
         The final destination path (may differ from *dest* if the
-        extension was adjusted for format conversion), or one path per
-        member, in archive order, for a multi-member ``.mszx``.
+        extension was adjusted for format conversion), or the archive
+        directory for a multi-member ``.mszx``.
     """
     source_fmt = _detect_source_format(url)
     final_dest = _resolve_dest(dest, store_as, source_fmt)
@@ -267,10 +305,20 @@ async def async_download_file(
             f"Conversion from {source_fmt} to mszx is not supported"
         )
 
+    # Where the members of a multi-member .mszx go, if this turns out to be one.
+    archive_dir = final_dest.with_suffix("")
+    may_expand = source_fmt == "mszx" and store_as in ("msz", "mzml")
+
     # Skip if file already exists and we're not forcing.
-    if not force and skip_existing and final_dest.exists():
-        logger.info("Skipping existing file: %s", final_dest)
-        return final_dest
+    if not force and skip_existing:
+        if final_dest.exists():
+            logger.info("Skipping existing file: %s", final_dest)
+            return final_dest
+        # The archive directory only ever appears complete, so it is safe
+        # to trust without downloading the archive again.
+        if may_expand and archive_dir.is_dir():
+            logger.info("Skipping existing archive directory: %s", archive_dir)
+            return archive_dir
 
     # Ensure the parent directory exists.
     final_dest.parent.mkdir(parents=True, exist_ok=True)
@@ -321,17 +369,13 @@ async def async_download_file(
     staging = final_dest.with_suffix(final_dest.suffix + ".part")
 
     try:
-        if source_fmt == "mszx":
-            targets = await asyncio.to_thread(
-                _mszx_member_targets, tmp_source, final_dest.parent, store_as
-            )
-            if len(targets) > 1:
+        if may_expand:
+            manifest = await asyncio.to_thread(read_archive_manifest, tmp_source)
+            entries = [spectra.entry for spectra in manifest.spectra_files]
+            if len(entries) > 1:
+                targets = _mszx_member_targets(entries, store_as)
                 return await _store_mszx_members(
-                    tmp_source,
-                    targets,
-                    store_as,
-                    skip_existing=skip_existing,
-                    force=force,
+                    tmp_source, targets, archive_dir, store_as
                 )
         await asyncio.to_thread(converter, tmp_source, staging)
         staging.replace(final_dest)
@@ -387,13 +431,13 @@ async def async_download_batch(
     -------
     list[Path]
         List of final destination paths (in input order, errors excluded).
-        A multi-member ``.mszx`` contributes one path per member.
+        A multi-member ``.mszx`` contributes its archive directory.
     """
     workers = min(parallel, len(files))
     sem = asyncio.Semaphore(workers)
 
     # Pre-allocate results list indexed by position for deterministic ordering.
-    results: list[Path | list[Path] | None] = [None] * len(files)
+    results: list[Path | None] = [None] * len(files)
 
     async def _download_one(idx: int, req: DownloadRequest) -> None:
         filename = req.dest.name
@@ -445,13 +489,7 @@ async def async_download_batch(
 
     await asyncio.gather(*[_download_one(i, req) for i, req in enumerate(files)])
 
-    paths: list[Path] = []
-    for r in results:
-        if isinstance(r, list):
-            paths.extend(r)
-        elif r is not None:
-            paths.append(r)
-    return paths
+    return [r for r in results if r is not None]
 
 
 def download_file(
@@ -466,7 +504,7 @@ def download_file(
     skip_existing: bool = False,
     force: bool = False,
     client: httpx.AsyncClient | None = None,
-) -> Path | list[Path]:
+) -> Path:
     """Download a single file from *url* to *dest*.
 
     This is a synchronous wrapper around :func:`async_download_file`.
