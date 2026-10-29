@@ -11,10 +11,12 @@ import shutil
 import tarfile
 import threading
 import urllib.parse
+from pathlib import Path
 from unittest.mock import patch
 
 import httpx
 import pytest
+from mscompress.mszx import compress_batch
 
 from mstransfer.client.downloader import (
     DownloadRequest,
@@ -460,6 +462,7 @@ class TestFormatConversion:
         )
         # Extension should have been changed to .mzML.
         assert result == tmp_path / "result.mzML"
+        assert isinstance(result, Path)
         assert result.exists()
         # Decompressed file should match the original mzML.
         assert result.stat().st_size == test_mzml.stat().st_size
@@ -473,6 +476,7 @@ class TestFormatConversion:
             store_as="msz",
         )
         assert result == tmp_path / "result.msz"
+        assert isinstance(result, Path)
         assert result.exists()
         assert result.stat().st_size > 0
 
@@ -540,6 +544,7 @@ class TestFormatConversion:
             store_as="mzml",
         )
         assert result == tmp_path / "result.mzML"
+        assert isinstance(result, Path)
         assert result.exists()
         assert result.stat().st_size == test_mzml.stat().st_size
 
@@ -552,6 +557,7 @@ class TestFormatConversion:
             store_as="msz",
         )
         assert result == tmp_path / "result.msz"
+        assert isinstance(result, Path)
         assert result.exists()
         # Inner spectra.msz is a byte-for-byte copy of test.msz (conftest).
         assert result.read_bytes() == test_msz.read_bytes()
@@ -695,6 +701,216 @@ class TestFormatConversion:
 
 
 # ---------------------------------------------------------------------------
+# Multi-member (batch v2) .mszx archives
+# ---------------------------------------------------------------------------
+
+
+def _write_batch_mszx(path, members):
+    """Write a v2 batch .mszx whose *members* map entry name → source file."""
+    manifest = json.dumps(
+        {
+            "version": "2.0",
+            "container": "batch",
+            "spectra_files": [{"entry": entry} for entry in members],
+        }
+    ).encode()
+    with tarfile.open(path, "w") as tar:
+        info = tarfile.TarInfo(name="manifest.json")
+        info.size = len(manifest)
+        tar.addfile(info, io.BytesIO(manifest))
+        for entry, src in members.items():
+            tar.add(str(src), arcname=entry)
+
+
+@pytest.fixture()
+def served_batch_mszx(served_ms_files, test_mzml, tmp_path):
+    """Serve ``batch.mszx`` (members ``a.msz`` and ``b.msz``) built by mscompress."""
+    inputs = tmp_path / "batch_inputs"
+    inputs.mkdir()
+    shutil.copy(test_mzml, inputs / "a.mzML")
+    shutil.copy(test_mzml, inputs / "b.mzML")
+    compress_batch(
+        [inputs / "a.mzML", inputs / "b.mzML"],
+        served_ms_files["serve_dir"] / "batch.mszx",
+    )
+    return served_ms_files
+
+
+class TestBatchMszx:
+    def test_store_as_msz_writes_each_member(self, served_batch_mszx, tmp_path):
+        """Each member is written to dest.parent/<entry stem>.msz."""
+        out_dir = tmp_path / "out"
+        result = download_file(
+            f"{served_batch_mszx['base_url']}/batch.mszx",
+            out_dir / "batch.mszx",
+            store_as="msz",
+        )
+        assert result == [out_dir / "a.msz", out_dir / "b.msz"]
+        assert isinstance(result, list)
+        # Only the members remain: no .part files, no leftover archive.
+        assert sorted(out_dir.iterdir()) == result
+
+        archive = served_batch_mszx["serve_dir"] / "batch.mszx"
+        with tarfile.open(archive) as tar:
+            for path in result:
+                member = tar.extractfile(path.name)
+                assert member is not None
+                assert path.read_bytes() == member.read()
+
+    def test_store_as_mzml_writes_each_member(
+        self, served_batch_mszx, test_mzml, tmp_path
+    ):
+        """Each member is decompressed to dest.parent/<entry stem>.mzML."""
+        out_dir = tmp_path / "out"
+        result = download_file(
+            f"{served_batch_mszx['base_url']}/batch.mszx",
+            out_dir / "batch.mszx",
+            store_as="mzml",
+        )
+        assert result == [out_dir / "a.mzML", out_dir / "b.mzML"]
+        assert isinstance(result, list)
+        assert sorted(out_dir.iterdir()) == result
+        for path in result:
+            assert path.stat().st_size == test_mzml.stat().st_size
+
+    def test_store_as_none_keeps_archive(self, served_batch_mszx, tmp_path):
+        """Without store_as the batch archive is saved as-is (single Path)."""
+        dest = tmp_path / "batch.mszx"
+        result = download_file(
+            f"{served_batch_mszx['base_url']}/batch.mszx",
+            dest,
+        )
+        assert result == dest
+        archive = served_batch_mszx["serve_dir"] / "batch.mszx"
+        assert dest.read_bytes() == archive.read_bytes()
+
+    def test_overwrites_existing_members(self, served_batch_mszx, tmp_path):
+        """Like single-file downloads, existing outputs are overwritten."""
+        (tmp_path / "a.msz").write_bytes(b"stale")
+        result = download_file(
+            f"{served_batch_mszx['base_url']}/batch.mszx",
+            tmp_path / "batch.mszx",
+            store_as="msz",
+        )
+        assert isinstance(result, list)
+        assert (tmp_path / "a.msz").read_bytes() != b"stale"
+
+    def test_skip_existing_when_all_members_exist(self, served_batch_mszx, tmp_path):
+        """skip_existing returns the existing members untouched."""
+        out_dir = tmp_path / "out"
+        out_dir.mkdir()
+        for name in ("a.msz", "b.msz"):
+            (out_dir / name).write_bytes(b"existing")
+        result = download_file(
+            f"{served_batch_mszx['base_url']}/batch.mszx",
+            out_dir / "batch.mszx",
+            store_as="msz",
+            skip_existing=True,
+        )
+        assert result == [out_dir / "a.msz", out_dir / "b.msz"]
+        assert (out_dir / "a.msz").read_bytes() == b"existing"
+        assert (out_dir / "b.msz").read_bytes() == b"existing"
+        assert sorted(out_dir.iterdir()) == result
+
+    def test_skip_existing_writes_when_some_members_missing(
+        self, served_batch_mszx, tmp_path
+    ):
+        """skip_existing only skips when every member already exists."""
+        (tmp_path / "a.msz").write_bytes(b"existing")
+        download_file(
+            f"{served_batch_mszx['base_url']}/batch.mszx",
+            tmp_path / "batch.mszx",
+            store_as="msz",
+            skip_existing=True,
+        )
+        assert (tmp_path / "a.msz").read_bytes() != b"existing"
+        assert (tmp_path / "b.msz").exists()
+
+    def test_force_overrides_skip_existing(self, served_batch_mszx, tmp_path):
+        for name in ("a.msz", "b.msz"):
+            (tmp_path / name).write_bytes(b"existing")
+        download_file(
+            f"{served_batch_mszx['base_url']}/batch.mszx",
+            tmp_path / "batch.mszx",
+            store_as="msz",
+            skip_existing=True,
+            force=True,
+        )
+        assert (tmp_path / "a.msz").read_bytes() != b"existing"
+
+    def test_colliding_member_names_raise(self, served_ms_files, test_msz, tmp_path):
+        """Entries that map to the same output name fail before writing."""
+        _write_batch_mszx(
+            served_ms_files["serve_dir"] / "dup.mszx",
+            {"a.msz": test_msz, "sub/A.msz": test_msz},
+        )
+        out_dir = tmp_path / "out"
+        with pytest.raises(ValueError, match="both map to"):
+            download_file(
+                f"{served_ms_files['base_url']}/dup.mszx",
+                out_dir / "dup.mszx",
+                store_as="msz",
+            )
+        assert list(out_dir.iterdir()) == []
+
+    def test_member_dirs_are_stripped(self, served_ms_files, test_msz, tmp_path):
+        """Directory parts of entry names never escape dest.parent."""
+        _write_batch_mszx(
+            served_ms_files["serve_dir"] / "nested.mszx",
+            {"../x.msz": test_msz, "sub/y.msz": test_msz},
+        )
+        out_dir = tmp_path / "out"
+        result = download_file(
+            f"{served_ms_files['base_url']}/nested.mszx",
+            out_dir / "nested.mszx",
+            store_as="msz",
+        )
+        assert result == [out_dir / "x.msz", out_dir / "y.msz"]
+        assert sorted(out_dir.iterdir()) == result
+
+    def test_failed_member_leaves_no_output(self, served_ms_files, test_msz, tmp_path):
+        """A bad member aborts the whole archive without partial files."""
+        src = served_ms_files["serve_dir"] / "bad.mszx"
+        _write_batch_mszx(src, {"a.msz": test_msz})
+        # Declare a second member in the manifest that isn't in the tar.
+        manifest = json.dumps(
+            {
+                "version": "2.0",
+                "container": "batch",
+                "spectra_files": [{"entry": "a.msz"}, {"entry": "missing.msz"}],
+            }
+        ).encode()
+        with tarfile.open(src, "w") as tar:
+            info = tarfile.TarInfo(name="manifest.json")
+            info.size = len(manifest)
+            tar.addfile(info, io.BytesIO(manifest))
+            tar.add(str(test_msz), arcname="a.msz")
+
+        out_dir = tmp_path / "out"
+        with pytest.raises(KeyError):
+            download_file(
+                f"{served_ms_files['base_url']}/bad.mszx",
+                out_dir / "bad.mszx",
+                store_as="msz",
+            )
+        assert list(out_dir.iterdir()) == []
+
+    def test_download_batch_flattens_members(self, served_batch_mszx, tmp_path):
+        """download_batch returns one path per member, in input order."""
+        base = served_batch_mszx["base_url"]
+        requests = [
+            DownloadRequest(url=f"{base}/batch.mszx", dest=tmp_path / "batch.mszx"),
+            DownloadRequest(url=f"{base}/test.mszx", dest=tmp_path / "single.mszx"),
+        ]
+        results = download_batch(requests, store_as="msz", parallel=1)
+        assert results == [
+            tmp_path / "a.msz",
+            tmp_path / "b.msz",
+            tmp_path / "single.msz",
+        ]
+
+
+# ---------------------------------------------------------------------------
 # async_download_file
 # ---------------------------------------------------------------------------
 
@@ -754,6 +970,7 @@ class TestAsyncDownloadFile:
             store_as="mzml",
         )
         assert result == tmp_path / "result.mzML"
+        assert isinstance(result, Path)
         assert result.exists()
         assert result.stat().st_size == test_mzml.stat().st_size
 
@@ -768,6 +985,7 @@ class TestAsyncDownloadFile:
             store_as="mzml",
         )
         assert result == tmp_path / "result.mzML"
+        assert isinstance(result, Path)
         assert result.stat().st_size == test_mzml.stat().st_size
 
     async def test_format_conversion_mszx_to_msz(
@@ -781,6 +999,7 @@ class TestAsyncDownloadFile:
             store_as="msz",
         )
         assert result == tmp_path / "result.msz"
+        assert isinstance(result, Path)
         assert result.read_bytes() == test_msz.read_bytes()
 
     async def test_http_404_raises(self, served_files, tmp_path):

@@ -592,6 +592,15 @@ class TestDownloadProgressDisplay:
         task = display.files.tasks[display._task_ids["a.msz"]]
         assert task.description == "[green]a.msz"
 
+    def test_on_file_error_counts_failures(self):
+        display = DownloadProgressDisplay(total_files=2)
+        display.on_file_start("a.msz", total_bytes=None)
+        display.on_file_start("b.msz", total_bytes=None)
+        display.on_file_complete("a.msz")
+        display.on_file_error("b.msz", RuntimeError("boom"))
+
+        assert display.failed == 1
+
     def test_on_file_error_marks_red(self):
         display = DownloadProgressDisplay(total_files=1)
         display.on_file_start("a.msz", total_bytes=1000)

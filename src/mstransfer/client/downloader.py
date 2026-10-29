@@ -6,14 +6,14 @@ import os
 import shutil
 import tarfile
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
 
 import aiofiles
 import httpx
 from mscompress import MSZFile, MZMLFile
 from mscompress.mszx import MSZXFile
-from mscompress.mszx.batch import read_archive_manifest
+from mscompress.mszx.batch import MSZXBatchFile, read_archive_manifest
 
 from mstransfer.client.utils import ThrottledCallback, optional_client
 
@@ -65,6 +65,80 @@ def _mszx_to_msz(src: Path, dst: Path) -> None:
             raise ValueError(f"Missing MSZ entry {entries[0].entry!r} in {src}")
         with member, dst.open("wb") as out:
             shutil.copyfileobj(member, out)
+
+
+def _mszx_member_targets(
+    src: Path, out_dir: Path, store_as: DownloadFormat
+) -> list[tuple[str, Path]]:
+    """Map each spectra entry of an .mszx archive to ``out_dir/<stem>.<ext>``.
+
+    Raises :class:`ValueError` if two entries map to the same output name.
+    """
+    targets: list[tuple[str, Path]] = []
+    seen: dict[str, str] = {}
+    for spectra in read_archive_manifest(src).spectra_files:
+        # Drop any directory part so entries can't write outside out_dir.
+        stem = PurePosixPath(spectra.entry).name.removesuffix(".msz")
+        target = out_dir / f"{stem}{_FORMAT_EXT[store_as]}"
+        # Compare case-insensitively: macOS and Windows filesystems are.
+        key = target.name.casefold()
+        if key in seen:
+            raise ValueError(
+                f"Archive entries {seen[key]!r} and {spectra.entry!r} "
+                f"both map to {target.name} in {src}"
+            )
+        seen[key] = spectra.entry
+        targets.append((spectra.entry, target))
+    return targets
+
+
+def _mszx_extract_members(
+    src: Path, targets: list[tuple[str, Path]], store_as: DownloadFormat
+) -> None:
+    """Write each (entry, path) in *targets* out of *src* as msz or mzML."""
+    if store_as == "msz":
+        with tarfile.open(src) as tar:
+            for entry, target in targets:
+                member = tar.extractfile(entry)
+                if member is None:
+                    raise ValueError(f"Missing MSZ entry {entry!r} in {src}")
+                with member, target.open("wb") as out:
+                    shutil.copyfileobj(member, out)
+    else:
+        with MSZXBatchFile.open(src) as batch:
+            for entry, target in targets:
+                batch.get(entry).decompress(str(target))
+
+
+async def _store_mszx_members(
+    src: Path,
+    targets: list[tuple[str, Path]],
+    store_as: DownloadFormat,
+    *,
+    skip_existing: bool,
+    force: bool,
+) -> list[Path]:
+    """Store every member of a multi-member .mszx at its target path.
+
+    Members are staged as ``.part`` files and only renamed into place once
+    all of them succeed, so a failure leaves no partial output behind.
+    """
+    paths = [target for _, target in targets]
+    if not force and skip_existing and all(p.exists() for p in paths):
+        logger.info("Skipping existing members of %s", src.name)
+        return paths
+
+    staged = [(entry, p.with_suffix(p.suffix + ".part")) for entry, p in targets]
+    try:
+        await asyncio.to_thread(_mszx_extract_members, src, staged, store_as)
+        for (_, staging), final in zip(staged, paths, strict=True):
+            staging.replace(final)
+    finally:
+        for _, staging in staged:
+            staging.unlink(missing_ok=True)
+
+    logger.info("Extracted %d members from %s", len(paths), src.name)
+    return paths
 
 
 # Mapping of (source_format, target_format) to converter function.
@@ -137,7 +211,7 @@ async def async_download_file(
     skip_existing: bool = False,
     force: bool = False,
     client: httpx.AsyncClient | None = None,
-) -> Path:
+) -> Path | list[Path]:
     """Download a single file from *url* to *dest* (async).
 
     The file is streamed to a temporary ``.part`` file first, then atomically
@@ -157,6 +231,11 @@ async def async_download_file(
         is converted after download using **mscompress**.  Conversion
         *to* ``"mszx"`` is only supported when the source is already
         ``.mszx`` (no-op); other combos raise :class:`NotImplementedError`.
+        When a multi-member (batch) ``.mszx`` is stored as ``"msz"`` or
+        ``"mzml"``, each member is written to
+        ``dest.parent/<entry stem>.<ext>``; existing files there are
+        overwritten unless *skip_existing* applies, and members whose
+        names collide raise :class:`ValueError` before anything is written.
     chunk_size:
         Number of bytes per read chunk (default 1 MiB).
     connect_timeout:
@@ -174,9 +253,10 @@ async def async_download_file(
 
     Returns
     -------
-    Path
+    Path | list[Path]
         The final destination path (may differ from *dest* if the
-        extension was adjusted for format conversion).
+        extension was adjusted for format conversion), or one path per
+        member, in archive order, for a multi-member ``.mszx``.
     """
     source_fmt = _detect_source_format(url)
     final_dest = _resolve_dest(dest, store_as, source_fmt)
@@ -241,6 +321,18 @@ async def async_download_file(
     staging = final_dest.with_suffix(final_dest.suffix + ".part")
 
     try:
+        if source_fmt == "mszx":
+            targets = await asyncio.to_thread(
+                _mszx_member_targets, tmp_source, final_dest.parent, store_as
+            )
+            if len(targets) > 1:
+                return await _store_mszx_members(
+                    tmp_source,
+                    targets,
+                    store_as,
+                    skip_existing=skip_existing,
+                    force=force,
+                )
         await asyncio.to_thread(converter, tmp_source, staging)
         staging.replace(final_dest)
         logger.info("Converted %s → %s", tmp_source.name, final_dest.name)
@@ -295,12 +387,13 @@ async def async_download_batch(
     -------
     list[Path]
         List of final destination paths (in input order, errors excluded).
+        A multi-member ``.mszx`` contributes one path per member.
     """
     workers = min(parallel, len(files))
     sem = asyncio.Semaphore(workers)
 
     # Pre-allocate results list indexed by position for deterministic ordering.
-    results: list[Path | None] = [None] * len(files)
+    results: list[Path | list[Path] | None] = [None] * len(files)
 
     async def _download_one(idx: int, req: DownloadRequest) -> None:
         filename = req.dest.name
@@ -352,7 +445,13 @@ async def async_download_batch(
 
     await asyncio.gather(*[_download_one(i, req) for i, req in enumerate(files)])
 
-    return [r for r in results if r is not None]
+    paths: list[Path] = []
+    for r in results:
+        if isinstance(r, list):
+            paths.extend(r)
+        elif r is not None:
+            paths.append(r)
+    return paths
 
 
 def download_file(
@@ -367,7 +466,7 @@ def download_file(
     skip_existing: bool = False,
     force: bool = False,
     client: httpx.AsyncClient | None = None,
-) -> Path:
+) -> Path | list[Path]:
     """Download a single file from *url* to *dest*.
 
     This is a synchronous wrapper around :func:`async_download_file`.
