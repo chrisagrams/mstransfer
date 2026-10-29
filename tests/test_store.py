@@ -9,9 +9,10 @@ import tarfile
 import pytest
 
 from mstransfer.client.store import (
+    Conversion,
+    MSFormat,
     MszxExpansion,
     StorePlan,
-    detect_source_format,
     mszx_to_msz,
 )
 
@@ -20,68 +21,113 @@ from mstransfer.client.store import (
 # ---------------------------------------------------------------------------
 
 
-class TestDetectSourceFormat:
+class TestMSFormatFromUrl:
     def test_msz_url(self):
-        assert detect_source_format("http://host/data/file.msz") == "msz"
+        assert MSFormat.from_url("http://host/data/file.msz") == "msz"
 
     def test_mzml_url(self):
-        assert detect_source_format("http://host/data/file.mzML") == "mzml"
+        assert MSFormat.from_url("http://host/data/file.mzML") == "mzml"
 
     def test_mzml_lowercase(self):
-        assert detect_source_format("http://host/data/file.mzml") == "mzml"
+        assert MSFormat.from_url("http://host/data/file.mzml") == "mzml"
 
     def test_unknown_extension(self):
-        assert detect_source_format("http://host/data/file.bin") is None
+        assert MSFormat.from_url("http://host/data/file.bin") is None
 
     def test_query_params_stripped(self):
-        assert detect_source_format("http://h/f.msz?token=abc") == "msz"
+        assert MSFormat.from_url("http://h/f.msz?token=abc") == "msz"
 
     def test_fragment_stripped(self):
-        assert detect_source_format("http://h/f.mzML#section") == "mzml"
+        assert MSFormat.from_url("http://h/f.mzML#section") == "mzml"
 
     def test_mszx_url(self):
-        assert detect_source_format("http://host/data/file.mszx") == "mszx"
+        assert MSFormat.from_url("http://host/data/file.mszx") == "mszx"
 
     def test_mszx_uppercase(self):
-        assert detect_source_format("http://host/data/file.MSZX") == "mszx"
+        assert MSFormat.from_url("http://host/data/file.MSZX") == "mszx"
+
+
+class TestMSFormat:
+    def test_compares_equal_to_string(self):
+        assert MSFormat.MZML == "mzml"
+        assert MSFormat("mzml") is MSFormat.MZML
+
+    def test_str_is_value(self):
+        assert str(MSFormat.MSZX) == "mszx"
+
+    def test_ext(self):
+        assert MSFormat.MZML.ext == ".mzML"
+
+
+class TestConversion:
+    @pytest.mark.parametrize(
+        ("source", "target"),
+        [
+            (MSFormat.MSZ, MSFormat.MZML),
+            (MSFormat.MZML, MSFormat.MSZ),
+            (MSFormat.MSZX, MSFormat.MZML),
+            (MSFormat.MSZX, MSFormat.MSZ),
+        ],
+    )
+    def test_supported(self, source, target):
+        assert Conversion(source, target).supported
+
+    @pytest.mark.parametrize("source", [MSFormat.MSZ, MSFormat.MZML])
+    def test_to_mszx_unsupported(self, source):
+        assert not Conversion(source, MSFormat.MSZX).supported
 
 
 class TestFinalDest:
     def test_no_store_as(self, tmp_path):
         dest = tmp_path / "file.msz"
-        assert StorePlan(dest, "msz", None).final_dest == dest
+        assert StorePlan(dest, MSFormat.MSZ, None).final_dest == dest
 
     def test_same_format(self, tmp_path):
         dest = tmp_path / "file.msz"
-        assert StorePlan(dest, "msz", "msz").final_dest == dest
+        assert StorePlan(dest, MSFormat.MSZ, MSFormat.MSZ).final_dest == dest
 
     def test_msz_to_mzml(self, tmp_path):
         dest = tmp_path / "file.msz"
-        assert StorePlan(dest, "msz", "mzml").final_dest == tmp_path / "file.mzML"
+        assert (
+            StorePlan(dest, MSFormat.MSZ, MSFormat.MZML).final_dest
+            == tmp_path / "file.mzML"
+        )
 
     def test_mzml_to_msz(self, tmp_path):
         dest = tmp_path / "file.mzML"
-        assert StorePlan(dest, "mzml", "msz").final_dest == tmp_path / "file.msz"
+        assert (
+            StorePlan(dest, MSFormat.MZML, MSFormat.MSZ).final_dest
+            == tmp_path / "file.msz"
+        )
 
     def test_unknown_source_no_change(self, tmp_path):
         dest = tmp_path / "file.bin"
-        assert StorePlan(dest, None, "msz").final_dest == dest
+        assert StorePlan(dest, None, MSFormat.MSZ).final_dest == dest
 
     def test_mszx_same_format(self, tmp_path):
         dest = tmp_path / "file.mszx"
-        assert StorePlan(dest, "mszx", "mszx").final_dest == dest
+        assert StorePlan(dest, MSFormat.MSZX, MSFormat.MSZX).final_dest == dest
 
     def test_mszx_to_msz(self, tmp_path):
         dest = tmp_path / "file.mszx"
-        assert StorePlan(dest, "mszx", "msz").final_dest == tmp_path / "file.msz"
+        assert (
+            StorePlan(dest, MSFormat.MSZX, MSFormat.MSZ).final_dest
+            == tmp_path / "file.msz"
+        )
 
     def test_mszx_to_mzml(self, tmp_path):
         dest = tmp_path / "file.mszx"
-        assert StorePlan(dest, "mszx", "mzml").final_dest == tmp_path / "file.mzML"
+        assert (
+            StorePlan(dest, MSFormat.MSZX, MSFormat.MZML).final_dest
+            == tmp_path / "file.mzML"
+        )
 
     def test_msz_to_mszx(self, tmp_path):
         dest = tmp_path / "file.msz"
-        assert StorePlan(dest, "msz", "mszx").final_dest == tmp_path / "file.mszx"
+        assert (
+            StorePlan(dest, MSFormat.MSZ, MSFormat.MSZX).final_dest
+            == tmp_path / "file.mszx"
+        )
 
 
 class TestStorePlan:
@@ -89,7 +135,7 @@ class TestStorePlan:
         plan = StorePlan.for_download("http://h/f.msz", tmp_path / "f.msz", "mzml")
         assert plan.source == "msz"
         assert plan.target == "mzml"
-        assert plan.conversion == ("msz", "mzml")
+        assert plan.conversion == Conversion(MSFormat.MSZ, MSFormat.MZML)
 
     @pytest.mark.parametrize("source", ["msz", "mzML"])
     def test_for_download_rejects_conversion_to_mszx(self, tmp_path, source):
@@ -103,68 +149,78 @@ class TestStorePlan:
         assert plan.conversion is None
 
     def test_part_path_uses_requested_dest(self, tmp_path):
-        plan = StorePlan(tmp_path / "f.msz", "msz", "mzml")
+        plan = StorePlan(tmp_path / "f.msz", MSFormat.MSZ, MSFormat.MZML)
         assert plan.part_path == tmp_path / "f.msz.part"
 
     @pytest.mark.parametrize(
         ("source", "target", "expected"),
         [
-            ("mszx", "msz", True),
-            ("mszx", "mzml", True),
-            ("mszx", "mszx", False),
-            ("mszx", None, False),
-            ("msz", "mzml", False),
+            (MSFormat.MSZX, MSFormat.MSZ, True),
+            (MSFormat.MSZX, MSFormat.MZML, True),
+            (MSFormat.MSZX, MSFormat.MSZX, False),
+            (MSFormat.MSZX, None, False),
+            (MSFormat.MSZ, MSFormat.MZML, False),
         ],
     )
     def test_may_expand(self, tmp_path, source, target, expected):
         assert StorePlan(tmp_path / "f", source, target).may_expand is expected
 
     def test_archive_dir(self, tmp_path):
-        plan = StorePlan(tmp_path / "run.mszx", "mszx", "msz")
+        plan = StorePlan(tmp_path / "run.mszx", MSFormat.MSZX, MSFormat.MSZ)
         assert plan.archive_dir == tmp_path / "run"
 
     def test_existing_none(self, tmp_path):
-        assert StorePlan(tmp_path / "run.mszx", "mszx", "msz").existing() is None
+        assert (
+            StorePlan(tmp_path / "run.mszx", MSFormat.MSZX, MSFormat.MSZ).existing()
+            is None
+        )
 
     def test_existing_final_dest(self, tmp_path):
         (tmp_path / "run.msz").write_bytes(b"x")
-        plan = StorePlan(tmp_path / "run.mszx", "mszx", "msz")
+        plan = StorePlan(tmp_path / "run.mszx", MSFormat.MSZX, MSFormat.MSZ)
         assert plan.existing() == tmp_path / "run.msz"
 
     def test_existing_archive_dir(self, tmp_path):
         (tmp_path / "run").mkdir()
-        plan = StorePlan(tmp_path / "run.mszx", "mszx", "msz")
+        plan = StorePlan(tmp_path / "run.mszx", MSFormat.MSZX, MSFormat.MSZ)
         assert plan.existing() == tmp_path / "run"
 
     def test_existing_ignores_dir_without_expansion(self, tmp_path):
         (tmp_path / "run").mkdir()
-        assert StorePlan(tmp_path / "run.msz", "msz", "mzml").existing() is None
+        assert (
+            StorePlan(tmp_path / "run.msz", MSFormat.MSZ, MSFormat.MZML).existing()
+            is None
+        )
 
 
 class TestMszxExpansion:
     def test_targets_use_entry_stem_and_target_ext(self, tmp_path):
-        expansion = MszxExpansion(tmp_path / "a.mszx", ("a.msz", "B.MSZ"), "mzml")
+        expansion = MszxExpansion(
+            tmp_path / "a.mszx", ("a.msz", "B.MSZ"), MSFormat.MZML
+        )
         assert expansion.targets == [("a.msz", "a.mzML"), ("B.MSZ", "B.mzML")]
 
     def test_targets_strip_directories(self, tmp_path):
         entries = ("../x.msz", "sub/y.msz", "..\\w.msz")
-        expansion = MszxExpansion(tmp_path / "a.mszx", entries, "msz")
+        expansion = MszxExpansion(tmp_path / "a.mszx", entries, MSFormat.MSZ)
         assert [name for _, name in expansion.targets] == ["x.msz", "y.msz", "w.msz"]
 
     def test_targets_reject_case_insensitive_collisions(self, tmp_path):
-        expansion = MszxExpansion(tmp_path / "a.mszx", ("a.msz", "sub/A.msz"), "msz")
+        expansion = MszxExpansion(
+            tmp_path / "a.mszx", ("a.msz", "sub/A.msz"), MSFormat.MSZ
+        )
         with pytest.raises(ValueError, match="both map to"):
             _ = expansion.targets
 
     @pytest.mark.parametrize("entry", [".msz", "..", "sub/.hidden.msz"])
     def test_targets_reject_unsafe_names(self, tmp_path, entry):
-        expansion = MszxExpansion(tmp_path / "a.mszx", ("ok.msz", entry), "msz")
+        expansion = MszxExpansion(tmp_path / "a.mszx", ("ok.msz", entry), MSFormat.MSZ)
         with pytest.raises(ValueError, match="Unsafe"):
             _ = expansion.targets
 
     @pytest.mark.asyncio
     async def test_write_validates_before_touching_disk(self, tmp_path):
-        expansion = MszxExpansion(tmp_path / "a.mszx", (".msz", "b.msz"), "msz")
+        expansion = MszxExpansion(tmp_path / "a.mszx", (".msz", "b.msz"), MSFormat.MSZ)
         with pytest.raises(ValueError, match="Unsafe"):
             await expansion.write(tmp_path / "a")
         assert list(tmp_path.iterdir()) == []

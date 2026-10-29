@@ -8,6 +8,7 @@ import shutil
 import tarfile
 import tempfile
 from dataclasses import dataclass
+from enum import Enum
 from functools import cached_property
 from pathlib import Path, PureWindowsPath
 from typing import TYPE_CHECKING, Literal
@@ -23,29 +24,44 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Output formats the client can produce on disk after download.
+# Output formats callers can request via ``store_as``.
 DownloadFormat = Literal["msz", "mzml", "mszx"]
 
-# Mapping of format to canonical file extension for naming converted outputs.
-FORMAT_EXT: dict[DownloadFormat, str] = {
-    "msz": ".msz",
-    "mzml": ".mzML",
-    "mszx": ".mszx",
+
+class MSFormat(str, Enum):
+    """An on-disk MS data format.
+
+    Members compare equal to their ``DownloadFormat`` string values.
+    """
+
+    MSZ = "msz"
+    MZML = "mzml"
+    MSZX = "mszx"
+
+    def __str__(self) -> str:
+        return self.value
+
+    @property
+    def ext(self) -> str:
+        """The canonical file extension, used to name converted outputs."""
+        return _FORMAT_EXT[self]
+
+    @classmethod
+    def from_url(cls, url: str) -> MSFormat | None:
+        """Infer the format from the URL filename extension, or *None*."""
+        # Strip query params and fragments before inspecting extension.
+        path = url.split("?", 1)[0].split("#", 1)[0]
+        return _EXT_FORMAT.get(Path(path).suffix.lower())
+
+
+_FORMAT_EXT: dict[MSFormat, str] = {
+    MSFormat.MSZ: ".msz",
+    MSFormat.MZML: ".mzML",
+    MSFormat.MSZX: ".mszx",
 }
 
 # Reverse mapping of lowercase extension to format for source format inference.
-_EXT_FORMAT: dict[str, DownloadFormat] = {v.lower(): k for k, v in FORMAT_EXT.items()}
-
-
-def detect_source_format(url: str) -> DownloadFormat | None:
-    """Infer the source format from the URL filename extension.
-
-    Returns ``"msz"``, ``"mzml"``, ``"mszx"``, or *None* if the format
-    cannot be determined.
-    """
-    # Strip query params and fragments before inspecting extension.
-    path = url.split("?", 1)[0].split("#", 1)[0]
-    return _EXT_FORMAT.get(Path(path).suffix.lower())
+_EXT_FORMAT: dict[str, MSFormat] = {v.lower(): k for k, v in _FORMAT_EXT.items()}
 
 
 # ---------------------------------------------------------------------------
@@ -90,14 +106,29 @@ def mszx_to_msz(src: Path, dst: Path) -> None:
 
 
 # Mapping of (source_format, target_format) to converter function.
-CONVERTERS: dict[
-    tuple[DownloadFormat, DownloadFormat], Callable[[Path, Path], None]
-] = {
-    ("msz", "mzml"): msz_to_mzml,
-    ("mzml", "msz"): mzml_to_msz,
-    ("mszx", "mzml"): mszx_to_mzml,
-    ("mszx", "msz"): mszx_to_msz,
+_CONVERTERS: dict[tuple[MSFormat, MSFormat], Callable[[Path, Path], None]] = {
+    (MSFormat.MSZ, MSFormat.MZML): msz_to_mzml,
+    (MSFormat.MZML, MSFormat.MSZ): mzml_to_msz,
+    (MSFormat.MSZX, MSFormat.MZML): mszx_to_mzml,
+    (MSFormat.MSZX, MSFormat.MSZ): mszx_to_msz,
 }
+
+
+@dataclass(frozen=True)
+class Conversion:
+    """Turning a *source*-format file into a *target*-format file."""
+
+    source: MSFormat
+    target: MSFormat
+
+    @property
+    def supported(self) -> bool:
+        """Whether a converter exists for this pair of formats."""
+        return (self.source, self.target) in _CONVERTERS
+
+    def run(self, src: Path, dst: Path) -> None:
+        """Convert *src* to *dst* (blocking)."""
+        _CONVERTERS[(self.source, self.target)](src, dst)
 
 
 # ---------------------------------------------------------------------------
@@ -110,12 +141,12 @@ class MszxExpansion:
     """Writes every member of a multi-member .mszx into one directory.
 
     Each spectra *entry* of *src* becomes ``<entry stem>.<ext>`` stored as
-    *target* (``"msz"`` or ``"mzml"``).
+    *target* (:attr:`MSFormat.MSZ` or :attr:`MSFormat.MZML`).
     """
 
     src: Path
     entries: tuple[str, ...]
-    target: DownloadFormat
+    target: MSFormat
 
     @cached_property
     def targets(self) -> list[tuple[str, str]]:
@@ -127,7 +158,7 @@ class MszxExpansion:
         targets: list[tuple[str, str]] = []
         seen: dict[str, str] = {}
         for entry in self.entries:
-            name = f"{self._member_stem(entry)}{FORMAT_EXT[self.target]}"
+            name = f"{self._member_stem(entry)}{self.target.ext}"
             # Compare case-insensitively: macOS and Windows filesystems are.
             key = name.casefold()
             if key in seen:
@@ -140,7 +171,7 @@ class MszxExpansion:
 
     def extract_to(self, directory: Path) -> None:
         """Write every member into *directory* (blocking)."""
-        if self.target == "msz":
+        if self.target is MSFormat.MSZ:
             with tarfile.open(self.src) as tar:
                 for entry, name in self.targets:
                     _extract_msz_entry(tar, entry, directory / name)
@@ -210,35 +241,38 @@ class StorePlan:
     """
 
     dest: Path
-    source: DownloadFormat | None
-    target: DownloadFormat | None
+    source: MSFormat | None
+    target: MSFormat | None
 
     @classmethod
     def for_download(
         cls, url: str, dest: Path, store_as: DownloadFormat | None
     ) -> StorePlan:
         """Plan storage for *url*, failing fast on unsupported conversions."""
-        plan = cls(dest, detect_source_format(url), store_as)
+        target = MSFormat(store_as) if store_as is not None else None
+        plan = cls(dest, MSFormat.from_url(url), target)
         conversion = plan.conversion
-        if conversion is not None and conversion not in CONVERTERS:
+        if conversion is not None and not conversion.supported:
             raise NotImplementedError(
-                f"Conversion from {plan.source} to {plan.target} is not supported"
+                f"Conversion from {conversion.source} to {conversion.target} "
+                "is not supported"
             )
         return plan
 
     @property
-    def conversion(self) -> tuple[DownloadFormat, DownloadFormat] | None:
-        """The ``(source, target)`` conversion needed, or *None* if none is."""
+    def conversion(self) -> Conversion | None:
+        """The conversion needed, or *None* if the file is stored as-is."""
         if self.source is None or self.target is None or self.source == self.target:
             return None
-        return self.source, self.target
+        return Conversion(self.source, self.target)
 
     @property
     def final_dest(self) -> Path:
         """The output path, with its extension adjusted for any conversion."""
-        if self.conversion is None:
+        conversion = self.conversion
+        if conversion is None:
             return self.dest
-        return self.dest.with_suffix(FORMAT_EXT[self.conversion[1]])
+        return self.dest.with_suffix(conversion.target.ext)
 
     @property
     def part_path(self) -> Path:
@@ -248,7 +282,10 @@ class StorePlan:
     @property
     def may_expand(self) -> bool:
         """Whether a multi-member .mszx would be expanded into a directory."""
-        return self.source == "mszx" and self.target in ("msz", "mzml")
+        return self.source is MSFormat.MSZX and self.target in (
+            MSFormat.MSZ,
+            MSFormat.MZML,
+        )
 
     @property
     def archive_dir(self) -> Path:
@@ -276,30 +313,27 @@ class StorePlan:
             part.rename(self.final_dest)
             return self.final_dest
 
-        source, target = conversion
         # Give the temp file the correct source extension so mscompress can
         # recognise its format, then convert.
-        src = part.with_suffix(FORMAT_EXT[source])
+        src = part.with_suffix(conversion.source.ext)
         part.rename(src)
         try:
             if self.may_expand:
                 manifest = await asyncio.to_thread(read_archive_manifest, src)
                 entries = tuple(spectra.entry for spectra in manifest.spectra_files)
                 if len(entries) > 1:
-                    expansion = MszxExpansion(src, entries, target)
+                    expansion = MszxExpansion(src, entries, conversion.target)
                     return await expansion.write(self.archive_dir)
-            return await self._convert(src, CONVERTERS[conversion])
+            return await self._convert(src, conversion)
         finally:
             src.unlink(missing_ok=True)
 
-    async def _convert(
-        self, src: Path, converter: Callable[[Path, Path], None]
-    ) -> Path:
+    async def _convert(self, src: Path, conversion: Conversion) -> Path:
         """Convert *src* into :attr:`final_dest` via a staging file."""
         final_dest = self.final_dest
         staging = final_dest.with_suffix(final_dest.suffix + ".part")
         try:
-            await asyncio.to_thread(converter, src, staging)
+            await asyncio.to_thread(conversion.run, src, staging)
             staging.replace(final_dest)
         finally:
             staging.unlink(missing_ok=True)
