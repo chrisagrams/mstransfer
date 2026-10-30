@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Any
 import aiofiles
 import aiofiles.os
 from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from mstransfer import __version__
 from mstransfer.server.models import (
@@ -14,6 +14,7 @@ from mstransfer.server.models import (
     HealthResponse,
     TransferRecord,
     TransferState,
+    UploadConflict,
     UploadResponse,
 )
 from mstransfer.store import MSFormat, StorePlan
@@ -95,8 +96,15 @@ def make_router(
             raise HTTPException(status_code=404, detail="Transfer not found")
         return record
 
-    @router.post("/upload", response_model=UploadResponse, dependencies=protected)
-    async def upload(request: Request, state: AppState = state_dep) -> UploadResponse:
+    @router.post(
+        "/upload",
+        response_model=UploadResponse,
+        responses={409: {"model": UploadConflict}},
+        dependencies=protected,
+    )
+    async def upload(
+        request: Request, state: AppState = state_dep
+    ) -> UploadResponse | JSONResponse:
         """
         Endpoint to handle file uploads. Expects the file content in the request body
         and requires the following headers:
@@ -109,8 +117,9 @@ def make_router(
             - X-Source-Format: ``mzML``, ``msz`` or ``mszx``.  Inferred from
               the filename extension when absent.
 
-        Responds 409 Conflict, before reading the body, if the output file
-        already exists or another transfer is writing it.
+        Responds 409 Conflict with an :class:`UploadConflict` body, before
+        reading the request body, if the output file already exists or
+        another transfer is writing it.
 
         The server will stream the incoming data to a file, update the transfer registry
         with the progress, and optionally decompress if configured to do so.  MSZX
@@ -151,15 +160,21 @@ def make_router(
         # transfer is still writing, before any of the body is read.
         existing = plan.existing()
         if existing is not None:
-            raise HTTPException(
-                status_code=409,
-                detail=f"{existing.name} already exists on the server",
+            return _conflict(
+                UploadConflict(
+                    detail=f"{existing.name} already exists on the server",
+                    filename=existing.name,
+                    reason="exists",
+                )
             )
         dest = plan.final_dest
         if not state.outputs.claim(dest):
-            raise HTTPException(
-                status_code=409,
-                detail=f"{dest.name} is already being written by another transfer",
+            return _conflict(
+                UploadConflict(
+                    detail=f"{dest.name} is already being written by another transfer",
+                    filename=dest.name,
+                    reason="in_progress",
+                )
             )
         try:
             return await _receive_and_store(
@@ -206,6 +221,11 @@ def make_router(
         )
 
     return router
+
+
+def _conflict(conflict: UploadConflict) -> JSONResponse:
+    """A 409 Conflict response carrying *conflict*."""
+    return JSONResponse(status_code=409, content=conflict.model_dump())
 
 
 async def _receive_and_store(

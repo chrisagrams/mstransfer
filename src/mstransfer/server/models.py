@@ -48,6 +48,18 @@ class UploadResponse(BaseModel):
     bytes_received: int
 
 
+class UploadConflict(BaseModel):
+    """Response body for an upload refused with 409 Conflict.
+
+    *reason* is ``"exists"`` when *filename* is already stored, or
+    ``"in_progress"`` when another transfer is still writing it.
+    """
+
+    detail: str
+    filename: str
+    reason: Literal["exists", "in_progress"]
+
+
 class FileInfo(BaseModel):
     """Metadata for a single stored file.
 

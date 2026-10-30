@@ -8,7 +8,7 @@ import pytest
 from mscompress import MZMLFile
 
 from mstransfer.server.fileprovider import DirectoryFileProvider
-from mstransfer.server.models import TransferState
+from mstransfer.server.models import TransferState, UploadConflict
 from mstransfer.server.state import OutputClaims, TransferRegistry
 
 # ---------------------------------------------------------------------------
@@ -478,7 +478,11 @@ async def test_upload_conflicting_with_stored_file_rejected(
         headers=_upload_headers("conflict", "test.mzML"),
     )
     assert resp.status_code == 409
-    assert "test.msz already exists" in resp.json()["detail"]
+    assert resp.json() == {
+        "detail": "test.msz already exists on the server",
+        "filename": "test.msz",
+        "reason": "exists",
+    }
     # Rejected before the body was read; no transfer record or files left.
     assert not consumed
     assert stored.read_bytes() == b"stored earlier"
@@ -538,7 +542,9 @@ async def test_upload_conflicting_with_in_flight_transfer_rejected(
         headers=_upload_headers("racing", "run1.msz"),
     )
     assert second.status_code == 409
-    assert "already being written" in second.json()["detail"]
+    conflict = UploadConflict.model_validate(second.json())
+    assert conflict.reason == "in_progress"
+    assert conflict.filename == "run1.msz"
 
     release.set()
     first_resp = await first
@@ -578,7 +584,9 @@ async def test_upload_store_as_mzml_leaves_unrelated_msz_alone(
         headers=_upload_headers("mzml-again", "test.mzML"),
     )
     assert again.status_code == 409
-    assert "test.mzML already exists" in again.json()["detail"]
+    conflict = UploadConflict.model_validate(again.json())
+    assert conflict.reason == "exists"
+    assert conflict.filename == "test.mzML"
 
 
 # ---------------------------------------------------------------------------

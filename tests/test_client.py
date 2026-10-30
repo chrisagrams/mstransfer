@@ -9,13 +9,13 @@ import time
 from pathlib import Path
 from unittest.mock import patch
 
-import httpx
 import pytest
 import uvicorn
 from mscompress import MSZFile, MZMLFile
 from mscompress.mszx import MSZXFile
 
 from mstransfer.client.sender import (
+    UploadConflictError,
     async_send_batch,
     async_send_file,
     send_batch,
@@ -309,8 +309,11 @@ class TestSendFile:
         """A 409 from the server surfaces with its message; nothing is replaced."""
         stored = _live_server["output_dir"] / "test.msz"
         stored.write_bytes(b"stored earlier")
-        with pytest.raises(httpx.HTTPStatusError, match="test.msz already exists"):
+        with pytest.raises(UploadConflictError) as exc_info:
             send_file(test_msz, _live_server["base_url"])
+        assert exc_info.value.conflict.reason == "exists"
+        assert exc_info.value.conflict.filename == "test.msz"
+        assert "409 Conflict: test.msz already exists" in str(exc_info.value)
         assert stored.read_bytes() == b"stored earlier"
 
     def test_send_file_progress_callback(self, test_msz, _live_server):
