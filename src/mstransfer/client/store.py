@@ -5,10 +5,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import shutil
-import tarfile
 import tempfile
 from dataclasses import dataclass
-from enum import Enum
+from enum import StrEnum
 from functools import cached_property
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import TYPE_CHECKING, ClassVar, Literal
@@ -29,7 +28,7 @@ logger = logging.getLogger(__name__)
 DownloadFormat = Literal["msz", "mzml", "mszx"]
 
 
-class MSFormat(str, Enum):
+class MSFormat(StrEnum):
     """An on-disk MS data format.
 
     Members compare equal to their ``DownloadFormat`` string values.
@@ -38,9 +37,6 @@ class MSFormat(str, Enum):
     MSZ = "msz"
     MZML = "mzml"
     MSZX = "mszx"
-
-    def __str__(self) -> str:
-        return self.value
 
     @property
     def ext(self) -> str:
@@ -56,43 +52,6 @@ class MSFormat(str, Enum):
             return cls(suffix.lower().removeprefix("."))
         except ValueError:
             return None
-
-
-class MszxArchive:
-    """Raw access to the spectra members of an .mszx tar.
-
-    TODO: Replace with ``MSZXBatchFile.extract_msz()`` once mscompress
-    provides it (https://github.com/chrisagrams/mscompress/issues/277).
-    """
-
-    def __init__(self, path: Path) -> None:
-        self.path = path
-        self.entries = self.read_entries(path)
-        # Closed by close() / __exit__; this class is the context manager.
-        self._tar = tarfile.open(path)  # noqa: SIM115
-
-    @staticmethod
-    def read_entries(path: Path) -> tuple[str, ...]:
-        """Return the spectra entry names listed in the manifest of *path*."""
-        manifest = read_archive_manifest(path)
-        return tuple(spectra.entry for spectra in manifest.spectra_files)
-
-    def extract_msz(self, entry: str, dst: Path) -> None:
-        """Stream the raw MSZ member *entry* to *dst*."""
-        member = self._tar.extractfile(entry)
-        if member is None:
-            raise ValueError(f"Missing MSZ entry {entry!r}")
-        with member, dst.open("wb") as out:
-            shutil.copyfileobj(member, out)
-
-    def close(self) -> None:
-        self._tar.close()
-
-    def __enter__(self) -> MszxArchive:
-        return self
-
-    def __exit__(self, *exc_info: object) -> None:
-        self.close()
 
 
 @dataclass(frozen=True)
@@ -131,13 +90,12 @@ class Conversion:
     @staticmethod
     def _mszx_to_msz(src: Path, dst: Path) -> None:
         """Extract the embedded .msz payload from an .mszx archive."""
-        with MszxArchive(src) as archive:
-            if len(archive.entries) != 1:
+        with MSZXBatchFile.open(src) as batch:
+            if len(batch) != 1:
                 raise NotImplementedError(
-                    f"Cannot store a {len(archive.entries)}-member .mszx "
-                    "as a single .msz"
+                    f"Cannot store a {len(batch)}-member .mszx as a single .msz"
                 )
-            archive.extract_msz(archive.entries[0], dst)
+            batch.extract_msz(0, dst)
 
     # Mapping of (source_format, target_format) to converter function.
     _CONVERTERS: ClassVar[
@@ -185,13 +143,11 @@ class MszxExpansion:
 
     def _extract_to(self, directory: Path) -> None:
         """Write every member into *directory* (blocking)."""
-        if self.target is MSFormat.MSZ:
-            with MszxArchive(self.src) as archive:
-                for entry, name in self.targets:
-                    archive.extract_msz(entry, directory / name)
-        else:
-            with MSZXBatchFile.open(self.src) as batch:
-                for entry, name in self.targets:
+        with MSZXBatchFile.open(self.src) as batch:
+            for entry, name in self.targets:
+                if self.target is MSFormat.MSZ:
+                    batch.extract_msz(entry, directory / name)
+                else:
                     batch.get(entry).decompress(str(directory / name))
 
     async def write(self, archive_dir: Path) -> Path:
@@ -328,7 +284,8 @@ class StorePlan:
         part.rename(src)
         try:
             if self.may_expand:
-                entries = await asyncio.to_thread(MszxArchive.read_entries, src)
+                manifest = await asyncio.to_thread(read_archive_manifest, src)
+                entries = tuple(spectra.entry for spectra in manifest.spectra_files)
                 if len(entries) > 1:
                     expansion = MszxExpansion(src, entries, conversion.target)
                     return await expansion.write(self.archive_dir)

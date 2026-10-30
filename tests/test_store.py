@@ -11,7 +11,6 @@ import pytest
 from mstransfer.client.store import (
     Conversion,
     MSFormat,
-    MszxArchive,
     MszxExpansion,
     StorePlan,
 )
@@ -205,44 +204,6 @@ class TestStorePlan:
         )
 
 
-def _write_mszx(path, members):
-    """Write a v2 batch .mszx at *path* from a {entry: source file} mapping."""
-    manifest = json.dumps(
-        {
-            "version": "2.0",
-            "container": "batch",
-            "spectra_files": [{"entry": entry} for entry in members],
-        }
-    ).encode()
-    with tarfile.open(path, "w") as tar:
-        info = tarfile.TarInfo(name="manifest.json")
-        info.size = len(manifest)
-        tar.addfile(info, io.BytesIO(manifest))
-        for entry, src in members.items():
-            tar.add(str(src), arcname=entry)
-
-
-class TestMszxArchive:
-    def test_read_entries(self, test_msz, tmp_path):
-        src = tmp_path / "a.mszx"
-        _write_mszx(src, {"a.msz": test_msz, "sub/b.msz": test_msz})
-        assert MszxArchive.read_entries(src) == ("a.msz", "sub/b.msz")
-
-    def test_extract_msz_copies_raw_bytes(self, test_msz, tmp_path):
-        src = tmp_path / "a.mszx"
-        _write_mszx(src, {"a.msz": test_msz})
-        with MszxArchive(src) as archive:
-            assert archive.entries == ("a.msz",)
-            archive.extract_msz("a.msz", tmp_path / "out.msz")
-        assert (tmp_path / "out.msz").read_bytes() == test_msz.read_bytes()
-
-    def test_extract_msz_missing_entry(self, test_msz, tmp_path):
-        src = tmp_path / "a.mszx"
-        _write_mszx(src, {"a.msz": test_msz})
-        with MszxArchive(src) as archive, pytest.raises(KeyError):
-            archive.extract_msz("missing.msz", tmp_path / "out.msz")
-
-
 class TestMszxExpansion:
     def test_targets_use_entry_stem_and_target_ext(self, tmp_path):
         expansion = MszxExpansion(
@@ -317,5 +278,5 @@ class TestMszxToMszConversion:
             entry.type = tarfile.DIRTYPE
             tar.addfile(entry)
 
-        with pytest.raises(ValueError, match="Missing MSZ entry"):
+        with pytest.raises(ValueError, match="not a regular file"):
             await Conversion(MSFormat.MSZX, MSFormat.MSZ).run(src, tmp_path / "out.msz")

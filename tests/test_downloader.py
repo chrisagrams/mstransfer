@@ -842,7 +842,7 @@ class TestBatchMszx:
         previous = out_dir / "bad"
         previous.mkdir()
         (previous / "old.msz").write_bytes(b"previous")
-        with pytest.raises(KeyError):
+        with pytest.raises(ValueError, match="missing from the archive"):
             download_file(
                 f"{served_ms_files['base_url']}/bad.mszx",
                 out_dir / "bad.mszx",
