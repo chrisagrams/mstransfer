@@ -11,7 +11,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
 
     steps:
       - uses: actions/checkout@v7
@@ -45,7 +45,7 @@ jobs:
         run: uv run pytest --cov=mstransfer --cov-report=term-missing --cov-report=xml
 
       - name: Upload coverage to Codecov
-        if: matrix.python-version == '3.10'
+        if: matrix.python-version == '3.11'
         uses: codecov/codecov-action@v7
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
