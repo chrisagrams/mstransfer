@@ -5,7 +5,7 @@ description = "Transfer mass spectrometry files (mzML/MSZ) between endpoints usi
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "mscompress>=1.2.0",
+    "mscompress>=1.2.2",
     "fastapi",
     "uvicorn[standard]",
     "httpx",
