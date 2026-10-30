@@ -185,8 +185,8 @@ def cmd_upload(args: argparse.Namespace) -> None:
                 continue
             err = r.error or (str(r.response.state.value) if r.response else "unknown")
             console.print(f"  [red]- {r.filename}: {err}")
-    else:
-        console.print(f"\n[green]All {ok} file(s) transferred successfully.")
+        sys.exit(1)
+    console.print(f"\n[green]All {ok} file(s) transferred successfully.")
 
 
 class DownloadProgressDisplay:
@@ -271,8 +271,8 @@ def cmd_download(args: argparse.Namespace) -> None:
     ok = len(requests) - fail
     if fail:
         console.print(f"\n[green]{ok} succeeded[/], [red]{fail} failed[/]")
-    else:
-        console.print(f"\n[green]All {ok} file(s) downloaded successfully.")
+        sys.exit(1)
+    console.print(f"\n[green]All {ok} file(s) downloaded successfully.")
 
 
 def main() -> None:
