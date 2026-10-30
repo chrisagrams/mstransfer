@@ -153,5 +153,6 @@ nav:
     - Client: reference/client.md
     - Server: reference/server.md
     - Models: reference/models.md
+    - Storage: reference/store.md
   - Contributing:
     - contributing/index.md
