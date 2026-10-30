@@ -9,7 +9,7 @@ from mscompress import MZMLFile
 
 from mstransfer.server.fileprovider import DirectoryFileProvider
 from mstransfer.server.models import TransferState
-from mstransfer.server.state import TransferRegistry
+from mstransfer.server.state import OutputClaims, TransferRegistry
 
 # ---------------------------------------------------------------------------
 # TransferRegistry unit tests
@@ -97,6 +97,20 @@ class TestTransferRegistry:
         assert reg.get("t2") is None
         assert reg.get("t3") is None
         assert reg.get("t1") is not None
+
+
+class TestOutputClaims:
+    def test_claim_is_exclusive_until_released(self, tmp_path):
+        claims = OutputClaims()
+        assert claims.claim(tmp_path / "run.msz")
+        assert not claims.claim(tmp_path / "run.msz")
+        claims.release(tmp_path / "run.msz")
+        assert claims.claim(tmp_path / "run.msz")
+
+    def test_claims_compare_case_insensitively(self, tmp_path):
+        claims = OutputClaims()
+        assert claims.claim(tmp_path / "run.mzML")
+        assert not claims.claim(tmp_path / "RUN.mzml")
 
 
 # ---------------------------------------------------------------------------
@@ -438,6 +452,149 @@ async def test_decompress_does_not_block_event_loop(mzml_client, tmp_output, tes
     upload_resp = await upload_task
     assert upload_resp.status_code == 200
     assert upload_resp.json()["state"] == "done"
+
+
+def _upload_headers(transfer_id, filename, **extra):
+    return {"X-Transfer-ID": transfer_id, "X-Original-Filename": filename, **extra}
+
+
+@pytest.mark.asyncio
+async def test_upload_conflicting_with_stored_file_rejected(
+    msz_client, tmp_output, test_msz
+):
+    """An upload whose output already exists gets a 409 and changes nothing."""
+    stored = tmp_output / "test.msz"
+    stored.write_bytes(b"stored earlier")
+    consumed = False
+
+    async def body():
+        nonlocal consumed
+        consumed = True
+        yield test_msz.read_bytes()
+
+    resp = await msz_client.post(
+        "/v1/upload",
+        content=body(),
+        headers=_upload_headers("conflict", "test.mzML"),
+    )
+    assert resp.status_code == 409
+    assert "test.msz already exists" in resp.json()["detail"]
+    # Rejected before the body was read; no transfer record or files left.
+    assert not consumed
+    assert stored.read_bytes() == b"stored earlier"
+    assert list(tmp_output.iterdir()) == [stored]
+    status = await msz_client.get("/v1/transfer/conflict/status")
+    assert status.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_upload_same_stem_different_format_rejected(msz_client, test_msz):
+    """test.mzML and test.msz both map to test.msz; the second is refused."""
+    first = await msz_client.post(
+        "/v1/upload",
+        content=test_msz.read_bytes(),
+        headers=_upload_headers("first", "test.msz"),
+    )
+    assert first.json()["state"] == "done"
+
+    second = await msz_client.post(
+        "/v1/upload",
+        content=test_msz.read_bytes(),
+        headers=_upload_headers("second", "test.mzML"),
+    )
+    assert second.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_upload_overwrite_header_replaces_stored_file(
+    msz_client, tmp_output, test_msz
+):
+    """X-Overwrite: true opts in to replacing an existing file."""
+    stored = tmp_output / "test.msz"
+    stored.write_bytes(b"stored earlier")
+    resp = await msz_client.post(
+        "/v1/upload",
+        content=test_msz.read_bytes(),
+        headers=_upload_headers("overwrite", "test.msz", **{"X-Overwrite": "true"}),
+    )
+    assert resp.status_code == 200
+    assert resp.json()["state"] == "done"
+    assert stored.read_bytes() == test_msz.read_bytes()
+
+
+@pytest.mark.asyncio
+async def test_upload_conflicting_with_in_flight_transfer_rejected(
+    msz_client, tmp_output, test_msz
+):
+    """Two concurrent uploads to one output can't interleave, even with overwrite."""
+    payload = test_msz.read_bytes()
+    release = asyncio.Event()
+
+    async def slow_body():
+        yield payload[:1024]
+        await release.wait()
+        yield payload[1024:]
+
+    first = asyncio.create_task(
+        msz_client.post(
+            "/v1/upload",
+            content=slow_body(),
+            headers=_upload_headers("in-flight", "run1.mzML"),
+        )
+    )
+    # Wait until the first upload has claimed its output.
+    for _ in range(100):
+        status = await msz_client.get("/v1/transfer/in-flight/status")
+        if status.status_code == 200:
+            break
+        await asyncio.sleep(0.01)
+
+    second = await msz_client.post(
+        "/v1/upload",
+        content=payload,
+        headers=_upload_headers("racing", "run1.msz", **{"X-Overwrite": "true"}),
+    )
+    assert second.status_code == 409
+    assert "already being written" in second.json()["detail"]
+
+    release.set()
+    first_resp = await first
+    assert first_resp.json()["state"] == "done"
+    assert (tmp_output / "run1.msz").read_bytes() == payload
+
+    # Once the first transfer finishes, its output can be overwritten again.
+    third = await msz_client.post(
+        "/v1/upload",
+        content=payload,
+        headers=_upload_headers("after", "run1.msz", **{"X-Overwrite": "true"}),
+    )
+    assert third.json()["state"] == "done"
+
+
+@pytest.mark.asyncio
+async def test_upload_store_as_mzml_leaves_unrelated_msz_alone(
+    mzml_client, tmp_output, test_msz
+):
+    """With store_as=mzml, a stored <stem>.msz is neither replaced nor removed."""
+    stored_msz = tmp_output / "test.msz"
+    stored_msz.write_bytes(b"stored earlier")
+    resp = await mzml_client.post(
+        "/v1/upload",
+        content=test_msz.read_bytes(),
+        headers=_upload_headers("mzml-side", "test.msz"),
+    )
+    assert resp.json()["state"] == "done"
+    assert stored_msz.read_bytes() == b"stored earlier"
+    assert (tmp_output / "test.mzML").exists()
+
+    # The mzML output now exists, so a second upload of the same stem conflicts.
+    again = await mzml_client.post(
+        "/v1/upload",
+        content=test_msz.read_bytes(),
+        headers=_upload_headers("mzml-again", "test.mzML"),
+    )
+    assert again.status_code == 409
+    assert "test.mzML already exists" in again.json()["detail"]
 
 
 # ---------------------------------------------------------------------------

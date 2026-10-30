@@ -204,6 +204,7 @@ class TestCmdUpload:
             "parallel": 4,
             "chunk_size": 1_048_576,
             "api_key": None,
+            "overwrite": False,
         }
         defaults.update(overrides)
         return argparse.Namespace(**defaults)
@@ -355,6 +356,7 @@ class TestCmdUpload:
         _, kwargs = mock_send_batch.call_args
         assert kwargs["parallel"] == 8
         assert kwargs["chunk_size"] == 4_194_304
+        assert kwargs["overwrite"] is False
 
     @patch("mstransfer.cli.async_send_batch", new_callable=AsyncMock)
     @patch("mstransfer.cli.httpx.get")
@@ -657,6 +659,15 @@ class TestMain:
         with patch("sys.argv", ["mstransfer", "upload", "file.mzML", "host"]):
             main()
         mock_cmd_upload.assert_called_once()
+
+    @patch("mstransfer.cli.cmd_upload")
+    def test_main_upload_overwrite_flag(self, mock_cmd_upload):
+        with patch(
+            "sys.argv", ["mstransfer", "upload", "file.mzML", "host", "--overwrite"]
+        ):
+            main()
+        (args,), _ = mock_cmd_upload.call_args
+        assert args.overwrite is True
 
     @patch("mstransfer.cli.cmd_download")
     def test_main_dispatches_download(self, mock_cmd_download):

@@ -20,6 +20,7 @@ class AppState(State):
     store_as: StoreFormat
     transfers: TransferRegistry
     files: FileProvider
+    outputs: OutputClaims
 
     def __init__(
         self,
@@ -32,6 +33,31 @@ class AppState(State):
         self.store_as = store_as
         self.transfers = TransferRegistry()
         self.files = files
+        self.outputs = OutputClaims()
+
+
+class OutputClaims:
+    """Output paths that in-flight uploads are writing.
+
+    Lets an upload refuse a destination another transfer already holds,
+    so two uploads never write to the same file.  Paths compare
+    case-insensitively, as macOS and Windows filesystems do.
+    """
+
+    def __init__(self) -> None:
+        self._claimed: set[str] = set()
+
+    def claim(self, path: Path) -> bool:
+        """Reserve *path*, returning *False* if it is already reserved."""
+        key = str(path).casefold()
+        if key in self._claimed:
+            return False
+        self._claimed.add(key)
+        return True
+
+    def release(self, path: Path) -> None:
+        """Give up a reservation made with :meth:`claim`."""
+        self._claimed.discard(str(path).casefold())
 
 
 class TransferRegistry:

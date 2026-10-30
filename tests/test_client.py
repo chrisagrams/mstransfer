@@ -8,6 +8,7 @@ import time
 from pathlib import Path
 from unittest.mock import patch
 
+import httpx
 import pytest
 import uvicorn
 from mscompress import MSZFile, MZMLFile
@@ -303,6 +304,22 @@ class TestSendFile:
         assert mzml_out.exists()
         assert mzml_out.stat().st_size == test_mzml.stat().st_size
 
+    def test_send_file_conflict_reports_server_detail(self, test_msz, _live_server):
+        """A 409 from the server surfaces with its message; nothing is replaced."""
+        stored = _live_server["output_dir"] / "test.msz"
+        stored.write_bytes(b"stored earlier")
+        with pytest.raises(httpx.HTTPStatusError, match="test.msz already exists"):
+            send_file(test_msz, _live_server["base_url"])
+        assert stored.read_bytes() == b"stored earlier"
+
+    def test_send_file_overwrite(self, test_msz, _live_server):
+        """overwrite=True replaces a file the server already stores."""
+        stored = _live_server["output_dir"] / "test.msz"
+        stored.write_bytes(b"stored earlier")
+        result = send_file(test_msz, _live_server["base_url"], overwrite=True)
+        assert result.state == "done"
+        assert stored.read_bytes() == test_msz.read_bytes()
+
     def test_send_file_progress_callback(self, test_msz, _live_server):
         """Progress callback should be invoked with byte deltas."""
         deltas = []
@@ -349,6 +366,7 @@ class TestSendFile:
             _live_server["base_url"],
             progress_callback=large_deltas.append,
             chunk_size=1_048_576,
+            overwrite=True,
         )
         # Both should transfer the full file regardless of chunk size
         assert sum(small_deltas) == test_msz.stat().st_size
@@ -448,10 +466,10 @@ class TestSendBatch:
         result_names = {r.filename for r in results}
         assert result_names == {f.name for f in files}
 
-    def test_mixed_msz_and_mzml(self, test_msz, test_mzml, _live_server):
+    def test_mixed_msz_and_mzml(self, test_msz, other_mzml, _live_server):
         """send_batch handles a mix of .msz and .mzML files."""
         results = send_batch(
-            [test_msz, test_mzml],
+            [test_msz, other_mzml],
             _live_server["base_url"],
             parallel=2,
         )
@@ -482,6 +500,21 @@ class TestSendBatch:
         assert r.error is not None
         assert "server exploded" in r.error
         assert r.filename == "test.msz"
+
+    def test_same_stem_conflict_is_per_file_error(
+        self, test_msz, test_mzml, _live_server
+    ):
+        """test.msz and test.mzML collide; one succeeds and the other fails."""
+        results = send_batch(
+            [test_msz, test_mzml],
+            _live_server["base_url"],
+            parallel=1,
+        )
+        assert results[0].response is not None
+        assert results[0].response.state == "done"
+        assert results[1].response is None
+        assert results[1].error is not None
+        assert "409 Conflict: test.msz already exists" in results[1].error
 
     def test_partial_failure(self, test_msz, _live_server, tmp_path):
         """One failure does not prevent other files from succeeding."""
@@ -544,10 +577,10 @@ class TestSendBatch:
             _, kwargs = mock_send.call_args
             assert kwargs["chunk_size"] == 4096
 
-    def test_batch_with_mscompress_objects(self, test_msz, test_mzml, _live_server):
+    def test_batch_with_mscompress_objects(self, test_msz, other_mzml, _live_server):
         """send_batch accepts MSZFile and MZMLFile objects."""
         msz = MSZFile(str(test_msz).encode())
-        mzml = MZMLFile(str(test_mzml).encode())
+        mzml = MZMLFile(str(other_mzml).encode())
         results = send_batch(
             [msz, mzml],
             _live_server["base_url"],
@@ -558,9 +591,9 @@ class TestSendBatch:
             assert r.response is not None
             assert r.response.state == "done"
 
-    def test_batch_mixed_paths_and_objects(self, test_msz, test_mzml, _live_server):
+    def test_batch_mixed_paths_and_objects(self, test_msz, other_mzml, _live_server):
         """send_batch accepts a mix of Path and mscompress objects."""
-        mzml = MZMLFile(str(test_mzml).encode())
+        mzml = MZMLFile(str(other_mzml).encode())
         results = send_batch(
             [test_msz, mzml],
             _live_server["base_url"],
@@ -568,7 +601,7 @@ class TestSendBatch:
         )
         assert len(results) == 2
         names = {r.filename for r in results}
-        assert names == {"test.msz", "test.mzML"}
+        assert names == {"test.msz", "other.mzML"}
         for r in results:
             assert r.response is not None
             assert r.response.state == "done"
@@ -705,10 +738,10 @@ class TestAsyncSendBatch:
             assert r.response is not None
             assert r.response.state == "done"
 
-    async def test_mixed_msz_and_mzml(self, test_msz, test_mzml, _live_server):
+    async def test_mixed_msz_and_mzml(self, test_msz, other_mzml, _live_server):
         """async_send_batch handles a mix of .msz and .mzML files."""
         results = await async_send_batch(
-            [test_msz, test_mzml],
+            [test_msz, other_mzml],
             _live_server["base_url"],
             parallel=2,
         )
