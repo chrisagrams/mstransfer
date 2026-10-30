@@ -8,12 +8,72 @@ import tarfile
 
 import pytest
 
-from mstransfer.client.store import (
+from mstransfer.store import (
     Conversion,
     MSFormat,
     MszxExpansion,
     StorePlan,
 )
+
+
+class TestMSFormatFromPath:
+    @pytest.mark.parametrize(
+        ("name", "expected"),
+        [
+            ("run.msz", "msz"),
+            ("run.mzML", "mzml"),
+            ("run.MSZX", "mszx"),
+            ("dir/run.mszx", "mszx"),
+            ("run.raw", None),
+            ("run", None),
+        ],
+    )
+    def test_from_path(self, name, expected):
+        assert MSFormat.from_path(name) == expected
+
+
+class TestMSFormatFromHeader:
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            ("mzML", MSFormat.MZML),
+            ("msz", MSFormat.MSZ),
+            (" MSZX ", MSFormat.MSZX),
+        ],
+    )
+    def test_from_header(self, value, expected):
+        assert MSFormat.from_header(value) is expected
+
+    def test_rejects_unknown(self):
+        with pytest.raises(ValueError):
+            MSFormat.from_header("raw")
+
+
+class TestStorePlanForUpload:
+    @pytest.mark.parametrize(
+        ("filename", "source", "store_as", "dest", "convert_to"),
+        [
+            # mzML is compressed on the wire, so it arrives as MSZ.
+            ("run.mzML", MSFormat.MZML, MSFormat.MSZ, "run.msz", None),
+            ("run.mzML", MSFormat.MZML, MSFormat.MZML, "run.msz", MSFormat.MZML),
+            ("run.msz", MSFormat.MSZ, MSFormat.MZML, "run.msz", MSFormat.MZML),
+            # Archives are kept as-is, whatever store_as says.
+            ("run.mszx", MSFormat.MSZX, MSFormat.MZML, "run.mszx", None),
+            ("run.mszx", MSFormat.MSZX, MSFormat.MSZ, "run.mszx", None),
+            # The declared source wins over the filename.
+            ("run.bin", MSFormat.MSZX, MSFormat.MSZ, "run.mszx", None),
+            # Without a declared source, it is inferred from the filename.
+            ("run.MSZX", None, MSFormat.MZML, "run.mszx", None),
+            ("run.mzML", None, MSFormat.MSZ, "run.msz", None),
+            ("run.bin", None, MSFormat.MZML, "run.msz", MSFormat.MZML),
+        ],
+    )
+    def test_for_upload(self, tmp_path, filename, source, store_as, dest, convert_to):
+        plan = StorePlan.for_upload(tmp_path, filename, source, store_as)
+        assert plan.dest == tmp_path / dest
+        conversion = plan.conversion
+        assert (conversion.target if conversion else None) == convert_to
+        assert not plan.may_expand
 
 
 class TestMSFormatFromUrl:
@@ -162,6 +222,15 @@ class TestStorePlan:
     def test_part_path_uses_requested_dest(self, tmp_path):
         plan = StorePlan(tmp_path / "f.msz", MSFormat.MSZ, MSFormat.MZML)
         assert plan.part_path == tmp_path / "f.msz.part"
+
+    def test_unique_part_path(self, tmp_path):
+        plan = StorePlan(tmp_path / "f.msz", MSFormat.MSZ, None)
+        first, second = plan.unique_part_path(), plan.unique_part_path()
+        assert first != second
+        for part in (first, second):
+            assert part.parent == tmp_path
+            assert part.name.startswith("f.msz.")
+            assert part.suffix == ".part"
 
     @pytest.mark.parametrize(
         ("source", "target", "expected"),

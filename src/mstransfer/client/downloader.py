@@ -8,8 +8,8 @@ from typing import TYPE_CHECKING, Protocol, runtime_checkable
 import aiofiles
 import httpx
 
-from mstransfer.client.store import DownloadFormat, StorePlan
 from mstransfer.client.utils import ThrottledCallback, optional_client
+from mstransfer.store import DownloadFormat, StorePlan
 
 if TYPE_CHECKING:
     from pathlib import Path

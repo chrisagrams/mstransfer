@@ -4,19 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import os
-from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
+    from pathlib import Path
 
-from mstransfer.server.models import FileFormat, FileInfo
-
-VALID_EXTENSIONS: dict[str, FileFormat] = {
-    ".msz": "msz",
-    ".mszx": "mszx",
-    ".mzml": "mzml",
-}
+from mstransfer.server.models import FileInfo
+from mstransfer.store import MSFormat
 
 
 @runtime_checkable
@@ -69,8 +64,7 @@ class DirectoryFileProvider:
         for entry in os.scandir(self._directory):
             if not entry.is_file():
                 continue
-            ext = Path(entry.name).suffix.lower()
-            fmt = VALID_EXTENSIONS.get(ext)
+            fmt = MSFormat.from_path(entry.name)
             if fmt is None:
                 continue
             results.append(
