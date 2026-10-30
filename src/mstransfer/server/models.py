@@ -5,6 +5,7 @@ from collections.abc import (
 )
 from datetime import datetime
 from enum import StrEnum
+from pathlib import Path
 from typing import Literal
 
 from pydantic import BaseModel, Field, SerializeAsAny
@@ -21,6 +22,38 @@ class TransferState(StrEnum):
     DECOMPRESSING = "decompressing"
     DONE = "done"
     ERROR = "error"
+
+
+class SourceFormat(StrEnum):
+    """Format of an uploaded payload, as declared by the client."""
+
+    MZML = "mzml"
+    MSZ = "msz"
+    MSZX = "mszx"
+
+    @classmethod
+    def from_upload(cls, header: str | None, filename: str) -> SourceFormat:
+        """Parse ``X-Source-Format``, falling back to the filename extension.
+
+        The header is matched case-insensitively.  When it is absent, a
+        ``.mszx`` filename means an archive; anything else is treated as an
+        MSZ stream, which is what clients sent before the header existed.
+        Raises :class:`ValueError` for an unrecognised header value.
+        """
+        if header is None:
+            is_mszx = Path(filename).suffix.lower() == ".mszx"
+            return cls.MSZX if is_mszx else cls.MSZ
+        return cls(header.strip().lower())
+
+    @property
+    def stored_suffix(self) -> str:
+        """mzML arrives as a compressed MSZ stream; archives keep their suffix."""
+        return ".mszx" if self is SourceFormat.MSZX else ".msz"
+
+    @property
+    def is_archive(self) -> bool:
+        """Whether the payload is an .mszx archive, stored without conversion."""
+        return self is SourceFormat.MSZX
 
 
 class TransferRecord(BaseModel):

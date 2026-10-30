@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any
 
 import aiofiles
 import aiofiles.os
@@ -15,6 +15,7 @@ from mstransfer import __version__
 from mstransfer.server.models import (
     FileListResponse,
     HealthResponse,
+    SourceFormat,
     TransferRecord,
     TransferState,
     UploadResponse,
@@ -32,27 +33,6 @@ def _state_from_app(request: Request) -> AppState:
 
 
 logger = logging.getLogger(__name__)
-
-SourceFormat = Literal["mzml", "msz", "mszx"]
-SOURCE_FORMATS: frozenset[str] = frozenset({"mzml", "msz", "mszx"})
-
-
-def _resolve_source_format(header: str | None, filename: str) -> SourceFormat:
-    """Determine what the client sent from ``X-Source-Format`` or *filename*.
-
-    The header is matched case-insensitively.  When it is absent, a
-    ``.mszx`` filename means an archive; anything else is treated as an
-    MSZ stream, which is what clients sent before the header existed.
-    Raises a 400 for an unrecognised header value.
-    """
-    if header is None:
-        return "mszx" if Path(filename).suffix.lower() == ".mszx" else "msz"
-    fmt = header.strip().lower()
-    if fmt not in SOURCE_FORMATS:
-        raise HTTPException(
-            status_code=400, detail=f"Unsupported X-Source-Format: {header!r}"
-        )
-    return fmt  # type: ignore[return-value]
 
 
 def make_router(
@@ -147,9 +127,15 @@ def make_router(
                 status_code=400, detail="Missing X-Original-Filename header"
             )
 
-        source_format = _resolve_source_format(
-            request.headers.get("X-Source-Format"), original_filename
-        )
+        # Determine the payload format, raise if unrecognised.
+        source_header = request.headers.get("X-Source-Format")
+        try:
+            source_format = SourceFormat.from_upload(source_header, original_filename)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported X-Source-Format: {source_header!r}",
+            ) from exc
 
         output_dir = state.output_dir
         store_as = state.store_as
@@ -159,11 +145,9 @@ def make_router(
         registry.create(transfer_id, original_filename)
         logger.info("Receiving %s (transfer_id=%s)", original_filename, transfer_id)
 
-        # Use the filename stem for the output file.  mzML sources arrive
-        # as a compressed MSZ stream, so only archives keep their own suffix.
+        # Use the filename stem for the output file.
         stem = Path(original_filename).stem
-        suffix = ".mszx" if source_format == "mszx" else ".msz"
-        received_path = output_dir / f"{stem}{suffix}"
+        received_path = output_dir / f"{stem}{source_format.stored_suffix}"
         bytes_received = 0
 
         # Stream the incoming data to a file asynchronously.
@@ -195,7 +179,7 @@ def make_router(
             transfer_id,
         )
 
-        if source_format == "mszx" or store_as == "msz":
+        if source_format.is_archive or store_as == "msz":
             # Archives are kept untouched, and .msz needs no conversion,
             # so we're done at this point.
             # Just update the registry with the final path and state.

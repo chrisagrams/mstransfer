@@ -8,7 +8,7 @@ import pytest
 from mscompress import MZMLFile
 
 from mstransfer.server.fileprovider import DirectoryFileProvider
-from mstransfer.server.models import TransferState
+from mstransfer.server.models import SourceFormat, TransferState
 from mstransfer.server.state import TransferRegistry
 
 # ---------------------------------------------------------------------------
@@ -97,6 +97,36 @@ class TestTransferRegistry:
         assert reg.get("t2") is None
         assert reg.get("t3") is None
         assert reg.get("t1") is not None
+
+
+class TestSourceFormat:
+    @pytest.mark.parametrize(
+        ("header", "filename", "expected"),
+        [
+            ("mzML", "a.mzML", SourceFormat.MZML),
+            ("msz", "a.msz", SourceFormat.MSZ),
+            (" MSZX ", "a.bin", SourceFormat.MSZX),
+            (None, "a.MSZX", SourceFormat.MSZX),
+            (None, "a.mzML", SourceFormat.MSZ),
+            (None, "a.msz", SourceFormat.MSZ),
+        ],
+    )
+    def test_from_upload(self, header, filename, expected):
+        assert SourceFormat.from_upload(header, filename) is expected
+
+    def test_from_upload_rejects_unknown(self):
+        with pytest.raises(ValueError):
+            SourceFormat.from_upload("raw", "a.raw")
+
+    def test_stored_suffix(self):
+        assert SourceFormat.MZML.stored_suffix == ".msz"
+        assert SourceFormat.MSZ.stored_suffix == ".msz"
+        assert SourceFormat.MSZX.stored_suffix == ".mszx"
+
+    def test_is_archive(self):
+        assert SourceFormat.MSZX.is_archive
+        assert not SourceFormat.MSZ.is_archive
+        assert not SourceFormat.MZML.is_archive
 
 
 # ---------------------------------------------------------------------------
