@@ -341,8 +341,11 @@ class StorePlan:
             return self.final_dest
 
         # Give the temp file the correct source extension so mscompress can
-        # recognise its format, then convert.
-        src = part.with_suffix(conversion.source.ext)
+        # recognise its format, then convert.  The name is hidden and unique
+        # so it never looks like (or collides with) a real output.
+        src = self.dest.with_name(
+            f".{self.dest.stem}.{uuid.uuid4().hex}{conversion.source.ext}"
+        )
         part.rename(src)
         try:
             if self.may_expand:
@@ -365,5 +368,5 @@ class StorePlan:
             staging.replace(final_dest)
         finally:
             staging.unlink(missing_ok=True)
-        logger.info("Converted %s → %s", src.name, final_dest.name)
+        logger.info("Converted %s → %s", self.dest.name, final_dest.name)
         return final_dest
