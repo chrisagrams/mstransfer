@@ -1,4 +1,4 @@
-"""Decide where and in what format a downloaded file is stored on disk."""
+"""Decide where and in what format a transferred file is stored on disk."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ import asyncio
 import logging
 import shutil
 import tempfile
+import uuid
 from dataclasses import dataclass
 from enum import StrEnum
 from functools import cached_property
@@ -16,8 +17,6 @@ from urllib.parse import unquote, urlsplit
 from mscompress import MSZFile, MZMLFile
 from mscompress.mszx import MSZXFile
 from mscompress.mszx.batch import MSZXBatchFile, read_archive_manifest
-
-from mstransfer.client.utils import replace_dir
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -44,14 +43,27 @@ class MSFormat(StrEnum):
         return ".mzML" if self is MSFormat.MZML else f".{self.value}"
 
     @classmethod
-    def from_url(cls, url: str) -> MSFormat | None:
-        """Infer the format from the URL filename extension, or *None*."""
-        suffix = PurePosixPath(unquote(urlsplit(url).path)).suffix
+    def from_path(cls, name: str) -> MSFormat | None:
+        """Infer the format from a filename extension, or *None*."""
+        suffix = PurePosixPath(name).suffix
         # Every format's lowercased extension is "." + its value.
         try:
             return cls(suffix.lower().removeprefix("."))
         except ValueError:
             return None
+
+    @classmethod
+    def from_url(cls, url: str) -> MSFormat | None:
+        """Infer the format from the URL filename extension, or *None*."""
+        return cls.from_path(unquote(urlsplit(url).path))
+
+    @classmethod
+    def from_header(cls, value: str) -> MSFormat:
+        """Parse an ``X-Source-Format`` header value, case-insensitively.
+
+        Raises :class:`ValueError` for an unrecognised value.
+        """
+        return cls(value.strip().lower())
 
 
 @dataclass(frozen=True)
@@ -167,7 +179,7 @@ class MszxExpansion:
         )
         try:
             await asyncio.to_thread(self._extract_to, staging)
-            replace_dir(staging, archive_dir)
+            self._swap_into(staging, archive_dir)
         finally:
             shutil.rmtree(staging, ignore_errors=True)
 
@@ -178,6 +190,27 @@ class MszxExpansion:
             archive_dir,
         )
         return archive_dir
+
+    @staticmethod
+    def _swap_into(staging: Path, target: Path) -> None:
+        """Move directory *staging* to *target*, replacing any existing directory.
+
+        An existing *target* is moved aside first and restored if the swap
+        fails, so *target* is never left half-written.
+        """
+        if not target.exists():
+            staging.rename(target)
+            return
+        if not target.is_dir():
+            raise FileExistsError(f"{target} exists and is not a directory")
+        backup = target.with_name(f".{target.name}.{uuid.uuid4().hex}.old")
+        target.rename(backup)
+        try:
+            staging.rename(target)
+        except BaseException:
+            backup.rename(target)
+            raise
+        shutil.rmtree(backup, ignore_errors=True)
 
     @staticmethod
     def _member_stem(entry: str) -> str:
@@ -224,6 +257,27 @@ class StorePlan:
             )
         return plan
 
+    @classmethod
+    def for_upload(
+        cls,
+        dest_dir: Path,
+        filename: str,
+        source: MSFormat | None,
+        store_as: MSFormat,
+    ) -> StorePlan:
+        """Plan storage for an upload of *filename* into *dest_dir*.
+
+        *source* is the format the client declared, or *None* to infer it
+        from *filename*.  mzML is compressed on the wire, so anything but an
+        .mszx archive arrives as MSZ.  Archives are always kept as-is,
+        whatever *store_as* says.
+        """
+        if source is None:
+            source = MSFormat.from_path(filename)
+        wire = MSFormat.MSZX if source is MSFormat.MSZX else MSFormat.MSZ
+        target = None if wire is MSFormat.MSZX else store_as
+        return cls(dest_dir / f"{Path(filename).stem}{wire.ext}", wire, target)
+
     @property
     def conversion(self) -> Conversion | None:
         """The conversion needed, or *None* if the file is stored as-is."""
@@ -243,6 +297,14 @@ class StorePlan:
     def part_path(self) -> Path:
         """Where the download is streamed before it is finalized."""
         return self.dest.with_suffix(self.dest.suffix + ".part")
+
+    def unique_part_path(self) -> Path:
+        """A :attr:`part_path` variant that concurrent writers never share.
+
+        Two uploads can target the same *dest* (e.g. ``run.msz`` and
+        ``run.mzML`` both arrive as ``run.msz``), so each needs its own file.
+        """
+        return self.dest.with_name(f"{self.dest.name}.{uuid.uuid4().hex}.part")
 
     @property
     def may_expand(self) -> bool:
@@ -296,7 +358,8 @@ class StorePlan:
     async def _convert(self, src: Path, conversion: Conversion) -> Path:
         """Convert *src* into :attr:`final_dest` via a staging file."""
         final_dest = self.final_dest
-        staging = final_dest.with_suffix(final_dest.suffix + ".part")
+        # A unique name, so concurrent conversions to one output never share it.
+        staging = final_dest.with_name(f"{final_dest.name}.{uuid.uuid4().hex}.part")
         try:
             await conversion.run(src, staging)
             staging.replace(final_dest)

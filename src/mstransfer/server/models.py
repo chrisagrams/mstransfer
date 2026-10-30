@@ -9,6 +9,8 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, SerializeAsAny
 
+from mstransfer.store import MSFormat  # noqa: TC001 (Pydantic resolves annotations at runtime)
+
 StoreFormat = Literal["msz", "mzml"]
 
 
@@ -56,7 +58,7 @@ class FileInfo(BaseModel):
 
     name: str
     size_bytes: int
-    format: StoreFormat
+    format: MSFormat
 
 
 class FileListResponse(BaseModel):

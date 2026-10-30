@@ -19,8 +19,13 @@ from mstransfer.client.sender import (
     send_batch,
     send_file,
 )
-from mstransfer.client.utils import ThrottledCallback, resolve_inputs
+from mstransfer.client.utils import (
+    ThrottledCallback,
+    normalize_source,
+    resolve_inputs,
+)
 from mstransfer.server.app import create_app
+from mstransfer.store import MSFormat
 
 # ---------------------------------------------------------------------------
 # resolve_inputs
@@ -82,6 +87,62 @@ class TestResolveInputs:
     def test_no_duplicates(self, sample_files):
         result = resolve_inputs([str(sample_files), str(sample_files)], recursive=True)
         assert len(result) == len(set(result))
+
+    def test_directory_finds_mszx_and_any_case(self, tmp_path):
+        (tmp_path / "a.mszx").write_bytes(b"mszx")
+        (tmp_path / "b.MZML").write_bytes(b"mzml")
+        (tmp_path / "c.MsZ").write_bytes(b"msz")
+        (tmp_path / "d.txt").write_bytes(b"other")
+        result = resolve_inputs([str(tmp_path)])
+        assert [p.name for p in result] == ["a.mszx", "b.MZML", "c.MsZ"]
+
+    def test_directory_skips_matching_subdirectory(self, tmp_path):
+        (tmp_path / "looks_like.msz").mkdir()
+        (tmp_path / "real.msz").write_bytes(b"msz")
+        result = resolve_inputs([str(tmp_path)])
+        assert [p.name for p in result] == ["real.msz"]
+
+
+class TestNormalizeSource:
+    def test_mzml_path(self, test_mzml):
+        path, fmt, mzml_obj = normalize_source(test_mzml)
+        assert (path, fmt) == (test_mzml, MSFormat.MZML)
+        assert isinstance(mzml_obj, MZMLFile)
+
+    def test_msz_path(self, test_msz):
+        assert normalize_source(test_msz) == (test_msz, MSFormat.MSZ, None)
+
+    def test_mszx_path(self, test_mszx):
+        assert normalize_source(test_mszx) == (test_mszx, MSFormat.MSZX, None)
+
+    def test_detects_by_contents_not_extension(self, tmp_path, test_msz):
+        renamed = tmp_path / "data.mzML"
+        renamed.write_bytes(test_msz.read_bytes())
+        assert normalize_source(renamed)[1] is MSFormat.MSZ
+
+    def test_unknown_contents_rejected(self, tmp_path):
+        bogus = tmp_path / "bogus.msz"
+        bogus.write_bytes(b"not ms data")
+        with pytest.raises(ValueError, match="Unsupported file type"):
+            normalize_source(bogus)
+
+    def test_mscompress_objects(self, test_mzml, test_msz):
+        mzml = MZMLFile(str(test_mzml).encode())
+        assert normalize_source(mzml) == (test_mzml, MSFormat.MZML, mzml)
+        msz = MSZFile(str(test_msz).encode())
+        assert normalize_source(msz) == (test_msz, MSFormat.MSZ, None)
+
+    def test_mszxfile_object(self, test_mszx):
+        """MSZXFile subclasses MSZFile but must still be reported as mszx."""
+        mszx = MSZXFile.open(test_mszx)
+        try:
+            assert normalize_source(mszx) == (test_mszx, MSFormat.MSZX, None)
+        finally:
+            mszx.close()
+
+    def test_rejects_unsupported_type(self):
+        with pytest.raises(TypeError, match="Unsupported source type"):
+            normalize_source("not_a_path")  # type: ignore[arg-type]
 
 
 # ---------------------------------------------------------------------------
@@ -330,6 +391,7 @@ class TestSendFile:
         assert result.state == "done"
         assert result.filename == "test.mszx"
         assert result.bytes_received == test_mszx.stat().st_size
+        assert Path(result.stored_as).name == "test.mszx"
         mszx.close()
 
     def test_send_file_rejects_invalid_type(self, _live_server):

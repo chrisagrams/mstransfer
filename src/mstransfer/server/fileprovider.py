@@ -4,18 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import os
-from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
+    from pathlib import Path
 
-from mstransfer.server.models import FileInfo, StoreFormat
-
-VALID_EXTENSIONS: dict[str, StoreFormat] = {
-    ".msz": "msz",
-    ".mzml": "mzml",
-}
+from mstransfer.server.models import FileInfo
+from mstransfer.store import MSFormat
 
 
 @runtime_checkable
@@ -33,13 +29,13 @@ class FileProvider(Protocol):
 
 
 class DirectoryFileProvider:
-    """Default provider — scans a directory for .msz/.mzML files."""
+    """Default provider — scans a directory for .msz/.mszx/.mzML files."""
 
     def __init__(self, directory: Path) -> None:
         self._directory = directory
 
     async def list_files(self) -> Sequence[FileInfo]:
-        """Return metadata for every .msz / .mzML file in the directory."""
+        """Return metadata for every .msz / .mszx / .mzML file in the directory."""
         return await asyncio.to_thread(self._scan)
 
     async def get_file(self, filename: str) -> Path | None:
@@ -68,8 +64,7 @@ class DirectoryFileProvider:
         for entry in os.scandir(self._directory):
             if not entry.is_file():
                 continue
-            ext = Path(entry.name).suffix.lower()
-            fmt = VALID_EXTENSIONS.get(ext)
+            fmt = MSFormat.from_path(entry.name)
             if fmt is None:
                 continue
             results.append(
