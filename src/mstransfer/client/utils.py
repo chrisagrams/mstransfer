@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import shutil
+import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -75,6 +77,27 @@ async def optional_client(
     else:
         async with httpx.AsyncClient(**kwargs) as c:
             yield c
+
+
+def replace_dir(staging: Path, target: Path) -> None:
+    """Move directory *staging* to *target*, replacing any existing directory.
+
+    An existing *target* is moved aside first and restored if the swap
+    fails, so *target* is never left half-written.
+    """
+    if not target.exists():
+        staging.rename(target)
+        return
+    if not target.is_dir():
+        raise FileExistsError(f"{target} exists and is not a directory")
+    backup = target.with_name(f".{target.name}.{uuid.uuid4().hex}.old")
+    target.rename(backup)
+    try:
+        staging.rename(target)
+    except BaseException:
+        backup.rename(target)
+        raise
+    shutil.rmtree(backup, ignore_errors=True)
 
 
 async def async_iter_from_sync(

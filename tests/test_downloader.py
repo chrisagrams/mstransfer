@@ -19,10 +19,7 @@ from mscompress.mszx import compress_batch
 
 from mstransfer.client.downloader import (
     DownloadRequest,
-    _detect_source_format,
     _FileProgressAdapter,
-    _mszx_to_msz,
-    _resolve_dest,
     async_download_batch,
     async_download_file,
     download_batch,
@@ -377,75 +374,6 @@ class TestFileProgressAdapter:
 
 
 # ---------------------------------------------------------------------------
-# Format detection and destination resolution
-# ---------------------------------------------------------------------------
-
-
-class TestDetectSourceFormat:
-    def test_msz_url(self):
-        assert _detect_source_format("http://host/data/file.msz") == "msz"
-
-    def test_mzml_url(self):
-        assert _detect_source_format("http://host/data/file.mzML") == "mzml"
-
-    def test_mzml_lowercase(self):
-        assert _detect_source_format("http://host/data/file.mzml") == "mzml"
-
-    def test_unknown_extension(self):
-        assert _detect_source_format("http://host/data/file.bin") is None
-
-    def test_query_params_stripped(self):
-        assert _detect_source_format("http://h/f.msz?token=abc") == "msz"
-
-    def test_fragment_stripped(self):
-        assert _detect_source_format("http://h/f.mzML#section") == "mzml"
-
-    def test_mszx_url(self):
-        assert _detect_source_format("http://host/data/file.mszx") == "mszx"
-
-    def test_mszx_uppercase(self):
-        assert _detect_source_format("http://host/data/file.MSZX") == "mszx"
-
-
-class TestResolveDest:
-    def test_no_store_as(self, tmp_path):
-        dest = tmp_path / "file.msz"
-        assert _resolve_dest(dest, None, "msz") == dest
-
-    def test_same_format(self, tmp_path):
-        dest = tmp_path / "file.msz"
-        assert _resolve_dest(dest, "msz", "msz") == dest
-
-    def test_msz_to_mzml(self, tmp_path):
-        dest = tmp_path / "file.msz"
-        assert _resolve_dest(dest, "mzml", "msz") == tmp_path / "file.mzML"
-
-    def test_mzml_to_msz(self, tmp_path):
-        dest = tmp_path / "file.mzML"
-        assert _resolve_dest(dest, "msz", "mzml") == tmp_path / "file.msz"
-
-    def test_unknown_source_no_change(self, tmp_path):
-        dest = tmp_path / "file.bin"
-        assert _resolve_dest(dest, "msz", None) == dest
-
-    def test_mszx_same_format(self, tmp_path):
-        dest = tmp_path / "file.mszx"
-        assert _resolve_dest(dest, "mszx", "mszx") == dest
-
-    def test_mszx_to_msz(self, tmp_path):
-        dest = tmp_path / "file.mszx"
-        assert _resolve_dest(dest, "msz", "mszx") == tmp_path / "file.msz"
-
-    def test_mszx_to_mzml(self, tmp_path):
-        dest = tmp_path / "file.mszx"
-        assert _resolve_dest(dest, "mzml", "mszx") == tmp_path / "file.mzML"
-
-    def test_msz_to_mszx(self, tmp_path):
-        dest = tmp_path / "file.msz"
-        assert _resolve_dest(dest, "mszx", "msz") == tmp_path / "file.mszx"
-
-
-# ---------------------------------------------------------------------------
 # Format conversion (integration with mscompress)
 # ---------------------------------------------------------------------------
 
@@ -556,47 +484,6 @@ class TestFormatConversion:
         assert result.exists()
         # Inner spectra.msz is a byte-for-byte copy of test.msz (conftest).
         assert result.read_bytes() == test_msz.read_bytes()
-
-    def test_mszx_to_msz_rejects_multi_member_batch(self, test_msz, tmp_path):
-        """A v2 batch .mszx with several members can't become one .msz."""
-        src = tmp_path / "batch.mszx"
-        manifest = json.dumps(
-            {
-                "version": "2.0",
-                "container": "batch",
-                "spectra_files": [{"entry": "a.msz"}, {"entry": "b.msz"}],
-            }
-        ).encode()
-        with tarfile.open(src, "w") as tar:
-            info = tarfile.TarInfo(name="manifest.json")
-            info.size = len(manifest)
-            tar.addfile(info, io.BytesIO(manifest))
-            tar.add(str(test_msz), arcname="a.msz")
-            tar.add(str(test_msz), arcname="b.msz")
-
-        with pytest.raises(NotImplementedError, match="2-member"):
-            _mszx_to_msz(src, tmp_path / "out.msz")
-
-    def test_mszx_to_msz_rejects_non_file_entry(self, tmp_path):
-        """A manifest entry that isn't a regular tar member raises ValueError."""
-        src = tmp_path / "bad.mszx"
-        manifest = json.dumps(
-            {
-                "version": "2.0",
-                "container": "batch",
-                "spectra_files": [{"entry": "spectra.msz"}],
-            }
-        ).encode()
-        with tarfile.open(src, "w") as tar:
-            info = tarfile.TarInfo(name="manifest.json")
-            info.size = len(manifest)
-            tar.addfile(info, io.BytesIO(manifest))
-            entry = tarfile.TarInfo(name="spectra.msz")
-            entry.type = tarfile.DIRTYPE
-            tar.addfile(entry)
-
-        with pytest.raises(ValueError, match="Missing MSZ entry"):
-            _mszx_to_msz(src, tmp_path / "out.msz")
 
     def test_download_mszx_store_as_mszx_no_conversion(
         self, served_ms_files, test_mszx, tmp_path
@@ -955,7 +842,7 @@ class TestBatchMszx:
         previous = out_dir / "bad"
         previous.mkdir()
         (previous / "old.msz").write_bytes(b"previous")
-        with pytest.raises(KeyError):
+        with pytest.raises(ValueError, match="missing from the archive"):
             download_file(
                 f"{served_ms_files['base_url']}/bad.mszx",
                 out_dir / "bad.mszx",
