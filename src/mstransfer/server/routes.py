@@ -108,11 +108,9 @@ def make_router(
 
             - X-Source-Format: ``mzML``, ``msz`` or ``mszx``.  Inferred from
               the filename extension when absent.
-            - X-Overwrite: ``true`` to replace a file already stored under
-              the same name.
 
         Responds 409 Conflict, before reading the body, if the output file
-        already exists (without X-Overwrite) or another transfer is writing it.
+        already exists or another transfer is writing it.
 
         The server will stream the incoming data to a file, update the transfer registry
         with the progress, and optionally decompress if configured to do so.  MSZX
@@ -149,17 +147,14 @@ def make_router(
             state.output_dir, original_filename, source, MSFormat(state.store_as)
         )
 
-        # Refuse an upload that would replace a stored file, unless asked to,
-        # before any of the body is read.
-        overwrite = request.headers.get("X-Overwrite", "").strip().lower() == "true"
+        # Refuse an upload that would replace a stored file, or one another
+        # transfer is still writing, before any of the body is read.
         existing = plan.existing()
-        if existing is not None and not overwrite:
+        if existing is not None:
             raise HTTPException(
                 status_code=409,
-                detail=f"{existing.name} already exists on the server "
-                "(upload with overwrite to replace it)",
+                detail=f"{existing.name} already exists on the server",
             )
-        # Never let two transfers write the same file, even with overwrite.
         dest = plan.final_dest
         if not state.outputs.claim(dest):
             raise HTTPException(

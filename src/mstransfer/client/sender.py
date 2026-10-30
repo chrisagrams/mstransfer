@@ -58,7 +58,6 @@ async def async_send_file(
     chunk_size: int = 1_048_576,
     api_key: str | None = None,
     client: httpx.AsyncClient | None = None,
-    overwrite: bool = False,
 ) -> UploadResponse:
     """Send a single file to the mstransfer listener (async).
 
@@ -99,8 +98,6 @@ async def async_send_file(
     }
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
-    if overwrite:
-        headers["X-Overwrite"] = "true"
 
     # Send the POST request with streaming upload and handle the response.
     async with optional_client(
@@ -204,7 +201,6 @@ async def async_send_batch(
     progress: BatchProgressCallback | None = None,
     api_key: str | None = None,
     client: httpx.AsyncClient | None = None,
-    overwrite: bool = False,
 ) -> list[FileResult]:
     """Send multiple files with configurable parallelism (async)."""
     workers = min(parallel, len(sources))
@@ -254,7 +250,6 @@ async def async_send_batch(
                     chunk_size=chunk_size,
                     api_key=api_key,
                     client=client,
-                    overwrite=overwrite,
                 )
                 results[idx] = FileResult(filename=fpath.name, response=result)
                 if progress:
@@ -278,7 +273,6 @@ def send_file(
     chunk_size: int = 1_048_576,
     api_key: str | None = None,
     client: httpx.AsyncClient | None = None,
-    overwrite: bool = False,
 ) -> UploadResponse:
     """Send a single file to the mstransfer listener.
 
@@ -296,7 +290,6 @@ def send_file(
             chunk_size=chunk_size,
             api_key=api_key,
             client=client,
-            overwrite=overwrite,
         )
     )
 
@@ -309,7 +302,6 @@ def send_batch(
     progress: BatchProgressCallback | None = None,
     api_key: str | None = None,
     client: httpx.AsyncClient | None = None,
-    overwrite: bool = False,
 ) -> list[FileResult]:
     """Send multiple files with configurable parallelism.
 
@@ -324,6 +316,5 @@ def send_batch(
             progress=progress,
             api_key=api_key,
             client=client,
-            overwrite=overwrite,
         )
     )

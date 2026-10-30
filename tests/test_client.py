@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import shutil
 import threading
 import time
 from pathlib import Path
@@ -312,14 +313,6 @@ class TestSendFile:
             send_file(test_msz, _live_server["base_url"])
         assert stored.read_bytes() == b"stored earlier"
 
-    def test_send_file_overwrite(self, test_msz, _live_server):
-        """overwrite=True replaces a file the server already stores."""
-        stored = _live_server["output_dir"] / "test.msz"
-        stored.write_bytes(b"stored earlier")
-        result = send_file(test_msz, _live_server["base_url"], overwrite=True)
-        assert result.state == "done"
-        assert stored.read_bytes() == test_msz.read_bytes()
-
     def test_send_file_progress_callback(self, test_msz, _live_server):
         """Progress callback should be invoked with byte deltas."""
         deltas = []
@@ -351,7 +344,7 @@ class TestSendFile:
         assert result.state == "done"
         assert result.bytes_received > 0
 
-    def test_chunk_size_affects_generator(self, test_msz, _live_server):
+    def test_chunk_size_affects_generator(self, test_msz, _live_server, tmp_path):
         """Both small and large chunk sizes should transfer the full file."""
         small_deltas: list[int] = []
         send_file(
@@ -360,13 +353,15 @@ class TestSendFile:
             progress_callback=small_deltas.append,
             chunk_size=256,
         )
+        # A second name, so the server doesn't refuse it as a duplicate.
+        copy = tmp_path / "copy.msz"
+        shutil.copyfile(test_msz, copy)
         large_deltas: list[int] = []
         send_file(
-            test_msz,
+            copy,
             _live_server["base_url"],
             progress_callback=large_deltas.append,
             chunk_size=1_048_576,
-            overwrite=True,
         )
         # Both should transfer the full file regardless of chunk size
         assert sum(small_deltas) == test_msz.stat().st_size

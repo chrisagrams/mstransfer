@@ -62,7 +62,6 @@ mstransfer upload <paths...> <host[:port]> [--recursive] [--parallel 4]
 |------|---------|-------------|
 | `--recursive`, `-r` | off | Recurse into directories |
 | `--parallel`, `-p` | `4` | Number of concurrent uploads |
-| `--overwrite` | off | Replace files the server already stores under the same name |
 
 Supported file types: `.mzML`, `.msz`, `.mszx`.
 
@@ -71,7 +70,7 @@ Supported file types: `.mzML`, `.msz`, `.mszx`.
 
 The client sends the format in an `X-Source-Format` header (`mzML`, `msz` or `mszx`). The server stores `.mszx` uploads untouched as `<stem>.mszx`, whatever `--store-as` says.
 
-The server names each stored file after the upload's stem, so `run1.mzML` and `run1.msz` both become `run1.msz`. It refuses an upload with **409 Conflict** if that output file already exists, unless the client sends `X-Overwrite: true` (`--overwrite`), and always refuses one whose output another transfer is still writing. The refused file counts as failed, and the CLI exits non-zero.
+The server names each stored file after the upload's stem, so `run1.mzML` and `run1.msz` both become `run1.msz`. It refuses an upload with **409 Conflict** if that output file already exists or another transfer is still writing it. The refused file counts as failed, and the CLI exits non-zero.
 
 ## Programmatic access
 

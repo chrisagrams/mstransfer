@@ -506,27 +506,10 @@ async def test_upload_same_stem_different_format_rejected(msz_client, test_msz):
 
 
 @pytest.mark.asyncio
-async def test_upload_overwrite_header_replaces_stored_file(
-    msz_client, tmp_output, test_msz
-):
-    """X-Overwrite: true opts in to replacing an existing file."""
-    stored = tmp_output / "test.msz"
-    stored.write_bytes(b"stored earlier")
-    resp = await msz_client.post(
-        "/v1/upload",
-        content=test_msz.read_bytes(),
-        headers=_upload_headers("overwrite", "test.msz", **{"X-Overwrite": "true"}),
-    )
-    assert resp.status_code == 200
-    assert resp.json()["state"] == "done"
-    assert stored.read_bytes() == test_msz.read_bytes()
-
-
-@pytest.mark.asyncio
 async def test_upload_conflicting_with_in_flight_transfer_rejected(
     msz_client, tmp_output, test_msz
 ):
-    """Two concurrent uploads to one output can't interleave, even with overwrite."""
+    """Two concurrent uploads to one output can't interleave."""
     payload = test_msz.read_bytes()
     release = asyncio.Event()
 
@@ -552,7 +535,7 @@ async def test_upload_conflicting_with_in_flight_transfer_rejected(
     second = await msz_client.post(
         "/v1/upload",
         content=payload,
-        headers=_upload_headers("racing", "run1.msz", **{"X-Overwrite": "true"}),
+        headers=_upload_headers("racing", "run1.msz"),
     )
     assert second.status_code == 409
     assert "already being written" in second.json()["detail"]
@@ -562,11 +545,12 @@ async def test_upload_conflicting_with_in_flight_transfer_rejected(
     assert first_resp.json()["state"] == "done"
     assert (tmp_output / "run1.msz").read_bytes() == payload
 
-    # Once the first transfer finishes, its output can be overwritten again.
+    # The claim is released once the first transfer finishes.
+    (tmp_output / "run1.msz").unlink()
     third = await msz_client.post(
         "/v1/upload",
         content=payload,
-        headers=_upload_headers("after", "run1.msz", **{"X-Overwrite": "true"}),
+        headers=_upload_headers("after", "run1.msz"),
     )
     assert third.json()["state"] == "done"
 

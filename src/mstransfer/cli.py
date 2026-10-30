@@ -169,7 +169,6 @@ def cmd_upload(args: argparse.Namespace) -> None:
                 progress=display,
                 api_key=args.api_key,
                 client=client,
-                overwrite=args.overwrite,
             )
 
     with Live(display.table, console=console, refresh_per_second=10):
@@ -335,11 +334,6 @@ def main() -> None:
         "--api-key",
         default=None,
         help="API key for authenticating with the server",
-    )
-    sp.add_argument(
-        "--overwrite",
-        action="store_true",
-        help="Replace files the server already stores under the same name",
     )
     sp.set_defaults(func=cmd_upload)
 
