@@ -272,6 +272,32 @@ class TestStorePlan:
             is None
         )
 
+    @pytest.mark.asyncio
+    async def test_finalize_conversion_temp_name(
+        self, test_msz, tmp_path, monkeypatch, caplog
+    ):
+        """The conversion source is a hidden temp file, not ``run.msz.msz``."""
+        plan = StorePlan(tmp_path / "run.msz", MSFormat.MSZ, MSFormat.MZML)
+        part = plan.part_path
+        part.write_bytes(test_msz.read_bytes())
+        seen: list[str] = []
+        original_run = Conversion.run
+
+        async def spy_run(self, src, dst):
+            seen.append(src.name)
+            await original_run(self, src, dst)
+
+        monkeypatch.setattr(Conversion, "run", spy_run)
+        with caplog.at_level("INFO", logger="mstransfer.store"):
+            result = await plan.finalize(part)
+
+        assert result == tmp_path / "run.mzML"
+        (src_name,) = seen
+        assert src_name.startswith(".run.")
+        assert src_name.endswith(".msz")
+        assert [p.name for p in tmp_path.iterdir()] == ["run.mzML"]
+        assert "Converted run.msz → run.mzML" in caplog.text
+
 
 class TestMszxExpansion:
     def test_targets_use_entry_stem_and_target_ext(self, tmp_path):
