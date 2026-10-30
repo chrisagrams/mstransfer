@@ -769,7 +769,7 @@ class TestBatchMszx:
         assert list(out_dir.iterdir()) == []
 
     def test_member_dirs_are_stripped(self, served_ms_files, test_msz, tmp_path):
-        """Directory parts of entry names, "/" or "\\", never escape the dir."""
+        r"""Directory parts of entry names, "/" or "\", never escape the dir."""
         _write_batch_mszx(
             served_ms_files["serve_dir"] / "nested.mszx",
             {"../x.msz": test_msz, "sub/y.msz": test_msz, "..\\w.msz": test_msz},

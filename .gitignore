@@ -19,3 +19,5 @@ received/
 # OS generated files
 .DS_Store
 Thumbs.db
+# Docs build output
+site/

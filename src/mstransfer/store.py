@@ -23,14 +23,14 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Output formats callers can request via ``store_as``.
+# Output formats callers can request via `store_as`.
 DownloadFormat = Literal["msz", "mzml", "mszx"]
 
 
 class MSFormat(StrEnum):
     """An on-disk MS data format.
 
-    Members compare equal to their ``DownloadFormat`` string values.
+    Members compare equal to their `DownloadFormat` string values.
     """
 
     MSZ = "msz"
@@ -59,9 +59,9 @@ class MSFormat(StrEnum):
 
     @classmethod
     def from_header(cls, value: str) -> MSFormat:
-        """Parse an ``X-Source-Format`` header value, case-insensitively.
+        """Parse an `X-Source-Format` header value, case-insensitively.
 
-        Raises :class:`ValueError` for an unrecognised value.
+        Raises `ValueError` for an unrecognised value.
         """
         return cls(value.strip().lower())
 
@@ -124,8 +124,8 @@ class Conversion:
 class MszxExpansion:
     """Writes every member of a multi-member .mszx into one directory.
 
-    Each spectra *entry* of *src* becomes ``<entry stem>.<ext>`` stored as
-    *target* (:attr:`MSFormat.MSZ` or :attr:`MSFormat.MZML`).
+    Each spectra *entry* of *src* becomes `<entry stem>.<ext>` stored as
+    *target* (`MSFormat.MSZ` or `MSFormat.MZML`).
     """
 
     src: Path
@@ -136,7 +136,7 @@ class MszxExpansion:
     def targets(self) -> list[tuple[str, str]]:
         """Map each spectra entry to an output file name.
 
-        Raises :class:`ValueError` for unsafe names, or if two entries map
+        Raises `ValueError` for unsafe names, or if two entries map
         to the same output name.
         """
         targets: list[tuple[str, str]] = []
@@ -216,7 +216,7 @@ class MszxExpansion:
     def _member_stem(entry: str) -> str:
         """Return the output stem for archive *entry*, without any directory part.
 
-        Raises :class:`ValueError` for names that would be empty or hidden.
+        Raises `ValueError` for names that would be empty or hidden.
         """
         # PureWindowsPath splits on both "/" and "\\", so no entry can name a
         # path outside the archive directory on any platform.
@@ -233,8 +233,8 @@ class StorePlan:
     """How a file downloaded to *dest* ends up on disk.
 
     *source* is the format of the downloaded bytes (or *None* if unknown)
-    and *target* the requested ``store_as`` format (or *None* to keep the
-    file as-is).  Build one with :meth:`for_download` to also validate the
+    and *target* the requested `store_as` format (or *None* to keep the
+    file as-is).  Build one with `for_download` to also validate the
     combination before any I/O.
     """
 
@@ -299,10 +299,10 @@ class StorePlan:
         return self.dest.with_suffix(self.dest.suffix + ".part")
 
     def unique_part_path(self) -> Path:
-        """A :attr:`part_path` variant that concurrent writers never share.
+        """A `part_path` variant that concurrent writers never share.
 
-        Two uploads can target the same *dest* (e.g. ``run.msz`` and
-        ``run.mzML`` both arrive as ``run.msz``), so each needs its own file.
+        Two uploads can target the same *dest* (e.g. `run.msz` and
+        `run.mzML` both arrive as `run.msz`), so each needs its own file.
         """
         return self.dest.with_name(f"{self.dest.name}.{uuid.uuid4().hex}.part")
 
@@ -333,7 +333,7 @@ class StorePlan:
         """Move or convert the downloaded *part* file into its final form.
 
         Returns the final destination, or the archive directory for a
-        multi-member ``.mszx``.
+        multi-member `.mszx`.
         """
         conversion = self.conversion
         if conversion is None:
@@ -356,7 +356,7 @@ class StorePlan:
             src.unlink(missing_ok=True)
 
     async def _convert(self, src: Path, conversion: Conversion) -> Path:
-        """Convert *src* into :attr:`final_dest` via a staging file."""
+        """Convert *src* into `final_dest` via a staging file."""
         final_dest = self.final_dest
         # A unique name, so concurrent conversions to one output never share it.
         staging = final_dest.with_name(f"{final_dest.name}.{uuid.uuid4().hex}.part")

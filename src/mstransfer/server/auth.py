@@ -35,7 +35,7 @@ class NoAuthProvider:
 
 
 class APIKeyAuthProvider:
-    """Validates ``Authorization: Bearer <key>`` or ``?api_key=`` query param."""
+    """Validates `Authorization: Bearer <key>` or `?api_key=` query param."""
 
     def __init__(self, api_key: str) -> None:
         self._api_key = api_key

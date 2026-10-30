@@ -53,7 +53,7 @@ class FileInfo(BaseModel):
 
     Subclass this to add provider-specific fields (e.g. checksum, URL,
     upload timestamp).  Extra fields are preserved in the API response
-    thanks to :pydantic:`SerializeAsAny` on :class:`FileListResponse`.
+    thanks to `SerializeAsAny` on `FileListResponse`.
     """
 
     name: str
