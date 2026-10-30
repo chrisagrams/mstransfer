@@ -66,27 +66,6 @@ class MSFormat(StrEnum):
         return cls(value.strip().lower())
 
 
-def replace_dir(staging: Path, target: Path) -> None:
-    """Move directory *staging* to *target*, replacing any existing directory.
-
-    An existing *target* is moved aside first and restored if the swap
-    fails, so *target* is never left half-written.
-    """
-    if not target.exists():
-        staging.rename(target)
-        return
-    if not target.is_dir():
-        raise FileExistsError(f"{target} exists and is not a directory")
-    backup = target.with_name(f".{target.name}.{uuid.uuid4().hex}.old")
-    target.rename(backup)
-    try:
-        staging.rename(target)
-    except BaseException:
-        backup.rename(target)
-        raise
-    shutil.rmtree(backup, ignore_errors=True)
-
-
 @dataclass(frozen=True)
 class Conversion:
     """Turning a *source*-format file into a *target*-format file."""
@@ -200,7 +179,7 @@ class MszxExpansion:
         )
         try:
             await asyncio.to_thread(self._extract_to, staging)
-            replace_dir(staging, archive_dir)
+            self._swap_into(staging, archive_dir)
         finally:
             shutil.rmtree(staging, ignore_errors=True)
 
@@ -211,6 +190,27 @@ class MszxExpansion:
             archive_dir,
         )
         return archive_dir
+
+    @staticmethod
+    def _swap_into(staging: Path, target: Path) -> None:
+        """Move directory *staging* to *target*, replacing any existing directory.
+
+        An existing *target* is moved aside first and restored if the swap
+        fails, so *target* is never left half-written.
+        """
+        if not target.exists():
+            staging.rename(target)
+            return
+        if not target.is_dir():
+            raise FileExistsError(f"{target} exists and is not a directory")
+        backup = target.with_name(f".{target.name}.{uuid.uuid4().hex}.old")
+        target.rename(backup)
+        try:
+            staging.rename(target)
+        except BaseException:
+            backup.rename(target)
+            raise
+        shutil.rmtree(backup, ignore_errors=True)
 
     @staticmethod
     def _member_stem(entry: str) -> str:
