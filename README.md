@@ -70,6 +70,8 @@ Supported file types: `.mzML`, `.msz`, `.mszx`.
 
 The client sends the format in an `X-Source-Format` header (`mzML`, `msz` or `mszx`). The server stores `.mszx` uploads untouched as `<stem>.mszx`, whatever `--store-as` says.
 
+The server names each stored file after the upload's stem, so `run1.mzML` and `run1.msz` both become `run1.msz`. It refuses an upload with **409 Conflict** if that output file already exists or another transfer is still writing it. The refused file counts as failed, and the CLI exits non-zero.
+
 ## Programmatic access
 
 You can use mstransfer as a library to send files from your own Python code:

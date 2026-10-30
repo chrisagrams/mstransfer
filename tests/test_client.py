@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import shutil
 import threading
 import time
 from pathlib import Path
 from unittest.mock import patch
 
+import httpx
 import pytest
 import uvicorn
 from mscompress import MSZFile, MZMLFile
@@ -303,6 +305,15 @@ class TestSendFile:
         assert mzml_out.exists()
         assert mzml_out.stat().st_size == test_mzml.stat().st_size
 
+    def test_send_file_conflict_raises(self, test_msz, _live_server):
+        """A 409 from the server raises; nothing is replaced."""
+        stored = _live_server["output_dir"] / "test.msz"
+        stored.write_bytes(b"stored earlier")
+        with pytest.raises(httpx.HTTPStatusError) as exc_info:
+            send_file(test_msz, _live_server["base_url"])
+        assert exc_info.value.response.status_code == 409
+        assert stored.read_bytes() == b"stored earlier"
+
     def test_send_file_progress_callback(self, test_msz, _live_server):
         """Progress callback should be invoked with byte deltas."""
         deltas = []
@@ -334,7 +345,7 @@ class TestSendFile:
         assert result.state == "done"
         assert result.bytes_received > 0
 
-    def test_chunk_size_affects_generator(self, test_msz, _live_server):
+    def test_chunk_size_affects_generator(self, test_msz, _live_server, tmp_path):
         """Both small and large chunk sizes should transfer the full file."""
         small_deltas: list[int] = []
         send_file(
@@ -343,9 +354,12 @@ class TestSendFile:
             progress_callback=small_deltas.append,
             chunk_size=256,
         )
+        # A second name, so the server doesn't refuse it as a duplicate.
+        copy = tmp_path / "copy.msz"
+        shutil.copyfile(test_msz, copy)
         large_deltas: list[int] = []
         send_file(
-            test_msz,
+            copy,
             _live_server["base_url"],
             progress_callback=large_deltas.append,
             chunk_size=1_048_576,
@@ -448,10 +462,10 @@ class TestSendBatch:
         result_names = {r.filename for r in results}
         assert result_names == {f.name for f in files}
 
-    def test_mixed_msz_and_mzml(self, test_msz, test_mzml, _live_server):
+    def test_mixed_msz_and_mzml(self, test_msz, other_mzml, _live_server):
         """send_batch handles a mix of .msz and .mzML files."""
         results = send_batch(
-            [test_msz, test_mzml],
+            [test_msz, other_mzml],
             _live_server["base_url"],
             parallel=2,
         )
@@ -482,6 +496,21 @@ class TestSendBatch:
         assert r.error is not None
         assert "server exploded" in r.error
         assert r.filename == "test.msz"
+
+    def test_same_stem_conflict_is_per_file_error(
+        self, test_msz, test_mzml, _live_server
+    ):
+        """test.msz and test.mzML collide; one succeeds and the other fails."""
+        results = send_batch(
+            [test_msz, test_mzml],
+            _live_server["base_url"],
+            parallel=1,
+        )
+        assert results[0].response is not None
+        assert results[0].response.state == "done"
+        assert results[1].response is None
+        assert results[1].error is not None
+        assert "409 Conflict" in results[1].error
 
     def test_partial_failure(self, test_msz, _live_server, tmp_path):
         """One failure does not prevent other files from succeeding."""
@@ -544,10 +573,10 @@ class TestSendBatch:
             _, kwargs = mock_send.call_args
             assert kwargs["chunk_size"] == 4096
 
-    def test_batch_with_mscompress_objects(self, test_msz, test_mzml, _live_server):
+    def test_batch_with_mscompress_objects(self, test_msz, other_mzml, _live_server):
         """send_batch accepts MSZFile and MZMLFile objects."""
         msz = MSZFile(str(test_msz).encode())
-        mzml = MZMLFile(str(test_mzml).encode())
+        mzml = MZMLFile(str(other_mzml).encode())
         results = send_batch(
             [msz, mzml],
             _live_server["base_url"],
@@ -558,9 +587,9 @@ class TestSendBatch:
             assert r.response is not None
             assert r.response.state == "done"
 
-    def test_batch_mixed_paths_and_objects(self, test_msz, test_mzml, _live_server):
+    def test_batch_mixed_paths_and_objects(self, test_msz, other_mzml, _live_server):
         """send_batch accepts a mix of Path and mscompress objects."""
-        mzml = MZMLFile(str(test_mzml).encode())
+        mzml = MZMLFile(str(other_mzml).encode())
         results = send_batch(
             [test_msz, mzml],
             _live_server["base_url"],
@@ -568,7 +597,7 @@ class TestSendBatch:
         )
         assert len(results) == 2
         names = {r.filename for r in results}
-        assert names == {"test.msz", "test.mzML"}
+        assert names == {"test.msz", "other.mzML"}
         for r in results:
             assert r.response is not None
             assert r.response.state == "done"
@@ -705,10 +734,10 @@ class TestAsyncSendBatch:
             assert r.response is not None
             assert r.response.state == "done"
 
-    async def test_mixed_msz_and_mzml(self, test_msz, test_mzml, _live_server):
+    async def test_mixed_msz_and_mzml(self, test_msz, other_mzml, _live_server):
         """async_send_batch handles a mix of .msz and .mzML files."""
         results = await async_send_batch(
-            [test_msz, test_mzml],
+            [test_msz, other_mzml],
             _live_server["base_url"],
             parallel=2,
         )
