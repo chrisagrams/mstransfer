@@ -175,3 +175,29 @@ async def async_file_chunk_generator(
         if callback:
             callback(len(chunk))
         yield chunk
+
+
+async def async_file_range_generator(
+    file_path: Path,
+    offset: int,
+    length: int,
+    chunk_size: int = 1_048_576,
+    callback: Callable[[int], None] | None = None,
+) -> AsyncIterator[bytes]:
+    """Read *length* bytes of a file starting at *offset* as an async iterator."""
+
+    def _read_chunks() -> Iterator[bytes]:
+        with open(file_path, "rb") as f:
+            f.seek(offset)
+            remaining = length
+            while remaining > 0:
+                chunk = f.read(min(chunk_size, remaining))
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+                yield chunk
+
+    async for chunk in async_iter_from_sync(_read_chunks()):
+        if callback:
+            callback(len(chunk))
+        yield chunk
