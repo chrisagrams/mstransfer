@@ -9,13 +9,13 @@ import time
 from pathlib import Path
 from unittest.mock import patch
 
+import httpx
 import pytest
 import uvicorn
 from mscompress import MSZFile, MZMLFile
 from mscompress.mszx import MSZXFile
 
 from mstransfer.client.sender import (
-    UploadConflictError,
     async_send_batch,
     async_send_file,
     send_batch,
@@ -305,14 +305,13 @@ class TestSendFile:
         assert mzml_out.exists()
         assert mzml_out.stat().st_size == test_mzml.stat().st_size
 
-    def test_send_file_conflict_reports_server_detail(self, test_msz, _live_server):
-        """A 409 from the server surfaces with its message; nothing is replaced."""
+    def test_send_file_conflict_raises(self, test_msz, _live_server):
+        """A 409 from the server raises; nothing is replaced."""
         stored = _live_server["output_dir"] / "test.msz"
         stored.write_bytes(b"stored earlier")
-        with pytest.raises(UploadConflictError) as exc_info:
+        with pytest.raises(httpx.HTTPStatusError) as exc_info:
             send_file(test_msz, _live_server["base_url"])
-        assert exc_info.value.conflict.filename == "test.msz"
-        assert "409 Conflict: test.msz already exists" in str(exc_info.value)
+        assert exc_info.value.response.status_code == 409
         assert stored.read_bytes() == b"stored earlier"
 
     def test_send_file_progress_callback(self, test_msz, _live_server):
@@ -511,7 +510,7 @@ class TestSendBatch:
         assert results[0].response.state == "done"
         assert results[1].response is None
         assert results[1].error is not None
-        assert "409 Conflict: test.msz already exists" in results[1].error
+        assert "409 Conflict" in results[1].error
 
     def test_partial_failure(self, test_msz, _live_server, tmp_path):
         """One failure does not prevent other files from succeeding."""

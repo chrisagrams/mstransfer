@@ -23,12 +23,7 @@ from mstransfer.client.utils import (
     normalize_source,
     optional_client,
 )
-from mstransfer.server.models import (
-    TransferRecord,
-    TransferState,
-    UploadConflict,
-    UploadResponse,
-)
+from mstransfer.server.models import TransferRecord, TransferState, UploadResponse
 
 logger = logging.getLogger(__name__)
 
@@ -44,18 +39,6 @@ class BatchProgressCallback(Protocol):
     def file_progress(self, index: int, delta: int) -> None: ...
     def file_done(self, index: int, result: UploadResponse) -> None: ...
     def file_error(self, index: int, exc: Exception) -> None: ...
-
-
-class UploadConflictError(httpx.HTTPStatusError):
-    """The server refused an upload because its output file is taken."""
-
-    def __init__(self, conflict: UploadConflict, response: httpx.Response) -> None:
-        super().__init__(
-            f"{response.status_code} {response.reason_phrase}: {conflict.detail}",
-            request=response.request,
-            response=response,
-        )
-        self.conflict = conflict
 
 
 @dataclass
@@ -125,9 +108,6 @@ async def async_send_file(
             headers=headers,
             content=stream,
         )
-        if resp.status_code == 409:
-            conflict = UploadConflict.model_validate_json(resp.content)
-            raise UploadConflictError(conflict, resp)
         resp.raise_for_status()
         upload_result = UploadResponse.model_validate(resp.json())
 

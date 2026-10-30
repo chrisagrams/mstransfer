@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Any
 import aiofiles
 import aiofiles.os
 from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import StreamingResponse
 
 from mstransfer import __version__
 from mstransfer.server.models import (
@@ -14,7 +14,6 @@ from mstransfer.server.models import (
     HealthResponse,
     TransferRecord,
     TransferState,
-    UploadConflict,
     UploadResponse,
 )
 from mstransfer.store import MSFormat, StorePlan
@@ -96,15 +95,8 @@ def make_router(
             raise HTTPException(status_code=404, detail="Transfer not found")
         return record
 
-    @router.post(
-        "/upload",
-        response_model=UploadResponse,
-        responses={409: {"model": UploadConflict}},
-        dependencies=protected,
-    )
-    async def upload(
-        request: Request, state: AppState = state_dep
-    ) -> UploadResponse | JSONResponse:
+    @router.post("/upload", response_model=UploadResponse, dependencies=protected)
+    async def upload(request: Request, state: AppState = state_dep) -> UploadResponse:
         """
         Endpoint to handle file uploads. Expects the file content in the request body
         and requires the following headers:
@@ -117,9 +109,8 @@ def make_router(
             - X-Source-Format: ``mzML``, ``msz`` or ``mszx``.  Inferred from
               the filename extension when absent.
 
-        Responds 409 Conflict with an :class:`UploadConflict` body, before
-        reading the request body, if the output file already exists or
-        another transfer is writing it.
+        Responds 409 Conflict, before reading the request body, if the output
+        file already exists or another transfer is writing it.
 
         The server will stream the incoming data to a file, update the transfer registry
         with the progress, and optionally decompress if configured to do so.  MSZX
@@ -161,21 +152,15 @@ def make_router(
         # transfer is still writing, before any of the body is read.
         existing = plan.existing()
         if existing is not None:
-            return JSONResponse(
+            raise HTTPException(
                 status_code=409,
-                content=UploadConflict(
-                    detail=f"{existing.name} already exists on the server",
-                    filename=existing.name,
-                ).model_dump(),
+                detail=f"{existing.name} already exists on the server",
             )
         dest = plan.final_dest
         if not state.outputs.claim(dest):
-            return JSONResponse(
+            raise HTTPException(
                 status_code=409,
-                content=UploadConflict(
-                    detail=f"{dest.name} is already being written by another transfer",
-                    filename=dest.name,
-                ).model_dump(),
+                detail=f"{dest.name} is already being written by another transfer",
             )
         try:
             # Create a new transfer record in the registry.

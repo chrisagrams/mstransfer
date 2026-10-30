@@ -5,7 +5,6 @@ from mstransfer.client.downloader import (
     download_file,
 )
 from mstransfer.client.sender import (
-    UploadConflictError,
     async_send_batch,
     async_send_file,
     send_batch,
@@ -14,7 +13,6 @@ from mstransfer.client.sender import (
 from mstransfer.client.utils import resolve_inputs
 
 __all__ = [
-    "UploadConflictError",
     "async_download_batch",
     "async_download_file",
     "async_send_batch",

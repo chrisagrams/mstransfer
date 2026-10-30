@@ -48,18 +48,6 @@ class UploadResponse(BaseModel):
     bytes_received: int
 
 
-class UploadConflict(BaseModel):
-    """Response body for an upload refused with 409 Conflict.
-
-    *filename* is the stored file the upload would have replaced, which
-    can differ from the uploaded name (e.g. ``run.mzML`` is stored as
-    ``run.msz``).
-    """
-
-    detail: str
-    filename: str
-
-
 class FileInfo(BaseModel):
     """Metadata for a single stored file.
 
