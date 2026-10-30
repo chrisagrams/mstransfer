@@ -160,19 +160,21 @@ def make_router(
         # transfer is still writing, before any of the body is read.
         existing = plan.existing()
         if existing is not None:
-            return _conflict(
-                UploadConflict(
+            return JSONResponse(
+                status_code=409,
+                content=UploadConflict(
                     detail=f"{existing.name} already exists on the server",
                     filename=existing.name,
-                )
+                ).model_dump(),
             )
         dest = plan.final_dest
         if not state.outputs.claim(dest):
-            return _conflict(
-                UploadConflict(
+            return JSONResponse(
+                status_code=409,
+                content=UploadConflict(
                     detail=f"{dest.name} is already being written by another transfer",
                     filename=dest.name,
-                )
+                ).model_dump(),
             )
         try:
             return await _receive_and_store(
@@ -219,11 +221,6 @@ def make_router(
         )
 
     return router
-
-
-def _conflict(conflict: UploadConflict) -> JSONResponse:
-    """A 409 Conflict response carrying *conflict*."""
-    return JSONResponse(status_code=409, content=conflict.model_dump())
 
 
 async def _receive_and_store(
