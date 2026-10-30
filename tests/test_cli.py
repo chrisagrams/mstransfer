@@ -583,6 +583,14 @@ class TestDownloadProgressDisplay:
         assert task.description == "a.msz"
         assert task.total == 1000
 
+    def test_on_file_total_sets_total(self):
+        display = DownloadProgressDisplay(total_files=1)
+        display.on_file_start("a.msz", total_bytes=None)
+        display.on_file_total("a.msz", 1000)
+
+        task = display.files.tasks[display._task_ids["a.msz"]]
+        assert task.total == 1000
+
     def test_on_file_progress_advances(self):
         display = DownloadProgressDisplay(total_files=1)
         display.on_file_start("a.msz", total_bytes=1000)

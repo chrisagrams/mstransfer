@@ -32,6 +32,7 @@ logger = logging.getLogger(__name__)
 class DownloadProgressCallback(Protocol):
     """Callback protocol for observing single-file download progress."""
 
+    def on_total(self, total_bytes: int | None) -> None: ...
     def on_progress(self, bytes_delta: int) -> None: ...
 
 
@@ -40,6 +41,7 @@ class BatchDownloadProgress(Protocol):
     """Callback protocol for observing batch download progress."""
 
     def on_file_start(self, filename: str, total_bytes: int | None) -> None: ...
+    def on_file_total(self, filename: str, total_bytes: int | None) -> None: ...
     def on_file_progress(self, filename: str, bytes_delta: int) -> None: ...
     def on_file_complete(self, filename: str) -> None: ...
     def on_file_error(self, filename: str, error: Exception) -> None: ...
@@ -98,7 +100,9 @@ async def async_download_file(
     read_timeout:
         Timeout in seconds for reading the response body.
     progress_callback:
-        Optional callback invoked with byte deltas per chunk.
+        Optional callback.  ``on_total`` is invoked once the server
+        responds, with the body size from ``Content-Length`` (or *None* if
+        unknown); ``on_progress`` is invoked with byte deltas per chunk.
     skip_existing:
         If *True* and the final destination already exists, skip the
         download.  For an ``.mszx`` stored as ``"msz"`` or ``"mzml"``, an
@@ -139,6 +143,12 @@ async def async_download_file(
         c.stream("GET", url) as resp,
     ):
         resp.raise_for_status()
+
+        if progress_callback:
+            # Content-Length counts encoded bytes, but the body is read decoded.
+            cl = resp.headers.get("content-length")
+            encoded = "content-encoding" in resp.headers
+            progress_callback.on_total(int(cl) if cl and not encoded else None)
 
         async with aiofiles.open(part_path, "wb") as f:
             async for chunk in resp.aiter_bytes(chunk_size=chunk_size):
@@ -206,22 +216,9 @@ async def async_download_batch(
         filename = req.dest.name
 
         async with sem:
-            # Try to determine total bytes from a HEAD request (best-effort).
-            total_bytes: int | None = None
+            # The total is unknown until the GET response arrives.
             if progress:
-                try:
-                    async with optional_client(
-                        client, timeout=connect_timeout
-                    ) as head_client:
-                        head_resp = await head_client.head(
-                            req.url, follow_redirects=True
-                        )
-                        cl = head_resp.headers.get("content-length")
-                        if cl is not None:
-                            total_bytes = int(cl)
-                except Exception:  # noqa: BLE001
-                    pass
-                progress.on_file_start(filename, total_bytes)
+                progress.on_file_start(filename, None)
 
             # Build a per-file progress adapter that implements
             # DownloadProgressCallback by forwarding to BatchDownloadProgress.
@@ -327,6 +324,9 @@ class _FileProgressAdapter:
     def __init__(self, filename: str, batch: BatchDownloadProgress) -> None:
         self._filename = filename
         self._batch = batch
+
+    def on_total(self, total_bytes: int | None) -> None:
+        self._batch.on_file_total(self._filename, total_bytes)
 
     def on_progress(self, bytes_delta: int) -> None:
         self._batch.on_file_progress(self._filename, bytes_delta)
