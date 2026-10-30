@@ -56,10 +56,11 @@ def normalize_source(
     """
     if isinstance(source, MZMLFile):
         return Path(source.path.decode()), MSFormat.MZML, source
-    if isinstance(source, MSZFile):
-        return Path(source.path.decode()), MSFormat.MSZ, None
+    # MSZXFile subclasses MSZFile, so it must be checked first.
     if isinstance(source, MSZXFile):
         return source.archive_path, MSFormat.MSZX, None
+    if isinstance(source, MSZFile):
+        return Path(source.path.decode()), MSFormat.MSZ, None
     if isinstance(source, Path):
         filetype = detect_filetype(str(source))
         if filetype is None:

@@ -305,6 +305,48 @@ class TestMszxExpansion:
             await expansion.write(tmp_path / "a")
         assert list(tmp_path.iterdir()) == []
 
+    def test_swap_into_new_target(self, tmp_path):
+        staging = tmp_path / "staging"
+        staging.mkdir()
+        (staging / "new.msz").write_bytes(b"new")
+        target = tmp_path / "out"
+        MszxExpansion._swap_into(staging, target)
+        assert [p.name for p in target.iterdir()] == ["new.msz"]
+        assert not staging.exists()
+
+    def test_swap_into_replaces_existing_dir(self, tmp_path):
+        staging = tmp_path / "staging"
+        staging.mkdir()
+        (staging / "new.msz").write_bytes(b"new")
+        target = tmp_path / "out"
+        target.mkdir()
+        (target / "old.msz").write_bytes(b"old")
+        MszxExpansion._swap_into(staging, target)
+        assert [p.name for p in target.iterdir()] == ["new.msz"]
+        # The moved-aside backup is cleaned up.
+        assert sorted(p.name for p in tmp_path.iterdir()) == ["out"]
+
+    def test_swap_into_rejects_non_directory_target(self, tmp_path):
+        staging = tmp_path / "staging"
+        staging.mkdir()
+        target = tmp_path / "out"
+        target.write_bytes(b"file")
+        with pytest.raises(FileExistsError):
+            MszxExpansion._swap_into(staging, target)
+        assert target.read_bytes() == b"file"
+
+    def test_swap_into_restores_target_on_failure(self, tmp_path):
+        """If the swap fails, the existing directory is put back untouched."""
+        target = tmp_path / "out"
+        target.mkdir()
+        (target / "old.msz").write_bytes(b"old")
+        # A missing staging directory makes the rename into place fail.
+        with pytest.raises(FileNotFoundError):
+            MszxExpansion._swap_into(tmp_path / "missing", target)
+        assert [p.name for p in target.iterdir()] == ["old.msz"]
+        assert (target / "old.msz").read_bytes() == b"old"
+        assert sorted(p.name for p in tmp_path.iterdir()) == ["out"]
+
 
 class TestMszxToMszConversion:
     @pytest.mark.asyncio

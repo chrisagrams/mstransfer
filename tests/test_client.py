@@ -132,6 +132,18 @@ class TestNormalizeSource:
         msz = MSZFile(str(test_msz).encode())
         assert normalize_source(msz) == (test_msz, MSFormat.MSZ, None)
 
+    def test_mszxfile_object(self, test_mszx):
+        """MSZXFile subclasses MSZFile but must still be reported as mszx."""
+        mszx = MSZXFile.open(test_mszx)
+        try:
+            assert normalize_source(mszx) == (test_mszx, MSFormat.MSZX, None)
+        finally:
+            mszx.close()
+
+    def test_rejects_unsupported_type(self):
+        with pytest.raises(TypeError, match="Unsupported source type"):
+            normalize_source("not_a_path")  # type: ignore[arg-type]
+
 
 # ---------------------------------------------------------------------------
 # ThrottledCallback
@@ -379,6 +391,7 @@ class TestSendFile:
         assert result.state == "done"
         assert result.filename == "test.mszx"
         assert result.bytes_received == test_mszx.stat().st_size
+        assert Path(result.stored_as).name == "test.mszx"
         mszx.close()
 
     def test_send_file_rejects_invalid_type(self, _live_server):

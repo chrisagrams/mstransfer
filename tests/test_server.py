@@ -304,6 +304,51 @@ async def test_upload_unknown_source_format_rejected(msz_client, tmp_output):
 
 
 @pytest.mark.asyncio
+async def test_upload_receive_failure_marks_error(msz_client, tmp_output, test_msz):
+    """If the upload can't be written, the transfer ends in ERROR with a 500."""
+    tmp_output.rmdir()
+    resp = await msz_client.post(
+        "/v1/upload",
+        content=test_msz.read_bytes(),
+        headers={
+            "X-Transfer-ID": "receive-fail",
+            "X-Original-Filename": "test.msz",
+            "X-Source-Format": "msz",
+        },
+    )
+    assert resp.status_code == 500
+    assert "Error receiving data" in resp.json()["detail"]
+
+    status = (await msz_client.get("/v1/transfer/receive-fail/status")).json()
+    assert status["state"] == "error"
+    assert status["error"]
+
+
+@pytest.mark.asyncio
+async def test_upload_conversion_failure_marks_error(mzml_client, tmp_output):
+    """A payload that can't be decompressed ends in ERROR and leaves no files."""
+    resp = await mzml_client.post(
+        "/v1/upload",
+        content=b"not an msz file" * 256,
+        headers={
+            "X-Transfer-ID": "convert-fail",
+            "X-Original-Filename": "bad.msz",
+            "X-Source-Format": "msz",
+        },
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["state"] == "error"
+    assert data["stored_as"] == ""
+
+    status = (await mzml_client.get("/v1/transfer/convert-fail/status")).json()
+    assert status["state"] == "error"
+    assert status["error"]
+    # Neither the .part file, the renamed source nor a partial mzML remain.
+    assert list(tmp_output.iterdir()) == []
+
+
+@pytest.mark.asyncio
 async def test_upload_missing_transfer_id(msz_client):
     resp = await msz_client.post(
         "/v1/upload",
