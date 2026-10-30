@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import gzip
 import http.server
 import io
 import json
@@ -216,6 +217,42 @@ class TestDownloadFile:
         assert result == dest
         assert dest.read_bytes() == b"hello world"
 
+    def test_on_total_bytes_reports_content_length(self, served_files, tmp_path):
+        """on_total_bytes receives the size from the GET response."""
+        totals: list[int | None] = []
+        download_file(
+            f"{served_files['base_url']}/medium.bin",
+            tmp_path / "medium.bin",
+            on_total_bytes=totals.append,
+        )
+        assert totals == [10_000]
+
+    def test_on_total_bytes_ignores_encoded_length(self, tmp_path):
+        """Content-Length of an encoded body is not the decoded size."""
+        body = gzip.compress(b"y" * 5000)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200, content=body, headers={"Content-Encoding": "gzip"}
+            )
+
+        totals: list[int | None] = []
+
+        async def _run() -> None:
+            async with httpx.AsyncClient(
+                transport=httpx.MockTransport(handler)
+            ) as client:
+                await async_download_file(
+                    "http://test/g.bin",
+                    tmp_path / "g.bin",
+                    on_total_bytes=totals.append,
+                    client=client,
+                )
+
+        asyncio.run(_run())
+        assert totals == [None]
+        assert (tmp_path / "g.bin").read_bytes() == b"y" * 5000
+
 
 # ---------------------------------------------------------------------------
 # download_batch
@@ -342,6 +379,101 @@ class TestDownloadBatch:
         results = download_batch(requests, skip_existing=True)
         assert len(results) == 1
         assert dest.read_bytes() == b"pre-existing"
+
+    def test_total_bytes_from_get_response(self, tmp_path):
+        """The total comes from the GET response, so a HEAD error is never used.
+
+        Regression test for #67: the mstransfer server answers HEAD with 405,
+        whose error body length used to be reported as the file size.
+        """
+        payload = b"x" * 1234
+        methods: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            methods.append(request.method)
+            if request.method != "GET":
+                return httpx.Response(405, json={"detail": "Method Not Allowed"})
+            return httpx.Response(200, content=payload)
+
+        events: list[tuple[str, int | None]] = []
+
+        class Tracker:
+            def on_file_start(self, filename: str, total_bytes: int | None) -> None:
+                events.append(("start", total_bytes))
+
+            def on_file_progress(self, filename: str, bytes_delta: int) -> None:
+                pass
+
+            def on_file_complete(self, filename: str) -> None:
+                events.append(("complete", None))
+
+            def on_file_error(self, filename: str, error: Exception) -> None:
+                events.append(("error", None))
+
+        async def _run() -> list:
+            async with httpx.AsyncClient(
+                transport=httpx.MockTransport(handler)
+            ) as client:
+                return await async_download_batch(
+                    [DownloadRequest(url="http://test/f.bin", dest=tmp_path / "f.bin")],
+                    progress=Tracker(),
+                    client=client,
+                )
+
+        asyncio.run(_run())
+        assert methods == ["GET"]
+        assert events == [("start", len(payload)), ("complete", None)]
+
+    def test_skipped_file_starts_with_unknown_total(self, served_files, tmp_path):
+        """A skipped download is still started before it completes."""
+        dest = tmp_path / "small.bin"
+        dest.write_bytes(b"pre-existing")
+        events: list[tuple[str, int | None]] = []
+
+        class Tracker:
+            def on_file_start(self, filename: str, total_bytes: int | None) -> None:
+                events.append(("start", total_bytes))
+
+            def on_file_progress(self, filename: str, bytes_delta: int) -> None:
+                pass
+
+            def on_file_complete(self, filename: str) -> None:
+                events.append(("complete", None))
+
+            def on_file_error(self, filename: str, error: Exception) -> None:
+                events.append(("error", None))
+
+        requests = [
+            DownloadRequest(url=f"{served_files['base_url']}/small.bin", dest=dest),
+        ]
+        download_batch(requests, skip_existing=True, progress=Tracker())
+        assert events == [("start", None), ("complete", None)]
+
+    def test_failed_file_starts_with_unknown_total(self, served_files, tmp_path):
+        """A failed download is started with an unknown total, then errors."""
+        events: list[tuple[str, int | None]] = []
+
+        class Tracker:
+            def on_file_start(self, filename: str, total_bytes: int | None) -> None:
+                events.append(("start", total_bytes))
+
+            def on_file_progress(self, filename: str, bytes_delta: int) -> None:
+                pass
+
+            def on_file_complete(self, filename: str) -> None:
+                events.append(("complete", None))
+
+            def on_file_error(self, filename: str, error: Exception) -> None:
+                events.append(("error", None))
+
+        requests = [
+            DownloadRequest(
+                url=f"{served_files['base_url']}/nonexistent",
+                dest=tmp_path / "missing.bin",
+            ),
+        ]
+        download_batch(requests, progress=Tracker())
+        assert events == [("start", None), ("error", None)]
 
 
 # ---------------------------------------------------------------------------

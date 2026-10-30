@@ -12,6 +12,7 @@ from mstransfer.client.utils import ThrottledCallback, optional_client
 from mstransfer.store import DownloadFormat, StorePlan
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from pathlib import Path
 
 __all__ = [
@@ -62,6 +63,7 @@ async def async_download_file(
     connect_timeout: float = 10.0,
     read_timeout: float = 300.0,
     progress_callback: DownloadProgressCallback | None = None,
+    on_total_bytes: Callable[[int | None], None] | None = None,
     skip_existing: bool = False,
     force: bool = False,
     client: httpx.AsyncClient | None = None,
@@ -99,6 +101,11 @@ async def async_download_file(
         Timeout in seconds for reading the response body.
     progress_callback:
         Optional callback invoked with byte deltas per chunk.
+    on_total_bytes:
+        Optional callback invoked once the server responds successfully,
+        with the body size from its ``Content-Length`` header, or *None*
+        when the size is unknown.  Not invoked if the download is skipped
+        or the request fails.
     skip_existing:
         If *True* and the final destination already exists, skip the
         download.  For an ``.mszx`` stored as ``"msz"`` or ``"mzml"``, an
@@ -139,6 +146,12 @@ async def async_download_file(
         c.stream("GET", url) as resp,
     ):
         resp.raise_for_status()
+
+        if on_total_bytes is not None:
+            # Content-Length counts encoded bytes, but the body is read decoded.
+            cl = resp.headers.get("content-length")
+            encoded = "content-encoding" in resp.headers
+            on_total_bytes(int(cl) if cl is not None and not encoded else None)
 
         async with aiofiles.open(part_path, "wb") as f:
             async for chunk in resp.aiter_bytes(chunk_size=chunk_size):
@@ -206,22 +219,16 @@ async def async_download_batch(
         filename = req.dest.name
 
         async with sem:
-            # Try to determine total bytes from a HEAD request (best-effort).
-            total_bytes: int | None = None
-            if progress:
-                try:
-                    async with optional_client(
-                        client, timeout=connect_timeout
-                    ) as head_client:
-                        head_resp = await head_client.head(
-                            req.url, follow_redirects=True
-                        )
-                        cl = head_resp.headers.get("content-length")
-                        if cl is not None:
-                            total_bytes = int(cl)
-                except Exception:  # noqa: BLE001
-                    pass
-                progress.on_file_start(filename, total_bytes)
+            # Report the file as started once the GET response gives its
+            # size.  A skipped or failed download never gets that far, so it
+            # is started with an unknown size before completing or erroring.
+            started = False
+
+            def _start(total_bytes: int | None) -> None:
+                nonlocal started
+                started = True
+                if progress:
+                    progress.on_file_start(filename, total_bytes)
 
             # Build a per-file progress adapter that implements
             # DownloadProgressCallback by forwarding to BatchDownloadProgress.
@@ -238,14 +245,19 @@ async def async_download_batch(
                     connect_timeout=connect_timeout,
                     read_timeout=read_timeout,
                     progress_callback=file_progress,
+                    on_total_bytes=_start,
                     skip_existing=skip_existing,
                     force=force,
                     client=client,
                 )
                 results[idx] = result
+                if not started:
+                    _start(None)
                 if progress:
                     progress.on_file_complete(filename)
             except Exception as exc:
+                if not started:
+                    _start(None)
                 if progress:
                     progress.on_file_error(filename, exc)
                 logger.error("Failed to download %s: %s", filename, exc)
@@ -264,6 +276,7 @@ def download_file(
     connect_timeout: float = 10.0,
     read_timeout: float = 300.0,
     progress_callback: DownloadProgressCallback | None = None,
+    on_total_bytes: Callable[[int | None], None] | None = None,
     skip_existing: bool = False,
     force: bool = False,
     client: httpx.AsyncClient | None = None,
@@ -281,6 +294,7 @@ def download_file(
             connect_timeout=connect_timeout,
             read_timeout=read_timeout,
             progress_callback=progress_callback,
+            on_total_bytes=on_total_bytes,
             skip_existing=skip_existing,
             force=force,
             client=client,
