@@ -23,7 +23,7 @@ if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Callable
     from pathlib import Path
 
-    from mstransfer.server.state import AppState, TransferRegistry
+    from mstransfer.server.state import AppState
 
 
 def _state_from_app(request: Request) -> AppState:
@@ -152,6 +152,7 @@ def make_router(
                 detail=f"Unsupported X-Source-Format: {source_header!r}",
             ) from exc
 
+        registry = state.transfers
         plan = StorePlan.for_upload(
             state.output_dir, original_filename, source, MSFormat(state.store_as)
         )
@@ -177,8 +178,77 @@ def make_router(
                 ).model_dump(),
             )
         try:
-            return await _receive_and_store(
-                request, state.transfers, plan, transfer_id, original_filename
+            # Create a new transfer record in the registry.
+            registry.create(transfer_id, original_filename)
+            logger.info("Receiving %s (transfer_id=%s)", original_filename, transfer_id)
+
+            # Stream the incoming data to a temp .part file so a partial upload
+            # is never visible under its final name.
+            part_path = plan.unique_part_path()
+            bytes_received = 0
+            update_every = 64  # throttle registry updates to reduce lock overhead
+            chunk_count = 0
+            try:
+                async with aiofiles.open(part_path, "wb") as f:
+                    async for chunk in request.stream():
+                        await f.write(chunk)
+                        bytes_received += len(chunk)
+                        chunk_count += 1
+                        if chunk_count % update_every == 0:
+                            registry.update(transfer_id, bytes_received=bytes_received)
+
+                # Final update to ensure accurate total
+                registry.update(transfer_id, bytes_received=bytes_received)
+
+            except Exception as exc:
+                part_path.unlink(missing_ok=True)
+                registry.update(transfer_id, state=TransferState.ERROR, error=str(exc))
+                raise HTTPException(
+                    status_code=500, detail=f"Error receiving data: {exc}"
+                ) from exc
+
+            registry.update(transfer_id, state=TransferState.RECEIVED)
+            logger.info(
+                "Received %s (%d bytes, transfer_id=%s)",
+                original_filename,
+                bytes_received,
+                transfer_id,
+            )
+
+            # Move the .part file into place, converting it if store_as asks for a
+            # different format.  Archives are always kept as-is (see for_upload).
+            if plan.conversion is not None:
+                registry.update(transfer_id, state=TransferState.DECOMPRESSING)
+            try:
+                stored = await plan.finalize(part_path)
+                registry.update(
+                    transfer_id,
+                    state=TransferState.DONE,
+                    stored_as=str(stored),
+                    bytes_received=bytes_received,
+                )
+            except Exception as exc:
+                # On error, update the registry w/ error and log the failure.
+                part_path.unlink(missing_ok=True)
+                registry.update(transfer_id, state=TransferState.ERROR, error=str(exc))
+                logger.error("Storing %s failed: %s", transfer_id, exc)
+
+            # Return the final transfer record as the response.
+            final = registry.get(transfer_id)
+
+            # This should not be None,
+            #  however if it is, return a 500 error indicating an unexpected state.
+            if final is None:
+                raise HTTPException(
+                    status_code=500,
+                    detail="Unexpected error: transfer record missing after processing",
+                )
+            return UploadResponse(
+                transfer_id=final.transfer_id,
+                filename=final.filename,
+                stored_as=final.stored_as,
+                state=final.state,
+                bytes_received=final.bytes_received,
             )
         finally:
             state.outputs.release(dest)
@@ -221,88 +291,6 @@ def make_router(
         )
 
     return router
-
-
-async def _receive_and_store(
-    request: Request,
-    registry: TransferRegistry,
-    plan: StorePlan,
-    transfer_id: str,
-    original_filename: str,
-) -> UploadResponse:
-    """Stream the request body to disk and store it as *plan* says."""
-    # Create a new transfer record in the registry.
-    registry.create(transfer_id, original_filename)
-    logger.info("Receiving %s (transfer_id=%s)", original_filename, transfer_id)
-
-    # Stream the incoming data to a temp .part file so a partial upload
-    # is never visible under its final name.
-    part_path = plan.unique_part_path()
-    bytes_received = 0
-    update_every = 64  # throttle registry updates to reduce lock overhead
-    chunk_count = 0
-    try:
-        async with aiofiles.open(part_path, "wb") as f:
-            async for chunk in request.stream():
-                await f.write(chunk)
-                bytes_received += len(chunk)
-                chunk_count += 1
-                if chunk_count % update_every == 0:
-                    registry.update(transfer_id, bytes_received=bytes_received)
-
-        # Final update to ensure accurate total
-        registry.update(transfer_id, bytes_received=bytes_received)
-
-    except Exception as exc:
-        part_path.unlink(missing_ok=True)
-        registry.update(transfer_id, state=TransferState.ERROR, error=str(exc))
-        raise HTTPException(
-            status_code=500, detail=f"Error receiving data: {exc}"
-        ) from exc
-
-    registry.update(transfer_id, state=TransferState.RECEIVED)
-    logger.info(
-        "Received %s (%d bytes, transfer_id=%s)",
-        original_filename,
-        bytes_received,
-        transfer_id,
-    )
-
-    # Move the .part file into place, converting it if store_as asks for a
-    # different format.  Archives are always kept as-is (see for_upload).
-    if plan.conversion is not None:
-        registry.update(transfer_id, state=TransferState.DECOMPRESSING)
-    try:
-        stored = await plan.finalize(part_path)
-        registry.update(
-            transfer_id,
-            state=TransferState.DONE,
-            stored_as=str(stored),
-            bytes_received=bytes_received,
-        )
-    except Exception as exc:
-        # On error, update the registry w/ error and log the failure.
-        part_path.unlink(missing_ok=True)
-        registry.update(transfer_id, state=TransferState.ERROR, error=str(exc))
-        logger.error("Storing %s failed: %s", transfer_id, exc)
-
-    # Return the final transfer record as the response.
-    final = registry.get(transfer_id)
-
-    # This should not be None,
-    #  however if it is, return a 500 error indicating an unexpected state.
-    if final is None:
-        raise HTTPException(
-            status_code=500,
-            detail="Unexpected error: transfer record missing after processing",
-        )
-    return UploadResponse(
-        transfer_id=final.transfer_id,
-        filename=final.filename,
-        stored_as=final.stored_as,
-        state=final.state,
-        bytes_received=final.bytes_received,
-    )
 
 
 async def _stream_file(
