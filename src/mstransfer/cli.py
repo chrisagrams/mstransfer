@@ -206,6 +206,9 @@ class DownloadProgressDisplay:
         task_id = self.files.add_task(filename, total=total_bytes)
         self._task_ids[filename] = task_id
 
+    def on_file_total(self, filename: str, total_bytes: int | None) -> None:
+        self.files.update(self._task_ids[filename], total=total_bytes)
+
     def on_file_progress(self, filename: str, bytes_delta: int) -> None:
         self.files.advance(self._task_ids[filename], bytes_delta)
 

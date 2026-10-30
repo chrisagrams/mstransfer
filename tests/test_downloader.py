@@ -137,6 +137,9 @@ class TestDownloadFile:
         deltas: list[int] = []
 
         class Tracker:
+            def on_total(self, total_bytes: int | None) -> None:
+                pass
+
             def on_progress(self, bytes_delta: int) -> None:
                 deltas.append(bytes_delta)
 
@@ -217,17 +220,25 @@ class TestDownloadFile:
         assert result == dest
         assert dest.read_bytes() == b"hello world"
 
-    def test_on_total_bytes_reports_content_length(self, served_files, tmp_path):
-        """on_total_bytes receives the size from the GET response."""
-        totals: list[int | None] = []
+    def test_on_total_reports_content_length(self, served_files, tmp_path):
+        """on_total receives the size from the GET response, before any data."""
+        events: list[tuple[str, int | None]] = []
+
+        class Tracker:
+            def on_total(self, total_bytes: int | None) -> None:
+                events.append(("total", total_bytes))
+
+            def on_progress(self, bytes_delta: int) -> None:
+                events.append(("progress", bytes_delta))
+
         download_file(
             f"{served_files['base_url']}/medium.bin",
             tmp_path / "medium.bin",
-            on_total_bytes=totals.append,
+            progress_callback=Tracker(),
         )
-        assert totals == [10_000]
+        assert events == [("total", 10_000), ("progress", 10_000)]
 
-    def test_on_total_bytes_ignores_encoded_length(self, tmp_path):
+    def test_on_total_ignores_encoded_length(self, tmp_path):
         """Content-Length of an encoded body is not the decoded size."""
         body = gzip.compress(b"y" * 5000)
 
@@ -238,6 +249,13 @@ class TestDownloadFile:
 
         totals: list[int | None] = []
 
+        class Tracker:
+            def on_total(self, total_bytes: int | None) -> None:
+                totals.append(total_bytes)
+
+            def on_progress(self, bytes_delta: int) -> None:
+                pass
+
         async def _run() -> None:
             async with httpx.AsyncClient(
                 transport=httpx.MockTransport(handler)
@@ -245,7 +263,7 @@ class TestDownloadFile:
                 await async_download_file(
                     "http://test/g.bin",
                     tmp_path / "g.bin",
-                    on_total_bytes=totals.append,
+                    progress_callback=Tracker(),
                     client=client,
                 )
 
@@ -313,6 +331,9 @@ class TestDownloadBatch:
             def on_file_start(self, filename: str, total_bytes: int | None) -> None:
                 started.append(filename)
 
+            def on_file_total(self, filename: str, total_bytes: int | None) -> None:
+                pass
+
             def on_file_progress(self, filename: str, bytes_delta: int) -> None:
                 progress_deltas.setdefault(filename, []).append(bytes_delta)
 
@@ -352,6 +373,9 @@ class TestDownloadBatch:
             def on_file_start(self, filename: str, total_bytes: int | None) -> None:
                 pass
 
+            def on_file_total(self, filename: str, total_bytes: int | None) -> None:
+                pass
+
             def on_file_progress(self, filename: str, bytes_delta: int) -> None:
                 pass
 
@@ -380,8 +404,8 @@ class TestDownloadBatch:
         assert len(results) == 1
         assert dest.read_bytes() == b"pre-existing"
 
-    def test_total_bytes_from_get_response(self, tmp_path):
-        """The total comes from the GET response, so a HEAD error is never used.
+    def test_total_from_get_response_not_head(self, tmp_path):
+        """The total comes from the GET response; HEAD is never sent.
 
         Regression test for #67: the mstransfer server answers HEAD with 405,
         whose error body length used to be reported as the file size.
@@ -401,6 +425,9 @@ class TestDownloadBatch:
             def on_file_start(self, filename: str, total_bytes: int | None) -> None:
                 events.append(("start", total_bytes))
 
+            def on_file_total(self, filename: str, total_bytes: int | None) -> None:
+                events.append(("total", total_bytes))
+
             def on_file_progress(self, filename: str, bytes_delta: int) -> None:
                 pass
 
@@ -410,11 +437,11 @@ class TestDownloadBatch:
             def on_file_error(self, filename: str, error: Exception) -> None:
                 events.append(("error", None))
 
-        async def _run() -> list:
+        async def _run() -> None:
             async with httpx.AsyncClient(
                 transport=httpx.MockTransport(handler)
             ) as client:
-                return await async_download_batch(
+                await async_download_batch(
                     [DownloadRequest(url="http://test/f.bin", dest=tmp_path / "f.bin")],
                     progress=Tracker(),
                     client=client,
@@ -422,58 +449,11 @@ class TestDownloadBatch:
 
         asyncio.run(_run())
         assert methods == ["GET"]
-        assert events == [("start", len(payload)), ("complete", None)]
-
-    def test_skipped_file_starts_with_unknown_total(self, served_files, tmp_path):
-        """A skipped download is still started before it completes."""
-        dest = tmp_path / "small.bin"
-        dest.write_bytes(b"pre-existing")
-        events: list[tuple[str, int | None]] = []
-
-        class Tracker:
-            def on_file_start(self, filename: str, total_bytes: int | None) -> None:
-                events.append(("start", total_bytes))
-
-            def on_file_progress(self, filename: str, bytes_delta: int) -> None:
-                pass
-
-            def on_file_complete(self, filename: str) -> None:
-                events.append(("complete", None))
-
-            def on_file_error(self, filename: str, error: Exception) -> None:
-                events.append(("error", None))
-
-        requests = [
-            DownloadRequest(url=f"{served_files['base_url']}/small.bin", dest=dest),
+        assert events == [
+            ("start", None),
+            ("total", len(payload)),
+            ("complete", None),
         ]
-        download_batch(requests, skip_existing=True, progress=Tracker())
-        assert events == [("start", None), ("complete", None)]
-
-    def test_failed_file_starts_with_unknown_total(self, served_files, tmp_path):
-        """A failed download is started with an unknown total, then errors."""
-        events: list[tuple[str, int | None]] = []
-
-        class Tracker:
-            def on_file_start(self, filename: str, total_bytes: int | None) -> None:
-                events.append(("start", total_bytes))
-
-            def on_file_progress(self, filename: str, bytes_delta: int) -> None:
-                pass
-
-            def on_file_complete(self, filename: str) -> None:
-                events.append(("complete", None))
-
-            def on_file_error(self, filename: str, error: Exception) -> None:
-                events.append(("error", None))
-
-        requests = [
-            DownloadRequest(
-                url=f"{served_files['base_url']}/nonexistent",
-                dest=tmp_path / "missing.bin",
-            ),
-        ]
-        download_batch(requests, progress=Tracker())
-        assert events == [("start", None), ("error", None)]
 
 
 # ---------------------------------------------------------------------------
@@ -488,6 +468,9 @@ class TestFileProgressAdapter:
 
         class FakeBatch:
             def on_file_start(self, filename, total_bytes):
+                pass
+
+            def on_file_total(self, filename, total_bytes):
                 pass
 
             def on_file_progress(self, filename, bytes_delta):
@@ -1035,6 +1018,9 @@ class TestAsyncDownloadFile:
         deltas: list[int] = []
 
         class Tracker:
+            def on_total(self, total_bytes: int | None) -> None:
+                pass
+
             def on_progress(self, bytes_delta: int) -> None:
                 deltas.append(bytes_delta)
 
@@ -1160,6 +1146,9 @@ class TestAsyncDownloadBatch:
 
         class Tracker:
             def on_file_start(self, filename: str, total_bytes: int | None) -> None:
+                pass
+
+            def on_file_total(self, filename: str, total_bytes: int | None) -> None:
                 pass
 
             def on_file_progress(self, filename: str, bytes_delta: int) -> None:
