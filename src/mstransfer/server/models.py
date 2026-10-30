@@ -4,15 +4,17 @@ from collections.abc import (
     Sequence,  # noqa: TC003 (Pydantic resolves annotations at runtime)
 )
 from datetime import datetime
-from enum import Enum
+from enum import StrEnum
 from typing import Literal
 
 from pydantic import BaseModel, Field, SerializeAsAny
 
+from mstransfer.store import MSFormat  # noqa: TC001 (Pydantic resolves annotations at runtime)
+
 StoreFormat = Literal["msz", "mzml"]
 
 
-class TransferState(str, Enum):
+class TransferState(StrEnum):
     """Enumeration of possible states for a file transfer."""
 
     RECEIVING = "receiving"
@@ -56,7 +58,7 @@ class FileInfo(BaseModel):
 
     name: str
     size_bytes: int
-    format: StoreFormat
+    format: MSFormat
 
 
 class FileListResponse(BaseModel):

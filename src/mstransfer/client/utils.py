@@ -15,10 +15,9 @@ from mscompress import MSZFile, MZMLFile
 from mscompress.mszx import MSZXFile
 from mscompress.utils import detect_filetype
 
-logger = logging.getLogger(__name__)
+from mstransfer.store import MSFormat
 
-VALID_EXTENSIONS = {".mzml", ".msz", ".mszx"}
-VALID_FORMATS = {"mzML", "msz", "mszx"}
+logger = logging.getLogger(__name__)
 
 
 def resolve_inputs(paths: list[str], recursive: bool = False) -> list[Path]:
@@ -27,40 +26,48 @@ def resolve_inputs(paths: list[str], recursive: bool = False) -> list[Path]:
     for p in paths:
         path = Path(p)
         if path.is_file():
-            if path.suffix.lower() in VALID_EXTENSIONS:
+            if MSFormat.from_path(path.name) is not None:
                 result.append(path)
             else:
                 logger.warning("Skipping unsupported file: %s", path)
         elif path.is_dir():
-            for ext in ("*.mzML", "*.msz", "*.mzml", "*.MSZ"):
-                if recursive:
-                    result.extend(path.rglob(ext))
-                else:
-                    result.extend(path.glob(ext))
-            result = list(dict.fromkeys(result))
+            entries = path.rglob("*") if recursive else path.glob("*")
+            result.extend(
+                entry
+                for entry in entries
+                if entry.is_file() and MSFormat.from_path(entry.name) is not None
+            )
         else:
             logger.warning("Path does not exist: %s", path)
     if not result:
-        raise FileNotFoundError("No valid .mzML or .msz files found in the given paths")
+        raise FileNotFoundError(
+            "No valid .mzML, .msz or .mszx files found in the given paths"
+        )
     return sorted(set(result))
 
 
 def normalize_source(
     source: Path | MZMLFile | MSZFile | MSZXFile,
-) -> tuple[Path, str, MZMLFile | None]:
-    """Return `(file_path, filetype, mzml_obj | None)` from *source*."""
+) -> tuple[Path, MSFormat, MZMLFile | None]:
+    """Return `(file_path, format, mzml_obj | None)` from *source*.
+
+    For a `pathlib.Path`, the format is detected from the file contents
+    rather than its extension.
+    """
     if isinstance(source, MZMLFile):
-        return Path(source.path.decode()), "mzML", source
-    if isinstance(source, MSZFile):
-        return Path(source.path.decode()), "msz", None
+        return Path(source.path.decode()), MSFormat.MZML, source
+    # MSZXFile subclasses MSZFile, so it must be checked first.
     if isinstance(source, MSZXFile):
-        return source.archive_path, "mszx", None
+        return source.archive_path, MSFormat.MSZX, None
+    if isinstance(source, MSZFile):
+        return Path(source.path.decode()), MSFormat.MSZ, None
     if isinstance(source, Path):
-        filetype = detect_filetype(str(source)) or ""
-        if filetype not in VALID_FORMATS:
-            raise ValueError(f"Unsupported file type for {source}: {filetype}")
-        mzml_obj = MZMLFile(str(source).encode()) if filetype == "mzML" else None
-        return source, filetype, mzml_obj
+        filetype = detect_filetype(str(source))
+        if filetype is None:
+            raise ValueError(f"Unsupported file type for {source}")
+        fmt = MSFormat(filetype.lower())
+        mzml_obj = MZMLFile(str(source).encode()) if fmt is MSFormat.MZML else None
+        return source, fmt, mzml_obj
     raise TypeError(f"Unsupported source type: {type(source)}")
 
 

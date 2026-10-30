@@ -318,8 +318,8 @@ class TestCmdUpload:
         ]
 
         args = self._make_args(["/data/a.mzML", "/data/b.msz", "host"])
-        # Should not raise — just prints the error summary
-        cmd_upload(args)
+        with pytest.raises(SystemExit, match="1"):
+            cmd_upload(args)
 
     @patch("mstransfer.cli.async_send_batch", new_callable=AsyncMock)
     @patch("mstransfer.cli.httpx.get")
@@ -377,8 +377,8 @@ class TestCmdUpload:
         ]
 
         args = self._make_args(["/data/a.mzML", "host"])
-        # Should not raise — reports failure
-        cmd_upload(args)
+        with pytest.raises(SystemExit, match="1"):
+            cmd_upload(args)
 
 
 # ---------------------------------------------------------------------------
@@ -503,16 +503,23 @@ class TestCmdDownload:
 
     @patch("mstransfer.cli.async_download_batch", new_callable=AsyncMock)
     def test_partial_failure(self, mock_batch, tmp_path):
-        """One failure does not prevent reporting."""
-        # Return only 1 result for 2 requests → 1 failure
-        mock_batch.return_value = [tmp_path / "a.msz"]
+        """Any failed download makes the command exit non-zero."""
+
+        async def _batch(requests, *, progress, **kwargs):
+            progress.on_file_start("a.msz", 10)
+            progress.on_file_complete("a.msz")
+            progress.on_file_start("b.msz", 10)
+            progress.on_file_error("b.msz", RuntimeError("boom"))
+            return [tmp_path / "a.msz"]
+
+        mock_batch.side_effect = _batch
 
         args = self._make_args(
             ["http://host/a.msz", "http://host/b.msz"],
             output_dir=str(tmp_path),
         )
-        # Should not raise — just prints summary
-        cmd_download(args)
+        with pytest.raises(SystemExit, match="1"):
+            cmd_download(args)
 
     @patch("mstransfer.cli.async_download_batch", new_callable=AsyncMock)
     def test_passes_store_as(self, mock_batch, tmp_path):

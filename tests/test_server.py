@@ -225,6 +225,130 @@ async def test_upload_mzml_stream_store_as_mzml(mzml_client, tmp_output, test_mz
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("client_fixture", ["msz_client", "mzml_client"])
+@pytest.mark.parametrize("source_format", ["mszx", "MSZX", None])
+async def test_upload_mszx_stored_as_is(
+    request, client_fixture, source_format, tmp_output, test_mszx
+):
+    """An .mszx archive is kept byte-for-byte as .mszx, whatever store_as says."""
+    client = request.getfixturevalue(client_fixture)
+    payload = test_mszx.read_bytes()
+    headers = {
+        "X-Transfer-ID": "mszx-upload",
+        "X-Original-Filename": "run.mszx",
+    }
+    if source_format is not None:
+        headers["X-Source-Format"] = source_format
+    resp = await client.post("/v1/upload", content=payload, headers=headers)
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["state"] == "done"
+    assert data["stored_as"] == str(tmp_output / "run.mszx")
+    assert (tmp_output / "run.mszx").read_bytes() == payload
+    assert sorted(p.name for p in tmp_output.iterdir()) == ["run.mszx"]
+
+
+@pytest.mark.asyncio
+async def test_upload_source_format_header_overrides_extension(
+    msz_client, tmp_output, test_mszx
+):
+    """X-Source-Format wins over the filename extension."""
+    payload = test_mszx.read_bytes()
+    resp = await msz_client.post(
+        "/v1/upload",
+        content=payload,
+        headers={
+            "X-Transfer-ID": "mszx-renamed",
+            "X-Original-Filename": "run.bin",
+            "X-Source-Format": "mszx",
+        },
+    )
+    assert resp.status_code == 200
+    assert (tmp_output / "run.mszx").read_bytes() == payload
+
+
+@pytest.mark.asyncio
+async def test_upload_mzml_source_format_header(mzml_client, tmp_output, test_mzml):
+    """The client's X-Source-Format: mzML still means an MSZ stream."""
+    mzml = MZMLFile(str(test_mzml).encode())
+    compressed = b"".join(mzml.compress_stream(chunk_size=1_048_576))
+    resp = await mzml_client.post(
+        "/v1/upload",
+        content=compressed,
+        headers={
+            "X-Transfer-ID": "mzml-header",
+            "X-Original-Filename": "test.mzML",
+            "X-Source-Format": "mzML",
+        },
+    )
+    assert resp.status_code == 200
+    assert resp.json()["state"] == "done"
+    assert (tmp_output / "test.mzML").stat().st_size == test_mzml.stat().st_size
+
+
+@pytest.mark.asyncio
+async def test_upload_unknown_source_format_rejected(msz_client, tmp_output):
+    resp = await msz_client.post(
+        "/v1/upload",
+        content=b"data",
+        headers={
+            "X-Transfer-ID": "bad-format",
+            "X-Original-Filename": "run.raw",
+            "X-Source-Format": "raw",
+        },
+    )
+    assert resp.status_code == 400
+    assert list(tmp_output.iterdir()) == []
+    status = await msz_client.get("/v1/transfer/bad-format/status")
+    assert status.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_upload_receive_failure_marks_error(msz_client, tmp_output, test_msz):
+    """If the upload can't be written, the transfer ends in ERROR with a 500."""
+    tmp_output.rmdir()
+    resp = await msz_client.post(
+        "/v1/upload",
+        content=test_msz.read_bytes(),
+        headers={
+            "X-Transfer-ID": "receive-fail",
+            "X-Original-Filename": "test.msz",
+            "X-Source-Format": "msz",
+        },
+    )
+    assert resp.status_code == 500
+    assert "Error receiving data" in resp.json()["detail"]
+
+    status = (await msz_client.get("/v1/transfer/receive-fail/status")).json()
+    assert status["state"] == "error"
+    assert status["error"]
+
+
+@pytest.mark.asyncio
+async def test_upload_conversion_failure_marks_error(mzml_client, tmp_output):
+    """A payload that can't be decompressed ends in ERROR and leaves no files."""
+    resp = await mzml_client.post(
+        "/v1/upload",
+        content=b"not an msz file" * 256,
+        headers={
+            "X-Transfer-ID": "convert-fail",
+            "X-Original-Filename": "bad.msz",
+            "X-Source-Format": "msz",
+        },
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["state"] == "error"
+    assert data["stored_as"] == ""
+
+    status = (await mzml_client.get("/v1/transfer/convert-fail/status")).json()
+    assert status["state"] == "error"
+    assert status["error"]
+    # Neither the .part file, the renamed source nor a partial mzML remain.
+    assert list(tmp_output.iterdir()) == []
+
+
+@pytest.mark.asyncio
 async def test_upload_missing_transfer_id(msz_client):
     resp = await msz_client.post(
         "/v1/upload",
@@ -342,6 +466,14 @@ class TestDirectoryFileProvider:
         assert "c.txt" not in names
 
     @pytest.mark.asyncio
+    async def test_list_files_finds_mszx(self, tmp_path):
+        (tmp_path / "a.mszx").write_bytes(b"mszx data")
+
+        provider = DirectoryFileProvider(tmp_path)
+        files = await provider.list_files()
+        assert [(f.name, f.format) for f in files] == [("a.mszx", "mszx")]
+
+    @pytest.mark.asyncio
     async def test_list_files_reports_correct_metadata(self, tmp_path):
         content = b"x" * 100
         (tmp_path / "test.msz").write_bytes(content)
@@ -421,6 +553,28 @@ async def test_list_files_after_upload(msz_client, test_msz):
     assert files[0]["name"] == "test.msz"
     assert files[0]["size_bytes"] == len(payload)
     assert files[0]["format"] == "msz"
+
+
+@pytest.mark.asyncio
+async def test_list_files_after_mszx_upload(msz_client, test_mszx):
+    """An uploaded archive is listed as mszx and downloads unchanged."""
+    payload = test_mszx.read_bytes()
+    await msz_client.post(
+        "/v1/upload",
+        content=payload,
+        headers={
+            "X-Transfer-ID": "list-mszx",
+            "X-Original-Filename": "run.mszx",
+            "X-Source-Format": "mszx",
+        },
+    )
+
+    files = (await msz_client.get("/v1/files")).json()["files"]
+    assert files == [{"name": "run.mszx", "size_bytes": len(payload), "format": "mszx"}]
+
+    resp = await msz_client.get("/v1/files/run.mszx")
+    assert resp.status_code == 200
+    assert resp.content == payload
 
 
 @pytest.mark.asyncio

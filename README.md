@@ -50,7 +50,7 @@ mstransfer serve [--host 0.0.0.0] [--port 1319] [--output-dir ./received] [--sto
 | `--host` | `0.0.0.0` | Bind address |
 | `--port` | `1319` | Listen port |
 | `--output-dir` | `./received` | Where received files are written |
-| `--store-as` | `msz` | Store as `msz` (compressed) or `mzml` (decompress on arrival) |
+| `--store-as` | `msz` | Store as `msz` (compressed) or `mzml` (decompress on arrival). `.mszx` archives are always stored as-is. |
 
 ### `mstransfer upload`
 
@@ -69,6 +69,8 @@ Supported file types: `.mzML`, `.msz`, `.mszx`.
 
 - **mzML files** are compressed to MSZ on-the-fly via `compress_stream()` and streamed directly into the HTTP request — no temp files on the sender.
 - **MSZ / MSZX files** are streamed as-is.
+
+The client sends the format in an `X-Source-Format` header (`mzML`, `msz` or `mszx`). The server stores `.mszx` uploads untouched as `<stem>.mszx`, whatever `--store-as` says.
 
 ## Programmatic access
 
@@ -144,7 +146,9 @@ flowchart LR
     read --> upload
 
     subgraph Server
-        upload --> mode{store-as?}
+        upload --> kind{source format?}
+        kind -- mszx --> keep["write .mszx as-is"]
+        kind -- mzML / msz --> mode{store-as?}
         mode -- msz --> write["write to disk"]
         mode -- mzml --> temp["write temp .msz"]
         temp --> decompress["decompress"]

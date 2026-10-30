@@ -67,8 +67,8 @@ async def async_send_file(
     # Generate a unique transfer ID.
     transfer_id = str(uuid.uuid4())
 
-    # Normalize source into (file_path, filetype, mzml_obj | None).
-    file_path, filetype, mzml_obj = normalize_source(source)
+    # Normalize source into (file_path, format, mzml_obj | None).
+    file_path, fmt, mzml_obj = normalize_source(source)
 
     # Throttle progress callbacks to reduce overhead (default: every 8 MiB).
     throttled = ThrottledCallback(progress_callback) if progress_callback else None
@@ -92,7 +92,7 @@ async def async_send_file(
     headers = {
         "X-Transfer-ID": transfer_id,
         "X-Original-Filename": file_path.name,
-        "X-Source-Format": filetype,
+        "X-Source-Format": fmt.value,
         "Content-Type": "application/octet-stream",
     }
     if api_key:

@@ -1,15 +1,12 @@
 from __future__ import annotations
 
-import asyncio
 import logging
-from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import aiofiles
 import aiofiles.os
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
-from mscompress import MSZFile
 
 from mstransfer import __version__
 from mstransfer.server.models import (
@@ -19,9 +16,11 @@ from mstransfer.server.models import (
     TransferState,
     UploadResponse,
 )
+from mstransfer.store import MSFormat, StorePlan
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Callable
+    from pathlib import Path
 
     from mstransfer.server.state import AppState
 
@@ -96,9 +95,14 @@ def make_router(
         - `X-Transfer-ID`: A unique identifier for the transfer.
         - `X-Original-Filename`: The original filename of the uploaded file.
 
+        and optionally:
+
+        - `X-Source-Format`: `mzML`, `msz` or `mszx`. Inferred from the
+          filename extension when absent.
+
         The server will stream the incoming data to a file, update the transfer
         registry with the progress, and optionally decompress if configured to
-        do so.
+        do so. MSZX archives are always stored as-is, regardless of `store_as`.
         """
         # Get the transfer ID, raise if missing.
         transfer_id = request.headers.get("X-Transfer-ID")
@@ -112,24 +116,38 @@ def make_router(
                 status_code=400, detail="Missing X-Original-Filename header"
             )
 
-        output_dir = state.output_dir
-        store_as = state.store_as
+        # Determine the payload format, raise if unrecognised.
+        # Without the header, the format is inferred from the filename.
+        source_header = request.headers.get("X-Source-Format")
+        try:
+            source = (
+                MSFormat.from_header(source_header)
+                if source_header is not None
+                else None
+            )
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported X-Source-Format: {source_header!r}",
+            ) from exc
+
         registry = state.transfers
+        plan = StorePlan.for_upload(
+            state.output_dir, original_filename, source, MSFormat(state.store_as)
+        )
 
         # Create a new transfer record in the registry.
         registry.create(transfer_id, original_filename)
         logger.info("Receiving %s (transfer_id=%s)", original_filename, transfer_id)
 
-        # Use the filename stem for the output file.
-        stem = Path(original_filename).stem
-        msz_path = output_dir / f"{stem}.msz"
+        # Stream the incoming data to a temp .part file so a partial upload
+        # is never visible under its final name.
+        part_path = plan.unique_part_path()
         bytes_received = 0
-
-        # Stream the incoming data to a file asynchronously.
         update_every = 64  # throttle registry updates to reduce lock overhead
         chunk_count = 0
         try:
-            async with aiofiles.open(msz_path, "wb") as f:
+            async with aiofiles.open(part_path, "wb") as f:
                 async for chunk in request.stream():
                     await f.write(chunk)
                     bytes_received += len(chunk)
@@ -141,6 +159,7 @@ def make_router(
             registry.update(transfer_id, bytes_received=bytes_received)
 
         except Exception as exc:
+            part_path.unlink(missing_ok=True)
             registry.update(transfer_id, state=TransferState.ERROR, error=str(exc))
             raise HTTPException(
                 status_code=500, detail=f"Error receiving data: {exc}"
@@ -154,49 +173,23 @@ def make_router(
             transfer_id,
         )
 
-        if store_as == "msz":
-            # If we're storing as .msz, we're done at this point.
-            # Just update the registry with the final path and state.
+        # Move the .part file into place, converting it if store_as asks for a
+        # different format.  Archives are always kept as-is (see for_upload).
+        if plan.conversion is not None:
+            registry.update(transfer_id, state=TransferState.DECOMPRESSING)
+        try:
+            stored = await plan.finalize(part_path)
             registry.update(
                 transfer_id,
                 state=TransferState.DONE,
-                stored_as=str(msz_path),
+                stored_as=str(stored),
                 bytes_received=bytes_received,
             )
-        elif store_as == "mzml":
-            # If we need to decompress to .mzML, update the state and then
-            # offload the decompression to a thread to avoid blocking the event loop.
-            registry.update(transfer_id, state=TransferState.DECOMPRESSING)
-            try:
-                # Open the .msz file
-                msz_file = MSZFile(str(msz_path).encode())
-
-                # Construct the output path for the decompressed .mzML file
-                mzml_path = output_dir / f"{stem}.mzML"
-
-                # Offload decompression to a thread to avoid blocking the event loop
-                await asyncio.to_thread(msz_file.decompress, str(mzml_path))
-
-                # Clean up the original .msz file after successful decompression
-                await aiofiles.os.remove(str(msz_path))
-
-                # Update the registry with the final state and path
-                # to the decompressed file
-                registry.update(
-                    transfer_id,
-                    state=TransferState.DONE,
-                    stored_as=str(mzml_path),
-                    bytes_received=bytes_received,
-                )
-                logger.info("Decompressed to %s", mzml_path)
-            except Exception as exc:
-                # On error, update the registry w/ error and log the failure.
-                registry.update(
-                    transfer_id,
-                    state=TransferState.ERROR,
-                    error=str(exc),
-                )
-                logger.error("Decompression failed for %s: %s", transfer_id, exc)
+        except Exception as exc:
+            # On error, update the registry w/ error and log the failure.
+            part_path.unlink(missing_ok=True)
+            registry.update(transfer_id, state=TransferState.ERROR, error=str(exc))
+            logger.error("Storing %s failed: %s", transfer_id, exc)
 
         # Return the final transfer record as the response.
         final = registry.get(transfer_id)
