@@ -3,7 +3,7 @@ name = "mstransfer"
 version = "0.2.3"
 description = "Transfer mass spectrometry files (mzML/MSZ) between endpoints using mscompress"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 dependencies = [
     "mscompress>=1.2.0",
     "fastapi",
@@ -26,7 +26,7 @@ build-backend = "hatchling.build"
 packages = ["src/mstransfer"]
 
 [tool.ruff]
-target-version = "py310"
+target-version = "py311"
 line-length = 88
 
 [tool.ruff.lint]
@@ -37,7 +37,7 @@ include = ["src", "tests"]
 exclude = ["benchmark", ".venv", "**/__pycache__", "**/node_modules", "build", "dist"]
 
 [tool.mypy]
-python_version = "3.10"
+python_version = "3.11"
 strict = true
 warn_return_any = true
 warn_unused_configs = true
