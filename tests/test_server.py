@@ -481,7 +481,6 @@ async def test_upload_conflicting_with_stored_file_rejected(
     assert resp.json() == {
         "detail": "test.msz already exists on the server",
         "filename": "test.msz",
-        "reason": "exists",
     }
     # Rejected before the body was read; no transfer record or files left.
     assert not consumed
@@ -543,7 +542,7 @@ async def test_upload_conflicting_with_in_flight_transfer_rejected(
     )
     assert second.status_code == 409
     conflict = UploadConflict.model_validate(second.json())
-    assert conflict.reason == "in_progress"
+    assert "already being written" in conflict.detail
     assert conflict.filename == "run1.msz"
 
     release.set()
@@ -585,7 +584,7 @@ async def test_upload_store_as_mzml_leaves_unrelated_msz_alone(
     )
     assert again.status_code == 409
     conflict = UploadConflict.model_validate(again.json())
-    assert conflict.reason == "exists"
+    assert "already exists" in conflict.detail
     assert conflict.filename == "test.mzML"
 
 

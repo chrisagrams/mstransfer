@@ -311,7 +311,6 @@ class TestSendFile:
         stored.write_bytes(b"stored earlier")
         with pytest.raises(UploadConflictError) as exc_info:
             send_file(test_msz, _live_server["base_url"])
-        assert exc_info.value.conflict.reason == "exists"
         assert exc_info.value.conflict.filename == "test.msz"
         assert "409 Conflict: test.msz already exists" in str(exc_info.value)
         assert stored.read_bytes() == b"stored earlier"

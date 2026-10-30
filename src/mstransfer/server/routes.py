@@ -164,7 +164,6 @@ def make_router(
                 UploadConflict(
                     detail=f"{existing.name} already exists on the server",
                     filename=existing.name,
-                    reason="exists",
                 )
             )
         dest = plan.final_dest
@@ -173,7 +172,6 @@ def make_router(
                 UploadConflict(
                     detail=f"{dest.name} is already being written by another transfer",
                     filename=dest.name,
-                    reason="in_progress",
                 )
             )
         try:

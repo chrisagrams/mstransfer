@@ -51,13 +51,13 @@ class UploadResponse(BaseModel):
 class UploadConflict(BaseModel):
     """Response body for an upload refused with 409 Conflict.
 
-    *reason* is ``"exists"`` when *filename* is already stored, or
-    ``"in_progress"`` when another transfer is still writing it.
+    *filename* is the stored file the upload would have replaced, which
+    can differ from the uploaded name (e.g. ``run.mzML`` is stored as
+    ``run.msz``).
     """
 
     detail: str
     filename: str
-    reason: Literal["exists", "in_progress"]
 
 
 class FileInfo(BaseModel):
