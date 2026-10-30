@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 import aiofiles
 import aiofiles.os
@@ -32,6 +32,27 @@ def _state_from_app(request: Request) -> AppState:
 
 
 logger = logging.getLogger(__name__)
+
+SourceFormat = Literal["mzml", "msz", "mszx"]
+SOURCE_FORMATS: frozenset[str] = frozenset({"mzml", "msz", "mszx"})
+
+
+def _resolve_source_format(header: str | None, filename: str) -> SourceFormat:
+    """Determine what the client sent from ``X-Source-Format`` or *filename*.
+
+    The header is matched case-insensitively.  When it is absent, a
+    ``.mszx`` filename means an archive; anything else is treated as an
+    MSZ stream, which is what clients sent before the header existed.
+    Raises a 400 for an unrecognised header value.
+    """
+    if header is None:
+        return "mszx" if Path(filename).suffix.lower() == ".mszx" else "msz"
+    fmt = header.strip().lower()
+    if fmt not in SOURCE_FORMATS:
+        raise HTTPException(
+            status_code=400, detail=f"Unsupported X-Source-Format: {header!r}"
+        )
+    return fmt  # type: ignore[return-value]
 
 
 def make_router(
@@ -105,8 +126,14 @@ def make_router(
             - X-Transfer-ID: A unique identifier for the transfer.
             - X-Original-Filename: The original filename of the uploaded file.
 
+        and optionally:
+
+            - X-Source-Format: ``mzML``, ``msz`` or ``mszx``.  Inferred from
+              the filename extension when absent.
+
         The server will stream the incoming data to a file, update the transfer registry
-        with the progress, and optionally decompress if configured to do so.
+        with the progress, and optionally decompress if configured to do so.  MSZX
+        archives are always stored as-is, regardless of ``store_as``.
         """
         # Get the transfer ID, raise if missing.
         transfer_id = request.headers.get("X-Transfer-ID")
@@ -120,6 +147,10 @@ def make_router(
                 status_code=400, detail="Missing X-Original-Filename header"
             )
 
+        source_format = _resolve_source_format(
+            request.headers.get("X-Source-Format"), original_filename
+        )
+
         output_dir = state.output_dir
         store_as = state.store_as
         registry = state.transfers
@@ -128,16 +159,18 @@ def make_router(
         registry.create(transfer_id, original_filename)
         logger.info("Receiving %s (transfer_id=%s)", original_filename, transfer_id)
 
-        # Use the filename stem for the output file.
+        # Use the filename stem for the output file.  mzML sources arrive
+        # as a compressed MSZ stream, so only archives keep their own suffix.
         stem = Path(original_filename).stem
-        msz_path = output_dir / f"{stem}.msz"
+        suffix = ".mszx" if source_format == "mszx" else ".msz"
+        received_path = output_dir / f"{stem}{suffix}"
         bytes_received = 0
 
         # Stream the incoming data to a file asynchronously.
         update_every = 64  # throttle registry updates to reduce lock overhead
         chunk_count = 0
         try:
-            async with aiofiles.open(msz_path, "wb") as f:
+            async with aiofiles.open(received_path, "wb") as f:
                 async for chunk in request.stream():
                     await f.write(chunk)
                     bytes_received += len(chunk)
@@ -162,13 +195,14 @@ def make_router(
             transfer_id,
         )
 
-        if store_as == "msz":
-            # If we're storing as .msz, we're done at this point.
+        if source_format == "mszx" or store_as == "msz":
+            # Archives are kept untouched, and .msz needs no conversion,
+            # so we're done at this point.
             # Just update the registry with the final path and state.
             registry.update(
                 transfer_id,
                 state=TransferState.DONE,
-                stored_as=str(msz_path),
+                stored_as=str(received_path),
                 bytes_received=bytes_received,
             )
         elif store_as == "mzml":
@@ -177,7 +211,7 @@ def make_router(
             registry.update(transfer_id, state=TransferState.DECOMPRESSING)
             try:
                 # Open the .msz file
-                msz_file = MSZFile(str(msz_path).encode())
+                msz_file = MSZFile(str(received_path).encode())
 
                 # Construct the output path for the decompressed .mzML file
                 mzml_path = output_dir / f"{stem}.mzML"
@@ -186,7 +220,7 @@ def make_router(
                 await asyncio.to_thread(msz_file.decompress, str(mzml_path))
 
                 # Clean up the original .msz file after successful decompression
-                await aiofiles.os.remove(str(msz_path))
+                await aiofiles.os.remove(str(received_path))
 
                 # Update the registry with the final state and path
                 # to the decompressed file

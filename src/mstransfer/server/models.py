@@ -10,6 +10,7 @@ from typing import Literal
 from pydantic import BaseModel, Field, SerializeAsAny
 
 StoreFormat = Literal["msz", "mzml"]
+FileFormat = Literal["msz", "mzml", "mszx"]
 
 
 class TransferState(StrEnum):
@@ -56,7 +57,7 @@ class FileInfo(BaseModel):
 
     name: str
     size_bytes: int
-    format: StoreFormat
+    format: FileFormat
 
 
 class FileListResponse(BaseModel):

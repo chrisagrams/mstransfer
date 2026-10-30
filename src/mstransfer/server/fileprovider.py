@@ -10,10 +10,11 @@ from typing import TYPE_CHECKING, Protocol, runtime_checkable
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-from mstransfer.server.models import FileInfo, StoreFormat
+from mstransfer.server.models import FileFormat, FileInfo
 
-VALID_EXTENSIONS: dict[str, StoreFormat] = {
+VALID_EXTENSIONS: dict[str, FileFormat] = {
     ".msz": "msz",
+    ".mszx": "mszx",
     ".mzml": "mzml",
 }
 
@@ -33,13 +34,13 @@ class FileProvider(Protocol):
 
 
 class DirectoryFileProvider:
-    """Default provider — scans a directory for .msz/.mzML files."""
+    """Default provider — scans a directory for .msz/.mszx/.mzML files."""
 
     def __init__(self, directory: Path) -> None:
         self._directory = directory
 
     async def list_files(self) -> Sequence[FileInfo]:
-        """Return metadata for every .msz / .mzML file in the directory."""
+        """Return metadata for every .msz / .mszx / .mzML file in the directory."""
         return await asyncio.to_thread(self._scan)
 
     async def get_file(self, filename: str) -> Path | None:
