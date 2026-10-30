@@ -46,7 +46,7 @@ and `docs/`. API reference pages are generated from docstrings with
 mkdocstrings.
 
 ```bash
-uvx --with-requirements docs/requirements.txt zensical serve
+uv run --only-group docs zensical serve
 ```
 
 To add a page, create it under `docs/` and add it to the `nav` in
