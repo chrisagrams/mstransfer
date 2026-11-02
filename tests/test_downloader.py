@@ -1448,14 +1448,12 @@ class RangeServer:
         body: bytes,
         *,
         etag: str | None = '"v1"',
-        last_modified: str | None = None,
         ranges: bool = True,
         honor_if_range: bool = True,
         sized: bool = True,
     ) -> None:
         self.body = body
         self.etag = etag
-        self.last_modified = last_modified
         self.ranges = ranges
         self.honor_if_range = honor_if_range
         self.sized = sized
@@ -1468,12 +1466,10 @@ class RangeServer:
         headers = {}
         if self.etag:
             headers["etag"] = self.etag
-        if self.last_modified:
-            headers["last-modified"] = self.last_modified
         body, status = self.body, 200
         range_ = request.headers.get("range")
         if_range = request.headers.get("if-range")
-        unchanged = if_range is None or if_range in (self.etag, self.last_modified)
+        unchanged = if_range is None or if_range == self.etag
         if range_ and self.ranges and (unchanged or not self.honor_if_range):
             start = int(range_.removeprefix("bytes=").removesuffix("-"))
             size = len(self.body)
@@ -1531,7 +1527,7 @@ class TestResume:
         assert part.read_bytes() == BODY[:4000]
         assert json.loads((tmp_path / "f.bin.part.json").read_text()) == {
             "url": "http://test/f.bin",
-            "validator": '"v1"',
+            "etag": '"v1"',
             "total": len(BODY),
         }
 
@@ -1608,7 +1604,7 @@ class TestResume:
         assert list(tmp_path.iterdir()) == [dest]
 
     def test_failed_restart_does_not_mislabel_partial(self, tmp_path):
-        """A restart that fails early leaves no old bytes under the new validator."""
+        """A restart that fails early leaves no old bytes under the new ETag."""
         server = RangeServer(BODY)
         dest = tmp_path / "f.bin"
         _interrupt(server, dest)
@@ -1662,11 +1658,11 @@ class TestResume:
 
     @pytest.mark.parametrize(
         "kwargs",
-        [{"etag": None}, {"sized": False}],
-        ids=["no-validator", "no-size"],
+        [{"etag": None}, {"etag": 'W/"v1"'}, {"sized": False}],
+        ids=["no-etag", "weak-etag", "no-size"],
     )
     def test_unverifiable_partial_is_not_kept(self, tmp_path, kwargs):
-        """Without a validator and a size, a failed download keeps nothing."""
+        """Without a strong ETag and a size, a failed download keeps nothing."""
         server = RangeServer(BODY, **kwargs)
         dest = tmp_path / "f.bin"
         _interrupt(server, dest)
@@ -1676,11 +1672,11 @@ class TestResume:
         "meta",
         [
             "not json",
-            '{"url": "http://test/f.bin", "validator": "\\"v1\\""}',
-            '{"url": "http://test/f.bin", "validator": 1, "total": 10240}',
-            '{"url": "http://test/f.bin", "validator": "\\"v1\\"", "total": 0}',
+            '{"url": "http://test/f.bin", "etag": "\\"v1\\""}',
+            '{"url": "http://test/f.bin", "etag": 1, "total": 10240}',
+            '{"url": "http://test/f.bin", "etag": "\\"v1\\"", "total": 0}',
         ],
-        ids=["not-json", "missing-total", "non-string-validator", "zero-total"],
+        ids=["not-json", "missing-total", "non-string-etag", "zero-total"],
     )
     def test_invalid_partial_info_restarts(self, tmp_path, meta):
         """A .part.json that does not validate is ignored, not trusted or fatal."""
@@ -1695,24 +1691,12 @@ class TestResume:
         assert list(tmp_path.iterdir()) == [dest]
 
     def test_empty_file(self, tmp_path):
-        """An empty file with a validator downloads and leaves nothing behind."""
+        """An empty file with an ETag downloads and leaves nothing behind."""
         server = RangeServer(b"")
         dest = tmp_path / "f.bin"
         assert _fetch(server, dest) == dest
         assert dest.read_bytes() == b""
         assert list(tmp_path.iterdir()) == [dest]
-
-    def test_weak_etag_falls_back_to_last_modified(self, tmp_path):
-        """If-Range needs a strong validator, so a weak ETag is not used."""
-        date = "Mon, 02 Nov 2026 12:00:00 GMT"
-        server = RangeServer(BODY, etag='W/"v1"', last_modified=date)
-        dest = tmp_path / "f.bin"
-        _interrupt(server, dest)
-
-        _fetch(server, dest)
-        assert server.requests[-1].headers["if-range"] == date
-        assert server.statuses[-1] == 206
-        assert dest.read_bytes() == BODY
 
     def test_resume_false_keeps_nothing(self, tmp_path):
         """resume=False neither uses nor keeps a partial."""

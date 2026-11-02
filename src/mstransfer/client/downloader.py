@@ -70,12 +70,12 @@ class DownloadResult:
 class _PartialInfo(BaseModel):
     """What a resumable .part file holds: the start of *url*'s *total*-byte body.
 
-    *validator* is the strong ``ETag`` or ``Last-Modified`` the body was sent
-    with, so a resumed range can be checked against it.
+    *etag* is the strong ``ETag`` the body was sent with, so a resumed range
+    can be checked against it.
     """
 
     url: str
-    validator: str
+    etag: str
     total: int = Field(gt=0)
 
 
@@ -101,10 +101,10 @@ async def async_download_file(
     With *resume*, an interrupted download keeps its partial ``.part`` file
     (and a ``.part.json`` describing it) next to *dest*, and a later call
     continues from the bytes already received.  A partial is only kept when
-    the server sent a strong ``ETag`` or a ``Last-Modified`` validator and the
-    body size, and it is only resumed with an ``If-Range`` request carrying
-    that validator.  If the server does not support ranges, or the file
-    changed, the download restarts from zero.  The finished file must have
+    the server sent a strong ``ETag`` and the body size, and it is only
+    resumed with an ``If-Range`` request carrying that ``ETag``.  If the
+    server does not support ranges, or the file changed, the download
+    restarts from zero.  The finished file must have
     exactly the expected size.
 
     Parameters
@@ -200,9 +200,9 @@ async def async_download_file(
             part_path = plan.part_path
 
     # What a partial from an earlier attempt claims to be: the bytes of a
-    # *total*-byte body of *url*, as identified by *validator*.
+    # *total*-byte body of *url*, as identified by *etag*.
     offset = 0
-    validator: str | None = None
+    etag: str | None = None
     total: int | None = None
     expected_range = ""
     if lock is not None and not force:
@@ -213,7 +213,7 @@ async def async_download_file(
         except (OSError, ValidationError):
             info = None
         if info is not None and info.url == url and 0 < offset < info.total:
-            validator, total = info.validator, info.total
+            etag, total = info.etag, info.total
             expected_range = f"bytes {offset}-{total - 1}/{total}"
         else:
             offset = 0
@@ -236,7 +236,7 @@ async def async_download_file(
                 request_headers = dict(headers)
                 if offset:
                     request_headers["Range"] = f"bytes={offset}-"
-                    request_headers["If-Range"] = str(validator)
+                    request_headers["If-Range"] = str(etag)
                 async with c.stream(
                     "GET",
                     url,
@@ -246,13 +246,9 @@ async def async_download_file(
                     # Content-Length counts encoded bytes, but the body is read
                     # decoded, so neither its size nor byte ranges can be used.
                     encoded = "content-encoding" in resp.headers
-                    etag = resp.headers.get("etag")
-                    # If-Range needs a strong validator, so skip weak ETags.
-                    resp_validator = (
-                        etag
-                        if etag and not etag.startswith("W/")
-                        else resp.headers.get("last-modified")
-                    )
+                    resp_etag = resp.headers.get("etag")
+                    if resp_etag and resp_etag.startswith("W/"):
+                        resp_etag = None  # If-Range needs a strong ETag.
 
                     if offset and resp.status_code == 416:
                         # The server no longer has our range: start over.
@@ -265,7 +261,7 @@ async def async_download_file(
                         # The range must continue our partial of the same file.
                         if (
                             encoded
-                            or resp_validator != validator
+                            or resp_etag != etag
                             or resp.headers.get("content-range") != expected_range
                         ):
                             logger.info("Partial of %s is stale, restarting", url)
@@ -288,13 +284,13 @@ async def async_download_file(
                         part_path.unlink(missing_ok=True)
                         cl = resp.headers.get("content-length")
                         total = int(cl) if cl and not encoded else None
-                        validator = resp_validator
+                        etag = resp_etag
                         # An empty body has nothing to resume.
                         retain = False
-                        if lock is not None and validator is not None and total:
+                        if lock is not None and etag is not None and total:
                             meta_path.write_text(
                                 _PartialInfo(
-                                    url=url, validator=validator, total=total
+                                    url=url, etag=etag, total=total
                                 ).model_dump_json()
                             )
                             retain = True
@@ -323,7 +319,7 @@ async def async_download_file(
         return await plan.finalize(part_path)
     finally:
         # Keep a resumable partial for a later attempt.  Anything else, like
-        # the .part of a cancelled download without a validator, is dead
+        # the .part of a cancelled download without an ETag, is dead
         # weight.  Cancellation is covered too, as it is not an Exception.
         try:
             keep = retain and part_path.stat().st_size > 0
