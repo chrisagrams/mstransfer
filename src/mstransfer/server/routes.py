@@ -1,15 +1,16 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Annotated, Any
 
 import aiofiles
 import aiofiles.os
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, Security
 from fastapi.responses import StreamingResponse
 
 from mstransfer import __version__
 from mstransfer.server.models import (
+    ErrorResponse,
     FileListResponse,
     HealthResponse,
     TransferRecord,
@@ -19,7 +20,7 @@ from mstransfer.server.models import (
 from mstransfer.store import MSFormat, StorePlan
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator, Callable
+    from collections.abc import AsyncGenerator, Callable, Sequence
     from pathlib import Path
 
     from mstransfer.server.state import AppState
@@ -36,6 +37,7 @@ logger = logging.getLogger(__name__)
 def make_router(
     auth_dep: Callable[..., Any] | None = None,
     state: AppState | None = None,
+    security_schemes: Sequence[Callable[..., Any]] = (),
 ) -> APIRouter:
     """Create the API router, optionally protecting routes with *auth_dep*.
 
@@ -49,6 +51,12 @@ def make_router(
         ``request.app.state``.  This allows the router to be included
         in a parent app with ``app.include_router(...)`` without
         requiring the parent to set up ``app.state``.
+    security_schemes:
+        FastAPI security scheme instances (``HTTPBearer``,
+        ``APIKeyQuery``, ...) that *auth_dep* accepts, e.g.
+        ``APIKeyAuthProvider.security_schemes``.  They only document the
+        protected routes in the OpenAPI schema; *auth_dep* still decides
+        access.  Ignored without *auth_dep*.
     """
 
     if state is not None:
@@ -62,7 +70,17 @@ def make_router(
         state_dep = Depends(_state_from_app)
 
     router = APIRouter()
-    protected: list[Any] = [Depends(auth_dep)] if auth_dep else []
+    # Protected routes carry x-requires-auth, a 401 response and, if given,
+    # the security schemes, so the schema tells them apart from /health.
+    protected: list[Any] = []
+    auth_extra: dict[str, Any] = {}
+    auth_responses: dict[int | str, dict[str, Any]] = {}
+    if auth_dep:
+        protected = [Depends(auth_dep), *(Security(s) for s in security_schemes)]
+        auth_extra = {"x-requires-auth": True}
+        auth_responses = {
+            401: {"model": ErrorResponse, "description": "Invalid or missing auth"}
+        }
 
     @router.get("/health", response_model=HealthResponse)
     async def health(state: AppState = state_dep) -> HealthResponse:
@@ -80,6 +98,11 @@ def make_router(
         "/transfer/{transfer_id}/status",
         response_model=TransferRecord,
         dependencies=protected,
+        openapi_extra=auth_extra,
+        responses={
+            **auth_responses,
+            404: {"model": ErrorResponse, "description": "Unknown transfer ID"},
+        },
     )
     async def transfer_status(
         transfer_id: str, state: AppState = state_dep
@@ -95,19 +118,61 @@ def make_router(
             raise HTTPException(status_code=404, detail="Transfer not found")
         return record
 
-    @router.post("/upload", response_model=UploadResponse, dependencies=protected)
-    async def upload(request: Request, state: AppState = state_dep) -> UploadResponse:
+    @router.post(
+        "/upload",
+        response_model=UploadResponse,
+        dependencies=protected,
+        openapi_extra={
+            # Streamed from request.stream(); a Body() param would buffer it.
+            # An empty media type object is OpenAPI 3.1's binary body.
+            "requestBody": {
+                "required": True,
+                "content": {"application/octet-stream": {}},
+            },
+            **auth_extra,
+        },
+        responses={
+            400: {"model": ErrorResponse},
+            **auth_responses,
+            409: {"model": ErrorResponse},
+            500: {"model": ErrorResponse},
+        },
+    )
+    async def upload(
+        request: Request,
+        transfer_id: Annotated[
+            str,
+            Header(
+                alias="X-Transfer-ID",
+                min_length=1,
+                description="A unique identifier for the transfer.",
+            ),
+        ],
+        original_filename: Annotated[
+            str,
+            Header(
+                alias="X-Original-Filename",
+                min_length=1,
+                description="The original filename of the uploaded file.",
+            ),
+        ],
+        source_header: Annotated[
+            str | None,
+            Header(
+                alias="X-Source-Format",
+                description=(
+                    "mzML, msz or mszx, case-insensitive.  Inferred from the "
+                    "filename extension when absent."
+                ),
+            ),
+        ] = None,
+        state: AppState = state_dep,
+    ) -> UploadResponse:
         """
         Endpoint to handle file uploads. Expects the file content in the request body
-        and requires the following headers:
-
-            - X-Transfer-ID: A unique identifier for the transfer.
-            - X-Original-Filename: The original filename of the uploaded file.
-
-        and optionally:
-
-            - X-Source-Format: ``mzML``, ``msz`` or ``mszx``.  Inferred from
-              the filename extension when absent.
+        and the ``X-Transfer-ID`` and ``X-Original-Filename`` headers, plus an
+        optional ``X-Source-Format`` header.  A missing or empty required header
+        responds 422; an unsupported ``X-Source-Format`` responds 400.
 
         Responds 409 Conflict, before reading the request body, if the output
         file already exists or another transfer is writing it.
@@ -116,21 +181,8 @@ def make_router(
         with the progress, and optionally decompress if configured to do so.  MSZX
         archives are always stored as-is, regardless of ``store_as``.
         """
-        # Get the transfer ID, raise if missing.
-        transfer_id = request.headers.get("X-Transfer-ID")
-        if not transfer_id:
-            raise HTTPException(status_code=400, detail="Missing X-Transfer-ID header")
-
-        # Get the original filename, raise if missing.
-        original_filename = request.headers.get("X-Original-Filename")
-        if not original_filename:
-            raise HTTPException(
-                status_code=400, detail="Missing X-Original-Filename header"
-            )
-
         # Determine the payload format, raise if unrecognised.
         # Without the header, the format is inferred from the filename.
-        source_header = request.headers.get("X-Source-Format")
         try:
             source = (
                 MSFormat.from_header(source_header)
@@ -238,7 +290,12 @@ def make_router(
         finally:
             state.outputs.release(dest)
 
-    @router.get("/files", dependencies=protected)
+    @router.get(
+        "/files",
+        dependencies=protected,
+        openapi_extra=auth_extra,
+        responses=auth_responses,
+    )
     async def list_files(state: AppState = state_dep) -> FileListResponse:
         """List all files available for download.
 
@@ -250,7 +307,20 @@ def make_router(
         files = await state.files.list_files()
         return FileListResponse(files=files)
 
-    @router.get("/files/{filename}", dependencies=protected)
+    @router.get(
+        "/files/{filename}",
+        response_class=StreamingResponse,
+        dependencies=protected,
+        openapi_extra=auth_extra,
+        responses={
+            200: {
+                "description": "The file's bytes",
+                "content": {"application/octet-stream": {}, "application/xml": {}},
+            },
+            **auth_responses,
+            404: {"model": ErrorResponse, "description": "File not found"},
+        },
+    )
     async def download_file(
         filename: str, state: AppState = state_dep
     ) -> StreamingResponse:

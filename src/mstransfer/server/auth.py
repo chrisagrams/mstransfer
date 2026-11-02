@@ -6,9 +6,10 @@ import hmac
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable
+    from collections.abc import Awaitable, Callable, Sequence
 
 from fastapi import HTTPException, Request
+from fastapi.security import APIKeyQuery, HTTPBearer
 from pydantic import BaseModel, Field
 
 
@@ -27,6 +28,21 @@ class AuthProvider(Protocol):
     async def authenticate(self, request: Request) -> AuthContext: ...
 
 
+@runtime_checkable
+class SecuritySchemeProvider(Protocol):
+    """Optional contract for an auth provider to document itself in OpenAPI.
+
+    Kept apart from :class:`AuthProvider` so providers that only implement
+    ``authenticate`` remain valid.  ``create_app`` adds these FastAPI security
+    scheme instances (``HTTPBearer``, ``APIKeyQuery``, ...) to the protected
+    routes.  They only document how to authenticate, so they must not reject
+    requests: create them with ``auto_error=False``.
+    """
+
+    @property
+    def security_schemes(self) -> Sequence[Callable[..., Any]]: ...
+
+
 class NoAuthProvider:
     """Default no-op provider — allows all requests."""
 
@@ -35,7 +51,20 @@ class NoAuthProvider:
 
 
 class APIKeyAuthProvider:
-    """Validates ``Authorization: Bearer <key>`` or ``?api_key=`` query param."""
+    """Validates ``Authorization: Bearer <key>`` or ``?api_key=`` query param.
+
+    Implements :class:`SecuritySchemeProvider` to document both ways of
+    passing the key in the OpenAPI schema.
+    """
+
+    security_schemes: Sequence[Callable[..., Any]] = (
+        HTTPBearer(auto_error=False, description="The API key as a bearer token."),
+        APIKeyQuery(
+            name="api_key",
+            auto_error=False,
+            description="The API key as a query parameter.",
+        ),
+    )
 
     def __init__(self, api_key: str) -> None:
         # compare_digest only accepts ASCII str, so compare UTF-8 bytes instead.

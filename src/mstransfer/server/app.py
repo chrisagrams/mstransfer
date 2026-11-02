@@ -5,7 +5,11 @@ from typing import TYPE_CHECKING, Any
 
 from fastapi import FastAPI
 
-from mstransfer.server.auth import AuthProvider, make_auth_dependency
+from mstransfer.server.auth import (
+    AuthProvider,
+    SecuritySchemeProvider,
+    make_auth_dependency,
+)
 from mstransfer.server.fileprovider import DirectoryFileProvider, FileProvider
 
 if TYPE_CHECKING:
@@ -51,5 +55,9 @@ def create_app(
         file_provider = DirectoryFileProvider(out)
 
     app.state = AppState(output_dir=out, store_as=store_as, files=file_provider)
-    app.include_router(make_router(auth_dep=auth_dep), prefix="/v1")
+    security_schemes = (
+        auth.security_schemes if isinstance(auth, SecuritySchemeProvider) else ()
+    )
+    router = make_router(auth_dep=auth_dep, security_schemes=security_schemes)
+    app.include_router(router, prefix="/v1")
     return app

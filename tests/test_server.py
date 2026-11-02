@@ -369,8 +369,8 @@ async def test_upload_missing_transfer_id(msz_client):
         content=b"data",
         headers={"X-Original-Filename": "test.msz"},
     )
-    assert resp.status_code == 400
-    assert "X-Transfer-ID" in resp.json()["detail"]
+    assert resp.status_code == 422
+    assert resp.json()["detail"][0]["loc"] == ["header", "X-Transfer-ID"]
 
 
 @pytest.mark.asyncio
@@ -413,14 +413,27 @@ async def test_upload_preserves_filename_stem(msz_client, tmp_output, test_msz):
 
 @pytest.mark.asyncio
 async def test_upload_missing_filename(msz_client, tmp_output, test_msz):
-    """Missing X-Original-Filename header should return 400."""
+    """Missing X-Original-Filename header should return 422."""
     resp = await msz_client.post(
         "/v1/upload",
         content=test_msz.read_bytes(),
         headers={"X-Transfer-ID": "default-name-test"},
     )
-    assert resp.status_code == 400
-    assert "X-Original-Filename" in resp.json()["detail"]
+    assert resp.status_code == 422
+    assert resp.json()["detail"][0]["loc"] == ["header", "X-Original-Filename"]
+    assert list(tmp_output.iterdir()) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("header", ["X-Transfer-ID", "X-Original-Filename"])
+async def test_upload_empty_required_header(msz_client, tmp_output, header):
+    """An empty required header is rejected like a missing one."""
+    headers = {"X-Transfer-ID": "empty-test", "X-Original-Filename": "e.msz"}
+    headers[header] = ""
+    resp = await msz_client.post("/v1/upload", content=b"data", headers=headers)
+    assert resp.status_code == 422
+    assert resp.json()["detail"][0]["loc"] == ["header", header]
+    assert list(tmp_output.iterdir()) == []
 
 
 @pytest.mark.asyncio
