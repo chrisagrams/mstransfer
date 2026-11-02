@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import httpx
 import pytest
 
+from mstransfer.server.app import create_app
 from mstransfer.server.auth import (
     APIKeyAuthProvider,
     AuthContext,
@@ -99,6 +101,43 @@ class TestAPIKeyAuthProvider:
         )
         # 404 means auth passed
         assert resp.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_non_ascii_bearer_token_rejected(self, authed_client):
+        resp = await authed_client.get(
+            "/v1/transfer/nonexistent/status",
+            headers={"Authorization": "Bearer café".encode()},
+        )
+        assert resp.status_code == 401
+
+    @pytest.mark.asyncio
+    async def test_non_ascii_query_param_rejected(self, authed_client):
+        resp = await authed_client.get(
+            "/v1/transfer/nonexistent/status", params={"api_key": "café"}
+        )
+        assert resp.status_code == 401
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("headers", "params", "expected"),
+        [
+            ({"Authorization": "Bearer café".encode()}, None, 404),
+            (None, {"api_key": "café"}, 404),
+            ({"Authorization": "Bearer wrong"}, None, 401),
+            (None, {"api_key": "wrong"}, 401),
+        ],
+    )
+    async def test_non_ascii_configured_key(
+        self, tmp_output, headers, params, expected
+    ):
+        app = create_app(output_dir=str(tmp_output), auth=APIKeyAuthProvider("café"))
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+            resp = await c.get(
+                "/v1/transfer/nonexistent/status", headers=headers, params=params
+            )
+        # 404 means auth passed
+        assert resp.status_code == expected
 
     def test_satisfies_protocol(self):
         assert isinstance(APIKeyAuthProvider("key"), AuthProvider)

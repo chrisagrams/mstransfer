@@ -38,19 +38,24 @@ class APIKeyAuthProvider:
     """Validates ``Authorization: Bearer <key>`` or ``?api_key=`` query param."""
 
     def __init__(self, api_key: str) -> None:
-        self._api_key = api_key
+        # compare_digest only accepts ASCII str, so compare UTF-8 bytes instead.
+        self._api_key = api_key.encode()
 
     async def authenticate(self, request: Request) -> AuthContext:
         # Try Authorization header first
         auth_header = request.headers.get("Authorization", "")
         if auth_header.startswith("Bearer "):
-            token = auth_header.removeprefix("Bearer ")
+            # Starlette decodes header bytes as latin-1; re-encoding recovers
+            # the raw bytes the client sent, so a UTF-8 key matches.
+            token = auth_header.removeprefix("Bearer ").encode("latin-1")
             if hmac.compare_digest(token, self._api_key):
                 return AuthContext(identity="api-key")
 
-        # Fall back to query parameter
+        # Fall back to query parameter (already percent-decoded as UTF-8)
         query_key = request.query_params.get("api_key")
-        if query_key is not None and hmac.compare_digest(query_key, self._api_key):
+        if query_key is not None and hmac.compare_digest(
+            query_key.encode(), self._api_key
+        ):
             return AuthContext(identity="api-key")
 
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
