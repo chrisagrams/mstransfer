@@ -406,7 +406,15 @@ def main() -> None:
     )
     dp.set_defaults(func=cmd_download)
 
-    args = parser.parse_args()
+    argv = sys.argv[1:]
+    if argv[:1] == ["upload"]:
+        # Intermixed parsing lets options sit between the paths and the target.
+        # It can't run on the top-level parser because of the subparsers.
+        args = sp.parse_intermixed_args(
+            argv[1:], namespace=argparse.Namespace(command="upload")
+        )
+    else:
+        args = parser.parse_args(argv)
     if args.command is None:
         parser.print_help()
         sys.exit(0)

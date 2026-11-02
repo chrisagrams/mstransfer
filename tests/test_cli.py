@@ -700,6 +700,33 @@ class TestMain:
             main()
         mock_cmd_upload.assert_called_once()
 
+    @pytest.mark.parametrize(
+        "argv",
+        [
+            ["a.mzML", "b.msz", "runs/", "-r", "-p", "8", "host:1319"],
+            ["-r", "-p", "8", "a.mzML", "b.msz", "runs/", "host:1319"],
+            ["a.mzML", "b.msz", "runs/", "host:1319", "-r", "-p", "8"],
+            ["a.mzML", "-r", "b.msz", "-p", "8", "runs/", "host:1319"],
+        ],
+    )
+    @patch("mstransfer.cli.cmd_upload")
+    def test_main_upload_options_anywhere(self, mock_cmd_upload, argv):
+        """Options may come before, between or after the upload positionals."""
+        with patch("sys.argv", ["mstransfer", "upload", *argv]):
+            main()
+        args = mock_cmd_upload.call_args[0][0]
+        assert args.command == "upload"
+        assert args.targets == ["a.mzML", "b.msz", "runs/", "host:1319"]
+        assert args.recursive is True
+        assert args.parallel == 8
+
+    def test_main_upload_unknown_option_errors(self, capsys):
+        argv = ["mstransfer", "upload", "a.mzML", "--bogus", "host"]
+        with patch("sys.argv", argv), pytest.raises(SystemExit) as exc:
+            main()
+        assert exc.value.code == 2
+        assert "unrecognized arguments: --bogus" in capsys.readouterr().err
+
     @patch("mstransfer.cli.cmd_download")
     def test_main_dispatches_download(self, mock_cmd_download):
         with patch("sys.argv", ["mstransfer", "download", "http://host/f.msz"]):
