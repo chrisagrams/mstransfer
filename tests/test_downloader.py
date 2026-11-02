@@ -125,11 +125,9 @@ class TestDownloadFile:
 
     def test_atomic_write_no_partial_file(self, served_files, tmp_path):
         """The .part file should not exist after a successful download."""
-        dest = tmp_path / "small.bin"
+        dest = tmp_path / "out" / "small.bin"
         download_file(f"{served_files['base_url']}/small.bin", dest)
-        part_path = dest.with_suffix(dest.suffix + ".part")
-        assert not part_path.exists()
-        assert dest.exists()
+        assert list(dest.parent.iterdir()) == [dest]
 
     def test_progress_callback(self, served_files, tmp_path):
         """Progress callback is invoked with byte deltas."""
@@ -203,11 +201,72 @@ class TestDownloadFile:
 
     def test_http_404_raises(self, served_files, tmp_path):
         """HTTP 404 raises an httpx.HTTPStatusError."""
-        dest = tmp_path / "missing.bin"
+        dest = tmp_path / "out" / "missing.bin"
         with pytest.raises(httpx.HTTPStatusError):
             download_file(f"{served_files['base_url']}/nonexistent", dest)
         # No partial file should remain.
-        assert not dest.exists()
+        assert list(dest.parent.iterdir()) == []
+
+    def test_failed_stream_removes_part_file(self, tmp_path):
+        """A body that fails partway leaves no .part file behind."""
+
+        class FailingStream(httpx.AsyncByteStream):
+            async def __aiter__(self):
+                yield b"partial"
+                raise httpx.ReadError("connection lost")
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, stream=FailingStream())
+
+        async def _run() -> None:
+            async with httpx.AsyncClient(
+                transport=httpx.MockTransport(handler)
+            ) as client:
+                await async_download_file(
+                    "http://test/f.bin",
+                    tmp_path / "f.bin",
+                    chunk_size=1,
+                    client=client,
+                )
+
+        with pytest.raises(httpx.ReadError):
+            asyncio.run(_run())
+        assert list(tmp_path.iterdir()) == []
+
+    def test_concurrent_downloads_to_same_dest(self, tmp_path):
+        """Two downloads to one dest don't share a .part file."""
+        fills = iter([b"a", b"b"])
+
+        class SlowStream(httpx.AsyncByteStream):
+            def __init__(self, fill: bytes) -> None:
+                self._fill = fill
+
+            async def __aiter__(self):
+                for _ in range(8):
+                    yield self._fill * 4
+                    await asyncio.sleep(0)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, stream=SlowStream(next(fills)))
+
+        dest = tmp_path / "f.bin"
+
+        async def _run() -> list:
+            async with httpx.AsyncClient(
+                transport=httpx.MockTransport(handler)
+            ) as client:
+                return await asyncio.gather(
+                    *(
+                        async_download_file(
+                            "http://test/f.bin", dest, chunk_size=4, client=client
+                        )
+                        for _ in range(2)
+                    )
+                )
+
+        assert asyncio.run(_run()) == [dest, dest]
+        assert dest.read_bytes() in (b"a" * 32, b"b" * 32)
+        assert list(tmp_path.iterdir()) == [dest]
 
     def test_no_progress_callback(self, served_files, tmp_path):
         """Download works fine without a progress callback."""
