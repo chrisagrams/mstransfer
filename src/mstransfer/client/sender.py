@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import math
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -154,9 +153,8 @@ async def _async_poll_status(
     *timeout* is how long to wait without progress; *None* waits forever.
     """
 
-    # Configure a deadline for the polling operation.
-    limit = math.inf if timeout is None else timeout
-    deadline = time.monotonic() + limit
+    # Configure a deadline for the polling operation (None polls forever).
+    deadline = None if timeout is None else time.monotonic() + timeout
 
     # Keep track of the last seen state and bytes to detect progress.
     last_state: TransferState | None = None
@@ -165,7 +163,7 @@ async def _async_poll_status(
     # Individual request timeout should be reasonably short.
     async with optional_client(client, timeout=10.0) as c:
         # Continuously poll until we hit a terminal state or exceed the deadline.
-        while time.monotonic() < deadline:
+        while deadline is None or time.monotonic() < deadline:
             # Make a GET request to the status endpoint for this transfer ID.
             resp = await c.get(
                 f"{base_url}/v1/transfer/{transfer_id}/status",
@@ -183,7 +181,8 @@ async def _async_poll_status(
                 if record.state != last_state or record.bytes_received > last_bytes:
                     last_state = record.state
                     last_bytes = record.bytes_received
-                    deadline = time.monotonic() + limit
+                    if timeout is not None:
+                        deadline = time.monotonic() + timeout
             # Sleep until the next poll interval before checking again.
             await asyncio.sleep(interval)
     raise TimeoutError(f"Transfer {transfer_id} did not complete within {timeout}s")
