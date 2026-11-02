@@ -4,7 +4,6 @@ import asyncio
 import logging
 import time
 import uuid
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
@@ -15,6 +14,7 @@ import httpx
 from mscompress import MSZFile, MZMLFile
 from mscompress.mszx import MSZXFile
 
+from mstransfer.client.results import FileResult
 from mstransfer.client.utils import (
     ThrottledCallback,
     async_counting_generator,
@@ -39,15 +39,6 @@ class BatchProgressCallback(Protocol):
     def file_progress(self, index: int, delta: int) -> None: ...
     def file_done(self, index: int, result: UploadResponse) -> None: ...
     def file_error(self, index: int, exc: Exception) -> None: ...
-
-
-@dataclass
-class FileResult:
-    """Result of uploading a single file in a batch."""
-
-    filename: str
-    response: UploadResponse | None = field(default=None)
-    error: str | None = field(default=None)
 
 
 async def async_send_file(
@@ -198,8 +189,11 @@ async def async_send_batch(
     client: httpx.AsyncClient | None = None,
     timeout: httpx.Timeout | None = None,
     poll_timeout: float | None = 3600.0,
-) -> list[FileResult]:
+) -> list[FileResult[UploadResponse]]:
     """Send multiple files with configurable parallelism (async).
+
+    Returns one :class:`FileResult` per source, in input order, carrying
+    the final transfer status or the error.
 
     *timeout* and *poll_timeout* are passed to :func:`async_send_file` for
     each file.
@@ -208,7 +202,7 @@ async def async_send_batch(
     sem = asyncio.Semaphore(workers)
 
     # Pre-allocate results list indexed by position for deterministic ordering.
-    results: list[FileResult | None] = [None] * len(sources)
+    results: list[FileResult[UploadResponse] | None] = [None] * len(sources)
 
     async def _upload_one(idx: int, src: Path | MZMLFile | MSZFile | MSZXFile) -> None:
         # Extract a Path for progress reporting and metadata.
@@ -259,17 +253,23 @@ async def async_send_batch(
                     timeout=timeout,
                     poll_timeout=poll_timeout,
                 )
-                results[idx] = FileResult(filename=fpath.name, response=result)
-                if progress:
-                    progress.file_done(idx, result)
             except Exception as exc:
-                results[idx] = FileResult(filename=fpath.name, error=str(exc))
+                results[idx] = FileResult(filename=fpath.name, error=exc)
                 if progress:
                     # Progress listeners expect file_started before file_error.
                     if not started:
                         progress.file_started(idx, fpath, None)
                     progress.file_error(idx, exc)
                 logger.error("Failed to send %s: %s", fpath, exc)
+            else:
+                results[idx] = FileResult(filename=fpath.name, response=result)
+                # A raising callback must not turn a finished upload into a
+                # failure, or abort the rest of the batch.
+                if progress:
+                    try:
+                        progress.file_done(idx, result)
+                    except Exception:
+                        logger.exception("file_done failed for %s", fpath)
 
     await asyncio.gather(*[_upload_one(i, s) for i, s in enumerate(sources)])
 
@@ -317,7 +317,7 @@ def send_batch(
     client: httpx.AsyncClient | None = None,
     timeout: httpx.Timeout | None = None,
     poll_timeout: float | None = 3600.0,
-) -> list[FileResult]:
+) -> list[FileResult[UploadResponse]]:
     """Send multiple files with configurable parallelism.
 
     *timeout* and *poll_timeout* are passed to :func:`async_send_file` for

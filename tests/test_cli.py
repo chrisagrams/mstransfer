@@ -20,7 +20,7 @@ from mstransfer.cli import (
     main,
     parse_target,
 )
-from mstransfer.client.sender import FileResult
+from mstransfer.client import DownloadRequest, DownloadResult, FileResult
 from mstransfer.server.models import (
     TransferState,
     UploadResponse,
@@ -314,7 +314,7 @@ class TestCmdUpload:
                     bytes_received=100,
                 ),
             ),
-            FileResult(filename="b.msz", error="Connection reset"),
+            FileResult(filename="b.msz", error=ConnectionError("Connection reset")),
         ]
 
         args = self._make_args(["/data/a.mzML", "/data/b.msz", "host"])
@@ -465,6 +465,13 @@ class TestUploadProgressDisplay:
 # ---------------------------------------------------------------------------
 
 
+def _ok_result(dest):
+    req = DownloadRequest(url="http://host/x", dest=dest)
+    return FileResult(
+        filename=dest.name, response=DownloadResult(request=req, path=dest)
+    )
+
+
 class TestCmdDownload:
     def _make_args(self, urls, **overrides):
         defaults = {
@@ -489,7 +496,7 @@ class TestCmdDownload:
     @patch("mstransfer.cli.async_download_batch", new_callable=AsyncMock)
     def test_successful_download(self, mock_batch, tmp_path):
         dest = tmp_path / "file.msz"
-        mock_batch.return_value = [dest]
+        mock_batch.return_value = [_ok_result(dest)]
 
         args = self._make_args(
             ["http://host/file.msz"],
@@ -503,15 +510,18 @@ class TestCmdDownload:
         assert call_kwargs["store_as"] is None
 
     @patch("mstransfer.cli.async_download_batch", new_callable=AsyncMock)
-    def test_partial_failure(self, mock_batch, tmp_path):
-        """Any failed download makes the command exit non-zero."""
+    def test_partial_failure(self, mock_batch, tmp_path, capsys):
+        """A failed download exits non-zero and names the file and the error."""
 
         async def _batch(requests, *, progress, **kwargs):
             progress.on_file_start("a.msz", 10)
             progress.on_file_complete("a.msz")
             progress.on_file_start("b.msz", 10)
             progress.on_file_error("b.msz", RuntimeError("boom"))
-            return [tmp_path / "a.msz"]
+            return [
+                _ok_result(requests[0].dest),
+                FileResult(filename="b.msz", error=RuntimeError("boom")),
+            ]
 
         mock_batch.side_effect = _batch
 
@@ -522,9 +532,15 @@ class TestCmdDownload:
         with pytest.raises(SystemExit, match="1"):
             cmd_download(args)
 
+        out = capsys.readouterr().out
+        assert "1 succeeded" in out
+        assert "1 failed" in out
+        assert "b.msz: boom" in out
+        assert "a.msz:" not in out
+
     @patch("mstransfer.cli.async_download_batch", new_callable=AsyncMock)
     def test_passes_store_as(self, mock_batch, tmp_path):
-        mock_batch.return_value = [tmp_path / "file.mzML"]
+        mock_batch.return_value = [_ok_result(tmp_path / "file.mzML")]
 
         args = self._make_args(
             ["http://host/file.msz"],
@@ -538,7 +554,7 @@ class TestCmdDownload:
 
     @patch("mstransfer.cli.async_download_batch", new_callable=AsyncMock)
     def test_passes_parallel_and_chunk_size(self, mock_batch, tmp_path):
-        mock_batch.return_value = [tmp_path / "file.msz"]
+        mock_batch.return_value = [_ok_result(tmp_path / "file.msz")]
 
         args = self._make_args(
             ["http://host/file.msz"],
@@ -570,7 +586,7 @@ class TestCmdDownload:
 
     @patch("mstransfer.cli.async_download_batch", new_callable=AsyncMock)
     def test_passes_api_key(self, mock_batch, tmp_path):
-        mock_batch.return_value = [tmp_path / "file.msz"]
+        mock_batch.return_value = [_ok_result(tmp_path / "file.msz")]
 
         args = self._make_args(
             ["http://host/file.msz"],
@@ -620,15 +636,6 @@ class TestDownloadProgressDisplay:
 
         task = display.files.tasks[display._task_ids["a.msz"]]
         assert task.description == "[green]a.msz"
-
-    def test_on_file_error_counts_failures(self):
-        display = DownloadProgressDisplay(total_files=2)
-        display.on_file_start("a.msz", total_bytes=None)
-        display.on_file_start("b.msz", total_bytes=None)
-        display.on_file_complete("a.msz")
-        display.on_file_error("b.msz", RuntimeError("boom"))
-
-        assert display.failed == 1
 
     def test_on_file_error_marks_red(self):
         display = DownloadProgressDisplay(total_files=1)

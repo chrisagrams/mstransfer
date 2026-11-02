@@ -495,8 +495,8 @@ class TestSendBatch:
             )
         assert len(results) == 1
         r = results[0]
-        assert r.error is not None
-        assert "server exploded" in r.error
+        assert isinstance(r.error, ConnectionError)
+        assert str(r.error) == "server exploded"
         assert r.filename == "test.msz"
 
     def test_same_stem_conflict_is_per_file_error(
@@ -511,8 +511,8 @@ class TestSendBatch:
         assert results[0].response is not None
         assert results[0].response.state == "done"
         assert results[1].response is None
-        assert results[1].error is not None
-        assert "409 Conflict" in results[1].error
+        assert isinstance(results[1].error, httpx.HTTPStatusError)
+        assert results[1].error.response.status_code == 409
 
     def test_partial_failure(self, test_msz, _live_server, tmp_path):
         """One failure does not prevent other files from succeeding."""
@@ -544,7 +544,8 @@ class TestSendBatch:
         by_name = {r.filename: r for r in results}
         assert by_name["good.msz"].response is not None
         assert by_name["good.msz"].response.state == "done"
-        assert by_name["bad.msz"].error is not None
+        assert isinstance(by_name["bad.msz"].error, ConnectionError)
+        assert by_name["bad.msz"].response is None
 
     def test_missing_file_is_per_file_error(self, test_msz, _live_server, tmp_path):
         """A missing .msz path fails on its own without aborting the batch."""
@@ -563,12 +564,37 @@ class TestSendBatch:
         assert results[0].response.state == "done"
         assert results[1].filename == "missing.msz"
         assert results[1].response is None
-        assert results[1].error is not None
-        assert "No such file" in results[1].error
+        assert isinstance(results[1].error, FileNotFoundError)
         progress.file_started.assert_any_call(1, missing, None)
         progress.file_error.assert_called_once()
         assert progress.file_error.call_args.args[0] == 1
         assert isinstance(progress.file_error.call_args.args[1], FileNotFoundError)
+
+    def test_raising_file_done_is_not_a_failure(self, test_msz, _live_server, tmp_path):
+        """A raising file_done leaves the result a success.
+
+        Its exception is logged, not reported through file_error, and the
+        other uploads in the batch still finish.
+        """
+        other = tmp_path / "other.msz"
+        other.write_bytes(test_msz.read_bytes())
+        progress = MagicMock()
+        progress.file_done.side_effect = RuntimeError("callback bug")
+
+        results = send_batch(
+            [test_msz, other],
+            _live_server["base_url"],
+            parallel=1,
+            progress=progress,
+        )
+
+        assert [r.filename for r in results] == ["test.msz", "other.msz"]
+        for r in results:
+            assert r.error is None
+            assert r.response is not None
+            assert r.response.state == "done"
+        assert progress.file_done.call_count == 2
+        progress.file_error.assert_not_called()
 
     def test_parallel_capped_to_file_count(self, test_msz, _live_server):
         """Semaphore should not exceed the number of files."""
