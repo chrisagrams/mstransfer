@@ -298,6 +298,32 @@ class TestStorePlan:
         assert [p.name for p in tmp_path.iterdir()] == ["run.mzML"]
         assert "Converted run.msz → run.mzML" in caplog.text
 
+    @pytest.mark.asyncio
+    async def test_finalize_expansion_logs_dest_name(self, test_msz, tmp_path, caplog):
+        """Expanding a batch archive logs its real name, not the temp file's."""
+        plan = StorePlan(tmp_path / "batch.mszx", MSFormat.MSZX, MSFormat.MZML)
+        part = plan.part_path
+        manifest = json.dumps(
+            {
+                "version": "2.0",
+                "container": "batch",
+                "spectra_files": [{"entry": "a.msz"}, {"entry": "b.msz"}],
+            }
+        ).encode()
+        with tarfile.open(part, "w") as tar:
+            info = tarfile.TarInfo(name="manifest.json")
+            info.size = len(manifest)
+            tar.addfile(info, io.BytesIO(manifest))
+            tar.add(str(test_msz), arcname="a.msz")
+            tar.add(str(test_msz), arcname="b.msz")
+
+        with caplog.at_level("INFO", logger="mstransfer.store"):
+            result = await plan.finalize(part)
+
+        assert result == tmp_path / "batch"
+        assert [p.name for p in tmp_path.iterdir()] == ["batch"]
+        assert "Extracted 2 members from batch.mszx into" in caplog.text
+
 
 class TestMszxExpansion:
     def test_targets_use_entry_stem_and_target_ext(self, tmp_path):

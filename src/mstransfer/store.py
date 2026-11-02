@@ -171,7 +171,7 @@ class MszxExpansion:
         never share staging files.  Names are validated before anything
         is written.
         """
-        targets = self.targets
+        _ = self.targets  # Validate every name before writing anything.
         staging = Path(
             tempfile.mkdtemp(
                 dir=archive_dir.parent, prefix=f".{archive_dir.name}.", suffix=".part"
@@ -182,13 +182,6 @@ class MszxExpansion:
             self._swap_into(staging, archive_dir)
         finally:
             shutil.rmtree(staging, ignore_errors=True)
-
-        logger.info(
-            "Extracted %d members from %s into %s",
-            len(targets),
-            self.src.name,
-            archive_dir,
-        )
         return archive_dir
 
     @staticmethod
@@ -353,7 +346,14 @@ class StorePlan:
                 entries = tuple(spectra.entry for spectra in manifest.spectra_files)
                 if len(entries) > 1:
                     expansion = MszxExpansion(src, entries, conversion.target)
-                    return await expansion.write(self.archive_dir)
+                    archive_dir = await expansion.write(self.archive_dir)
+                    logger.info(
+                        "Extracted %d members from %s into %s",
+                        len(entries),
+                        self.dest.name,
+                        archive_dir,
+                    )
+                    return archive_dir
             return await self._convert(src, conversion)
         finally:
             src.unlink(missing_ok=True)
