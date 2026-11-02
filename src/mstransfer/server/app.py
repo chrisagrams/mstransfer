@@ -51,5 +51,9 @@ def create_app(
         file_provider = DirectoryFileProvider(out)
 
     app.state = AppState(output_dir=out, store_as=store_as, files=file_provider)
-    app.include_router(make_router(auth_dep=auth_dep), prefix="/v1")
+    router = make_router(
+        auth_dep=auth_dep,
+        security_schemes=getattr(auth, "security_schemes", ()),
+    )
+    app.include_router(router, prefix="/v1")
     return app

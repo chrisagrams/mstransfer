@@ -73,3 +73,9 @@ class HealthResponse(BaseModel):
     status: str
     version: str
     store_as: StoreFormat
+
+
+class ErrorResponse(BaseModel):
+    """Body of an error response, as raised by :class:`fastapi.HTTPException`."""
+
+    detail: str

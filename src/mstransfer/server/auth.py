@@ -9,6 +9,7 @@ if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
 
 from fastapi import HTTPException, Request
+from fastapi.security import APIKeyQuery, HTTPBearer
 from pydantic import BaseModel, Field
 
 
@@ -35,7 +36,22 @@ class NoAuthProvider:
 
 
 class APIKeyAuthProvider:
-    """Validates ``Authorization: Bearer <key>`` or ``?api_key=`` query param."""
+    """Validates ``Authorization: Bearer <key>`` or ``?api_key=`` query param.
+
+    ``security_schemes`` advertises both ways of passing the key in the
+    OpenAPI schema.  It is optional for other providers: one without it
+    still marks protected routes with ``x-requires-auth``, but declares no
+    scheme.
+    """
+
+    security_schemes = (
+        HTTPBearer(auto_error=False, description="The API key as a bearer token."),
+        APIKeyQuery(
+            name="api_key",
+            auto_error=False,
+            description="The API key as a query parameter.",
+        ),
+    )
 
     def __init__(self, api_key: str) -> None:
         # compare_digest only accepts ASCII str, so compare UTF-8 bytes instead.
