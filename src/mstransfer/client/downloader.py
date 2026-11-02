@@ -113,6 +113,10 @@ async def async_download_file(
         (overrides *skip_existing*).
     api_key:
         Optional API key, sent as ``Authorization: Bearer <key>``.
+    client:
+        Optional :class:`httpx.AsyncClient` to reuse.  *connect_timeout* and
+        *read_timeout* are applied to the request and take precedence over
+        the client's own timeout configuration.
 
     Returns
     -------
@@ -143,8 +147,8 @@ async def async_download_file(
     )
 
     async with (
-        optional_client(client, timeout=timeout) as c,
-        c.stream("GET", url, headers=headers) as resp,
+        optional_client(client) as c,
+        c.stream("GET", url, headers=headers, timeout=timeout) as resp,
     ):
         resp.raise_for_status()
 
@@ -206,6 +210,10 @@ async def async_download_batch(
         If *True*, re-download even if destination exists.
     api_key:
         Optional API key, sent as ``Authorization: Bearer <key>``.
+    client:
+        Optional :class:`httpx.AsyncClient` shared by all downloads.
+        *connect_timeout* and *read_timeout* are applied to each request
+        and take precedence over the client's own timeout configuration.
 
     Returns
     -------

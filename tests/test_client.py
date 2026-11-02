@@ -719,6 +719,52 @@ class TestAsyncSendFile:
         with pytest.raises(TypeError, match="Unsupported source type"):
             await async_send_file("not_a_path_or_file", _live_server["base_url"])  # type: ignore[arg-type]
 
+    async def test_timeouts_override_client(self, test_msz):
+        """The upload and poll timeouts apply even when client= is passed."""
+        seen: dict[str, dict[str, float | None]] = {}
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            transfer_id = request.headers.get("X-Transfer-ID", "t")
+            if request.method == "POST":
+                await request.aread()
+                seen["upload"] = request.extensions["timeout"]
+                state = "received"
+            else:
+                seen["poll"] = request.extensions["timeout"]
+                state = "done"
+            return httpx.Response(
+                200,
+                json={
+                    "transfer_id": transfer_id,
+                    "filename": "test.msz",
+                    "stored_as": "test.msz",
+                    "state": state,
+                    "bytes_received": 0,
+                },
+            )
+
+        # A client built only for headers keeps httpx's default 5 s timeout.
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler), headers={"X-Auth": "t"}
+        ) as client:
+            result = await async_send_file(
+                test_msz, "http://test", timeout=42.0, client=client
+            )
+
+        assert result.state == "done"
+        assert seen["upload"] == {
+            "connect": 10.0,
+            "read": 42.0,
+            "write": 42.0,
+            "pool": 42.0,
+        }
+        assert seen["poll"] == {
+            "connect": 10.0,
+            "read": 10.0,
+            "write": 10.0,
+            "pool": 10.0,
+        }
+
 
 # ---------------------------------------------------------------------------
 # async_send_batch

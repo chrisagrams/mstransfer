@@ -1118,6 +1118,28 @@ class TestAsyncDownloadFile:
             await async_download_file(f"{served_files['base_url']}/nonexistent", dest)
         assert not dest.exists()
 
+    async def test_timeouts_override_client(self, tmp_path):
+        """connect_timeout/read_timeout apply even when client= is passed."""
+        seen: list[dict[str, float | None]] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen.append(request.extensions["timeout"])
+            return httpx.Response(200, content=b"data")
+
+        # A client built only for headers keeps httpx's default 5 s timeout.
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler), headers={"X-Auth": "t"}
+        ) as client:
+            await async_download_file(
+                "http://test/f.bin",
+                tmp_path / "f.bin",
+                connect_timeout=7.0,
+                read_timeout=42.0,
+                client=client,
+            )
+
+        assert seen == [{"connect": 7.0, "read": 42.0, "write": 42.0, "pool": 42.0}]
+
 
 # ---------------------------------------------------------------------------
 # async_download_batch
