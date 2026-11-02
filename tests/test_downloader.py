@@ -1703,7 +1703,7 @@ class TestResume:
         assert list(tmp_path.iterdir()) == [dest]
 
     def test_resume_false_keeps_nothing(self, tmp_path):
-        """resume=False neither uses nor keeps a partial."""
+        """resume=False neither uses nor keeps a partial, and removes an old one."""
         server = RangeServer(BODY)
         dest = tmp_path / "f.bin"
         _interrupt(server, dest, resume=False)
@@ -1712,6 +1712,19 @@ class TestResume:
         _interrupt(server, dest)
         _fetch(server, dest, resume=False)
         assert "range" not in server.requests[-1].headers
+        assert dest.read_bytes() == BODY
+        assert list(tmp_path.iterdir()) == [dest]
+
+    def test_failed_resume_false_keeps_old_partial(self, tmp_path):
+        """A failed resume=False download leaves an earlier partial resumable."""
+        server = RangeServer(BODY)
+        dest = tmp_path / "f.bin"
+        _interrupt(server, dest)
+        _interrupt(server, dest, at=2000, resume=False)
+        assert (tmp_path / "f.bin.part").read_bytes() == BODY[:4000]
+
+        _fetch(server, dest)
+        assert server.requests[-1].headers["range"] == "bytes=4000-"
         assert dest.read_bytes() == BODY
 
     def test_force_discards_partial(self, tmp_path):
@@ -1778,7 +1791,8 @@ class TestResume:
             asyncio.run(_run())
         assert list(tmp_path.iterdir()) == []
 
-    def test_concurrent_download_does_not_touch_owned_partial(self, tmp_path):
+    @pytest.mark.parametrize("resume", [True, False])
+    def test_concurrent_download_does_not_touch_owned_partial(self, tmp_path, resume):
         """A second download to a dest whose partial is in use streams elsewhere."""
         stalled = asyncio.Event()
 
@@ -1808,7 +1822,9 @@ class TestResume:
                 )
                 await stalled.wait()
                 await asyncio.sleep(0.05)
-                await async_download_file("http://test/f.bin", dest, client=client)
+                await async_download_file(
+                    "http://test/f.bin", dest, resume=resume, client=client
+                )
                 assert dest.read_bytes() == BODY
                 owner.cancel()
                 with pytest.raises(asyncio.CancelledError):
