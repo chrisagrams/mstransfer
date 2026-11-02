@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import json
 import logging
 import sys
 from dataclasses import dataclass
@@ -12,6 +11,7 @@ from typing import Protocol, runtime_checkable
 import aiofiles
 import httpx
 from filelock import BaseFileLock, FileLock, Timeout
+from pydantic import BaseModel, Field, ValidationError
 
 from mstransfer.client.results import FileResult
 from mstransfer.client.utils import ThrottledCallback, optional_client
@@ -65,6 +65,18 @@ class DownloadResult:
 
     request: DownloadRequest
     path: Path
+
+
+class _PartialInfo(BaseModel):
+    """What a resumable .part file holds: the start of *url*'s *total*-byte body.
+
+    *validator* is the strong ``ETag`` or ``Last-Modified`` the body was sent
+    with, so a resumed range can be checked against it.
+    """
+
+    url: str
+    validator: str
+    total: int = Field(gt=0)
 
 
 async def async_download_file(
@@ -194,14 +206,14 @@ async def async_download_file(
     total: int | None = None
     expected_range = ""
     if lock is not None and not force:
+        info: _PartialInfo | None
         try:
-            meta = json.loads(meta_path.read_text())
-            if meta["url"] == url:
-                validator, total = str(meta["validator"]), int(meta["total"])
+            info = _PartialInfo.model_validate_json(meta_path.read_text())
             offset = part_path.stat().st_size
-        except (OSError, ValueError, KeyError, TypeError):
-            pass
-        if validator is not None and total is not None and 0 < offset < total:
+        except (OSError, ValidationError):
+            info = None
+        if info is not None and info.url == url and 0 < offset < info.total:
+            validator, total = info.validator, info.total
             expected_range = f"bytes {offset}-{total - 1}/{total}"
         else:
             offset = 0
@@ -277,17 +289,15 @@ async def async_download_file(
                         cl = resp.headers.get("content-length")
                         total = int(cl) if cl and not encoded else None
                         validator = resp_validator
-                        retain = (
-                            lock is not None
-                            and validator is not None
-                            and total is not None
-                        )
-                        if retain:
+                        # An empty body has nothing to resume.
+                        retain = False
+                        if lock is not None and validator is not None and total:
                             meta_path.write_text(
-                                json.dumps(
-                                    {"url": url, "validator": validator, "total": total}
-                                )
+                                _PartialInfo(
+                                    url=url, validator=validator, total=total
+                                ).model_dump_json()
                             )
+                            retain = True
 
                     if progress_callback:
                         progress_callback.on_total(total)

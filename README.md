@@ -74,7 +74,7 @@ The server names each stored file after the upload's stem, so `run1.mzML` and `r
 
 ### `mstransfer download`
 
-Download files by URL, e.g. `http://remote-host:1319/v1/files/run1.msz` (see `GET /v1/files` for what a server offers).
+Download files from a server by URL, e.g. `http://remote-host:1319/v1/files/run1.msz`.
 
 ```
 mstransfer download <urls...> [--output-dir ./downloads] [--parallel 4] [--store-as msz|mzml|mszx] [--skip-existing] [--force] [--no-resume]
@@ -89,9 +89,7 @@ mstransfer download <urls...> [--output-dir ./downloads] [--parallel 4] [--store
 | `--force` | off | Download again even if the output exists, discarding any partial download |
 | `--no-resume` | off | Start interrupted downloads over instead of resuming them |
 
-Each file is streamed to `<name>.part` and moved into place only once it is complete. If a download is interrupted (an error, a dropped connection, or Ctrl-C), the partial file stays next to the output with a `<name>.part.json` describing it, and the next download of the same URL to the same place continues from where it stopped. It sends a `Range` request with `If-Range`, so it only resumes if the server supports byte ranges and the file is unchanged (same `ETag` or `Last-Modified`); otherwise the download starts over. A partial is only kept when the server sent such a validator and the file size. The finished file must be exactly the size the server announced.
-
-The mstransfer server supports range requests and sends `ETag`/`Last-Modified`, so downloads from it can be resumed.
+If a download is interrupted (for example by a dropped connection or Ctrl-C), running the same command again picks up where it left off instead of starting over. If the file changed on the server in the meantime, or the server can't resume downloads, it starts from the beginning.
 
 ### Authentication
 

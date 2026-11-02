@@ -1672,6 +1672,36 @@ class TestResume:
         _interrupt(server, dest)
         assert list(tmp_path.iterdir()) == []
 
+    @pytest.mark.parametrize(
+        "meta",
+        [
+            "not json",
+            '{"url": "http://test/f.bin", "validator": "\\"v1\\""}',
+            '{"url": "http://test/f.bin", "validator": 1, "total": 10240}',
+            '{"url": "http://test/f.bin", "validator": "\\"v1\\"", "total": 0}',
+        ],
+        ids=["not-json", "missing-total", "non-string-validator", "zero-total"],
+    )
+    def test_invalid_partial_info_restarts(self, tmp_path, meta):
+        """A .part.json that does not validate is ignored, not trusted or fatal."""
+        server = RangeServer(BODY)
+        dest = tmp_path / "f.bin"
+        _interrupt(server, dest)
+        (tmp_path / "f.bin.part.json").write_text(meta)
+
+        _fetch(server, dest)
+        assert "range" not in server.requests[-1].headers
+        assert dest.read_bytes() == BODY
+        assert list(tmp_path.iterdir()) == [dest]
+
+    def test_empty_file(self, tmp_path):
+        """An empty file with a validator downloads and leaves nothing behind."""
+        server = RangeServer(b"")
+        dest = tmp_path / "f.bin"
+        assert _fetch(server, dest) == dest
+        assert dest.read_bytes() == b""
+        assert list(tmp_path.iterdir()) == [dest]
+
     def test_weak_etag_falls_back_to_last_modified(self, tmp_path):
         """If-Range needs a strong validator, so a weak ETag is not used."""
         date = "Mon, 02 Nov 2026 12:00:00 GMT"
