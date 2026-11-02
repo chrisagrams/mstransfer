@@ -3,19 +3,22 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import os
 import sys
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 import aiofiles
 import httpx
-from filelock import BaseFileLock, FileLock, Timeout
+from filelock import lock_descriptor
 from pydantic import BaseModel, Field, ValidationError
 
 from mstransfer.client.results import FileResult
 from mstransfer.client.utils import ThrottledCallback, optional_client
 from mstransfer.store import DownloadFormat, StorePlan
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 __all__ = [
     "BatchDownloadProgress",
@@ -186,18 +189,28 @@ async def async_download_file(
     # is never resumed, so concurrent downloads to one dest never share it.
     part_path = plan.unique_part_path()
     meta_path = plan.part_path.with_name(plan.part_path.name + ".json")
-    lock: BaseFileLock | None = None
-    if resume:
-        candidate = FileLock(
-            plan.part_path.with_name(plan.part_path.name + ".lock"), timeout=0
-        )
+    lock_path = plan.part_path.with_name(plan.part_path.name + ".lock")
+    lock_fd: int | None = None
+    while resume:
+        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
         try:
-            candidate.acquire()
-        except Timeout:
-            pass
-        else:
-            lock = candidate
+            locked = lock_descriptor(fd, blocking=False)
+        except OSError:
+            # No native locking here, so no download can own the partial.
+            with contextlib.suppress(OSError):
+                lock_path.unlink()
+            locked = False
+        if locked and os.fstat(fd).st_nlink == 0:
+            # The owner unlinked the lock file before letting go of it, so
+            # this lock is stale: a newer download may hold the current file.
+            os.close(fd)
+            continue
+        if locked:
+            lock_fd = fd
             part_path = plan.part_path
+        else:
+            os.close(fd)
+        break
 
     # What a partial from an earlier attempt claims to be: the bytes of a
     # *total*-byte body of *url*, as identified by *etag*.
@@ -205,7 +218,7 @@ async def async_download_file(
     etag: str | None = None
     total: int | None = None
     expected_range = ""
-    if lock is not None and not force:
+    if lock_fd is not None and not force:
         info: _PartialInfo | None
         try:
             info = _PartialInfo.model_validate_json(meta_path.read_text())
@@ -287,7 +300,7 @@ async def async_download_file(
                         etag = resp_etag
                         # An empty body has nothing to resume.
                         retain = False
-                        if lock is not None and etag is not None and total:
+                        if lock_fd is not None and etag is not None and total:
                             meta_path.write_text(
                                 _PartialInfo(
                                     url=url, etag=etag, total=total
@@ -327,16 +340,20 @@ async def async_download_file(
             keep = False
         if not keep:
             part_path.unlink(missing_ok=True)
-        if lock is not None:
+        if lock_fd is not None:
             if not keep:
                 meta_path.unlink(missing_ok=True)
-            lock.release()
+            # Remove the lock file while still holding it, so a download that
+            # opened it meanwhile finds its lock stale instead of sharing
+            # ownership with one that creates a new lock file.  Windows cannot
+            # delete an open file, so there it goes after closing, and only if
+            # no other download has it open.
+            if sys.platform != "win32":
+                lock_path.unlink(missing_ok=True)
+            os.close(lock_fd)
             if sys.platform == "win32":
-                # filelock removes its lock file on release elsewhere, but not
-                # here.  Windows cannot delete a file another download holds
-                # open, so this never removes a lock that is in use.
                 with contextlib.suppress(OSError):
-                    Path(lock.lock_file).unlink()
+                    lock_path.unlink()
 
 
 async def async_download_batch(

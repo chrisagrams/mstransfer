@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import gzip
 import http.server
 import io
 import json
+import os
 import posixpath
 import shutil
+import sys
 import tarfile
 import threading
 import urllib.parse
@@ -16,6 +19,7 @@ from unittest.mock import patch
 
 import httpx
 import pytest
+from filelock import lock_descriptor
 from mscompress.mszx import compress_batch
 
 from mstransfer.client import DownloadRequest, DownloadResult, FileResult
@@ -1821,6 +1825,109 @@ class TestResume:
             "f.bin.part",
             "f.bin.part.json",
         ]
+
+    def test_leftover_lock_file_is_removed(self, tmp_path):
+        """A lock file left by an earlier mstransfer is taken over and removed."""
+        dest = tmp_path / "f.bin"
+        (tmp_path / "f.bin.part.lock").touch()
+        server = RangeServer(BODY)
+        _interrupt(server, dest)
+        assert sorted(p.name for p in tmp_path.iterdir()) == [
+            "f.bin.part",
+            "f.bin.part.json",
+        ]
+        _fetch(server, dest)
+        assert server.statuses[-1] == 206
+        assert list(tmp_path.iterdir()) == [dest]
+
+    @pytest.mark.skipif(
+        sys.platform == "win32", reason="Windows cannot unlink an open file"
+    )
+    def test_lock_on_unlinked_lock_file_is_stale(self, tmp_path):
+        """A lock won after its owner unlinked the file is retaken on a new one."""
+        dest = tmp_path / "f.bin"
+        lock = tmp_path / "f.bin.part.lock"
+        server = RangeServer(BODY)
+        _interrupt(server, dest)
+        lock.touch()
+        attempts: list[int] = []
+
+        def owner_finishes_first(fd: int, **kwargs) -> bool:
+            # The previous owner unlinks the file between this download's
+            # open and its lock attempt, then lets go of it.
+            if not attempts:
+                lock.unlink()
+            attempts.append(os.fstat(fd).st_nlink)
+            return lock_descriptor(fd, **kwargs)
+
+        with patch(
+            "mstransfer.client.downloader.lock_descriptor",
+            side_effect=owner_finishes_first,
+        ):
+            assert _fetch(server, dest) == dest
+        assert attempts == [0, 1]
+        assert server.statuses[-1] == 206
+        assert dest.read_bytes() == BODY
+        assert list(tmp_path.iterdir()) == [dest]
+
+    def test_owner_holds_lock_until_it_exits(self, tmp_path):
+        """The owner's lock excludes others while it runs, and goes with it."""
+        dest = tmp_path / "f.bin"
+        lock = tmp_path / "f.bin.part.lock"
+        stalled = asyncio.Event()
+
+        class Stalls(httpx.AsyncByteStream):
+            async def __aiter__(self):
+                yield b"a" * 3000
+                stalled.set()
+                await asyncio.Event().wait()
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            headers = {"etag": '"v1"', "content-length": str(len(BODY))}
+            if request.url.path == "/stall":
+                return httpx.Response(200, headers=headers, stream=Stalls())
+            return httpx.Response(200, headers=headers, stream=_Body(BODY, None))
+
+        async def _run() -> None:
+            async with httpx.AsyncClient(
+                transport=httpx.MockTransport(handler)
+            ) as client:
+                owner = asyncio.create_task(
+                    async_download_file(
+                        "http://test/stall", dest, chunk_size=1000, client=client
+                    )
+                )
+                await stalled.wait()
+                assert lock.exists()
+                # While the owner holds the lock, nobody else can take it.
+                fd = os.open(lock, os.O_RDWR)
+                try:
+                    assert not lock_descriptor(fd, blocking=False)
+                finally:
+                    os.close(fd)
+                owner.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await owner
+                assert not lock.exists()
+                await async_download_file("http://test/f.bin", dest, client=client)
+
+        asyncio.run(_run())
+        assert dest.read_bytes() == BODY
+        assert list(tmp_path.iterdir()) == [dest]
+
+    def test_without_native_locking_downloads_without_resuming(self, tmp_path):
+        """Where the file system cannot lock, downloads work but never resume."""
+        dest = tmp_path / "f.bin"
+        server = RangeServer(BODY)
+        with patch(
+            "mstransfer.client.downloader.lock_descriptor",
+            side_effect=OSError(errno.ENOLCK, "No locks available"),
+        ):
+            _interrupt(server, dest)
+            assert list(tmp_path.iterdir()) == []
+            assert _fetch(server, dest) == dest
+        assert "range" not in server.requests[-1].headers
+        assert list(tmp_path.iterdir()) == [dest]
 
     def test_resumes_from_mstransfer_server(self, tmp_path):
         """Resume works end to end against the mstransfer server."""

@@ -14,7 +14,7 @@ dependencies = [
     "python-multipart",
     "pydantic>=2.0",
     "aiofiles",
-    "filelock>=3.24.3",
+    "filelock>=3.30.0",  # lock_descriptor
 ]
 
 [project.scripts]
