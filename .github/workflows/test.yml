@@ -14,6 +14,9 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest]
         python-version: ["3.11", "3.12", "3.13", "3.14"]
+    env:
+      # Override .python-version so uv uses the matrix version.
+      UV_PYTHON: ${{ matrix.python-version }}
     defaults:
       run:
         # Use bash on Windows too so globs like dist/*.whl expand.

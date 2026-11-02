@@ -895,7 +895,11 @@ def _write_batch_mszx(path, members):
         info.size = len(manifest)
         tar.addfile(info, io.BytesIO(manifest))
         for entry, src in members.items():
-            tar.add(str(src), arcname=entry)
+            info = tar.gettarinfo(str(src), arcname=entry)
+            # gettarinfo turns "\\" into "/" on Windows; keep the entry verbatim.
+            info.name = entry
+            with open(src, "rb") as f:
+                tar.addfile(info, f)
 
 
 @pytest.fixture()
