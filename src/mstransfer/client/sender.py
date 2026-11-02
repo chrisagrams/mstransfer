@@ -199,20 +199,7 @@ async def async_send_batch(
         else:
             fpath = src
 
-        # We can determine total bytes for compressed files (MSZ/MSZX).
-        # For mzML, compression is on-the-fly so the total is unknown.
-        if isinstance(src, MSZFile | MSZXFile):
-            total_bytes: int | None = fpath.stat().st_size
-        elif isinstance(src, MZMLFile):
-            total_bytes = None
-        else:
-            is_compressed = fpath.suffix.lower() in (".msz", ".mszx")
-            total_bytes = fpath.stat().st_size if is_compressed else None
-
         async with sem:
-            # If the progress callback is provided, notify that this file is starting.
-            if progress:
-                progress.file_started(idx, fpath, total_bytes)
 
             def make_callback(i: int) -> Callable[[int], None]:
                 """Create a callback that captures the file index for progress."""
@@ -223,7 +210,25 @@ async def async_send_batch(
 
                 return cb
 
+            started = False
             try:
+                # We can determine total bytes for compressed files (MSZ/MSZX).
+                # For mzML, compression is on-the-fly so the total is unknown.
+                # stat() is inside the try so a missing or unreadable file
+                # becomes a per-file error instead of aborting the batch.
+                if isinstance(src, MSZFile | MSZXFile):
+                    total_bytes: int | None = fpath.stat().st_size
+                elif isinstance(src, MZMLFile):
+                    total_bytes = None
+                else:
+                    is_compressed = fpath.suffix.lower() in (".msz", ".mszx")
+                    total_bytes = fpath.stat().st_size if is_compressed else None
+
+                # Notify the progress callback that this file is starting.
+                if progress:
+                    progress.file_started(idx, fpath, total_bytes)
+                started = True
+
                 result = await async_send_file(
                     src,
                     base_url,
@@ -238,6 +243,9 @@ async def async_send_batch(
             except Exception as exc:
                 results[idx] = FileResult(filename=fpath.name, error=str(exc))
                 if progress:
+                    # Progress listeners expect file_started before file_error.
+                    if not started:
+                        progress.file_started(idx, fpath, None)
                     progress.file_error(idx, exc)
                 logger.error("Failed to send %s: %s", fpath, exc)
 

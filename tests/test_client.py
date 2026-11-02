@@ -7,7 +7,7 @@ import shutil
 import threading
 import time
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import httpx
 import pytest
@@ -543,6 +543,30 @@ class TestSendBatch:
         assert by_name["good.msz"].response is not None
         assert by_name["good.msz"].response.state == "done"
         assert by_name["bad.msz"].error is not None
+
+    def test_missing_file_is_per_file_error(self, test_msz, _live_server, tmp_path):
+        """A missing .msz path fails on its own without aborting the batch."""
+        missing = tmp_path / "missing.msz"
+        progress = MagicMock()
+
+        results = send_batch(
+            [test_msz, missing],
+            _live_server["base_url"],
+            parallel=2,
+            progress=progress,
+        )
+
+        assert len(results) == 2
+        assert results[0].response is not None
+        assert results[0].response.state == "done"
+        assert results[1].filename == "missing.msz"
+        assert results[1].response is None
+        assert results[1].error is not None
+        assert "No such file" in results[1].error
+        progress.file_started.assert_any_call(1, missing, None)
+        progress.file_error.assert_called_once()
+        assert progress.file_error.call_args.args[0] == 1
+        assert isinstance(progress.file_error.call_args.args[1], FileNotFoundError)
 
     def test_parallel_capped_to_file_count(self, test_msz, _live_server):
         """Semaphore should not exceed the number of files."""
