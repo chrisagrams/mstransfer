@@ -1136,6 +1136,11 @@ class TestAsyncDownloadFile:
                 {"read_timeout": 42.0},
                 {"connect": 5.0, "read": 42.0, "write": 42.0, "pool": 42.0},
             ),
+            # None means no limit, not "use the client's".
+            (
+                {"connect_timeout": None, "read_timeout": None},
+                {"connect": None, "read": None, "write": None, "pool": None},
+            ),
         ],
     )
     async def test_timeouts_with_client(self, tmp_path, kwargs, expected):

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -16,7 +17,9 @@ from mscompress import MSZFile, MZMLFile
 from mscompress.mszx import MSZXFile
 
 from mstransfer.client.utils import (
+    UNSET,
     ThrottledCallback,
+    Unset,
     async_counting_generator,
     async_file_chunk_generator,
     async_iter_from_sync,
@@ -54,7 +57,7 @@ async def async_send_file(
     source: Path | MZMLFile | MSZFile | MSZXFile,
     base_url: str,
     progress_callback: Callable[[int], None] | None = None,
-    timeout: float | None = None,
+    timeout: float | None | Unset = UNSET,
     chunk_size: int = 1_048_576,
     api_key: str | None = None,
     client: httpx.AsyncClient | None = None,
@@ -64,12 +67,13 @@ async def async_send_file(
     Accepts a file path, or an already-opened MZMLFile / MSZFile / MSZXFile
     from mscompress.  Returns the final transfer status from the server.
 
-    *timeout*, if set, sets the read, write and pool timeouts of the upload
-    request, overriding *client*'s; if *None*, *client*'s timeouts are used
-    (3600 s, with a 10 s connect timeout, without *client*).  It is also how
-    long to wait without server-side progress while polling for completion
-    (3600 s if *None*).  Status polls use *client*'s timeout, or 10 s
-    without *client*.
+    *timeout*, if passed, sets the read, write and pool timeouts of the
+    upload request, overriding *client*'s, and *None* means no limit; if
+    not passed, *client*'s timeouts are used (3600 s, with a 10 s connect
+    timeout, without *client*).  It is also how long to wait without
+    server-side progress while polling for completion (3600 s if not
+    passed, forever if *None*).  Status polls use *client*'s timeout, or
+    10 s without *client*.
     """
 
     # Generate a unique transfer ID.
@@ -110,14 +114,15 @@ async def async_send_file(
     async with optional_client(
         client, timeout=httpx.Timeout(3600.0, connect=10.0)
     ) as c:
-        # A timeout that is set overrides the client's; otherwise keep its own.
+        # A timeout that is passed overrides the client's (None means no
+        # limit); otherwise keep its own.
         resp = await c.post(
             f"{base_url}/v1/upload",
             headers=headers,
             content=stream,
             timeout=(
-                c.timeout
-                if timeout is None
+                httpx.USE_CLIENT_DEFAULT
+                if timeout is UNSET
                 else httpx.Timeout(timeout, connect=c.timeout.connect)
             ),
         )
@@ -134,7 +139,7 @@ async def async_send_file(
         state = await _async_poll_status(
             base_url,
             transfer_id,
-            timeout=3600.0 if timeout is None else timeout,
+            timeout=3600.0 if timeout is UNSET else timeout,
             headers=poll_headers,
             client=client,
         )
@@ -146,15 +151,19 @@ async def async_send_file(
 async def _async_poll_status(
     base_url: str,
     transfer_id: str,
-    timeout: float = 300.0,
+    timeout: float | None = 300.0,
     interval: float = 0.5,
     headers: dict[str, str] | None = None,
     client: httpx.AsyncClient | None = None,
 ) -> TransferState:
-    """Poll transfer status until terminal state or timeout (async)."""
+    """Poll transfer status until terminal state or timeout (async).
+
+    *timeout* is how long to wait without progress; *None* waits forever.
+    """
 
     # Configure a deadline for the polling operation.
-    deadline = time.monotonic() + timeout
+    limit = math.inf if timeout is None else timeout
+    deadline = time.monotonic() + limit
 
     # Keep track of the last seen state and bytes to detect progress.
     last_state: TransferState | None = None
@@ -181,7 +190,7 @@ async def _async_poll_status(
                 if record.state != last_state or record.bytes_received > last_bytes:
                     last_state = record.state
                     last_bytes = record.bytes_received
-                    deadline = time.monotonic() + timeout
+                    deadline = time.monotonic() + limit
             # Sleep until the next poll interval before checking again.
             await asyncio.sleep(interval)
     raise TimeoutError(f"Transfer {transfer_id} did not complete within {timeout}s")
@@ -195,8 +204,12 @@ async def async_send_batch(
     progress: BatchProgressCallback | None = None,
     api_key: str | None = None,
     client: httpx.AsyncClient | None = None,
+    timeout: float | None | Unset = UNSET,
 ) -> list[FileResult]:
-    """Send multiple files with configurable parallelism (async)."""
+    """Send multiple files with configurable parallelism (async).
+
+    *timeout* is passed to :func:`async_send_file` for each file.
+    """
     workers = min(parallel, len(sources))
     sem = asyncio.Semaphore(workers)
 
@@ -249,6 +262,7 @@ async def async_send_batch(
                     chunk_size=chunk_size,
                     api_key=api_key,
                     client=client,
+                    timeout=timeout,
                 )
                 results[idx] = FileResult(filename=fpath.name, response=result)
                 if progress:
@@ -271,7 +285,7 @@ def send_file(
     source: Path | MZMLFile | MSZFile | MSZXFile,
     base_url: str,
     progress_callback: Callable[[int], None] | None = None,
-    timeout: float | None = None,
+    timeout: float | None | Unset = UNSET,
     chunk_size: int = 1_048_576,
     api_key: str | None = None,
     client: httpx.AsyncClient | None = None,
@@ -304,8 +318,11 @@ def send_batch(
     progress: BatchProgressCallback | None = None,
     api_key: str | None = None,
     client: httpx.AsyncClient | None = None,
+    timeout: float | None | Unset = UNSET,
 ) -> list[FileResult]:
     """Send multiple files with configurable parallelism.
+
+    *timeout* is passed to :func:`async_send_file` for each file.
 
     This is a synchronous wrapper around :func:`async_send_batch`.
     """
@@ -318,5 +335,6 @@ def send_batch(
             progress=progress,
             api_key=api_key,
             client=client,
+            timeout=timeout,
         )
     )

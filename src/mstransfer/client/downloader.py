@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Protocol, runtime_checkable
 import aiofiles
 import httpx
 
-from mstransfer.client.utils import ThrottledCallback, optional_client
+from mstransfer.client.utils import UNSET, ThrottledCallback, Unset, optional_client
 from mstransfer.store import DownloadFormat, StorePlan
 
 if TYPE_CHECKING:
@@ -61,8 +61,8 @@ async def async_download_file(
     *,
     store_as: DownloadFormat | None = None,
     chunk_size: int = 1_048_576,
-    connect_timeout: float | None = None,
-    read_timeout: float | None = None,
+    connect_timeout: float | None | Unset = UNSET,
+    read_timeout: float | None | Unset = UNSET,
     progress_callback: DownloadProgressCallback | None = None,
     skip_existing: bool = False,
     force: bool = False,
@@ -97,12 +97,13 @@ async def async_download_file(
     chunk_size:
         Number of bytes per read chunk (default 1 MiB).
     connect_timeout:
-        Timeout in seconds for establishing the connection.  If *None*,
-        the client's connect timeout is used (10 s without *client*).
+        Timeout in seconds for establishing the connection, or *None* for
+        no limit.  If not passed, the client's connect timeout is used
+        (10 s without *client*).
     read_timeout:
-        Timeout in seconds to wait on each read of the response body; it
-        also sets the write and pool timeouts.  If *None*, the client's
-        timeouts are used (300 s without *client*).
+        Timeout in seconds to wait on each read of the response body, or
+        *None* for no limit; it also sets the write and pool timeouts.  If
+        not passed, the client's timeouts are used (300 s without *client*).
     progress_callback:
         Optional callback.  ``on_total`` is invoked once the server
         responds, with the body size from ``Content-Length`` (or *None* if
@@ -118,8 +119,8 @@ async def async_download_file(
         Optional API key, sent as ``Authorization: Bearer <key>``.
     client:
         Optional :class:`httpx.AsyncClient` to reuse.  A *connect_timeout*
-        or *read_timeout* that is set overrides the client's timeout for
-        this request; one left as *None* keeps the client's value.
+        or *read_timeout* that is passed overrides the client's timeout for
+        this request; one not passed keeps the client's value.
 
     Returns
     -------
@@ -141,13 +142,14 @@ async def async_download_file(
     # Write to a temp .part file to avoid partial downloads.
     part_path = plan.part_path
 
-    # Timeouts that are set override the client's; unset ones keep its values.
+    # Timeouts that are passed override the client's (None means no limit);
+    # ones not passed keep its values.
     base = client.timeout if client else httpx.Timeout(300.0, connect=10.0)
     timeout = httpx.Timeout(
-        connect=base.connect if connect_timeout is None else connect_timeout,
-        read=base.read if read_timeout is None else read_timeout,
-        write=base.write if read_timeout is None else read_timeout,
-        pool=base.pool if read_timeout is None else read_timeout,
+        connect=base.connect if connect_timeout is UNSET else connect_timeout,
+        read=base.read if read_timeout is UNSET else read_timeout,
+        write=base.write if read_timeout is UNSET else read_timeout,
+        pool=base.pool if read_timeout is UNSET else read_timeout,
     )
     headers = {"Authorization": f"Bearer {api_key}"} if api_key else None
 
@@ -186,8 +188,8 @@ async def async_download_batch(
     store_as: DownloadFormat | None = None,
     parallel: int = 4,
     chunk_size: int = 1_048_576,
-    connect_timeout: float | None = None,
-    read_timeout: float | None = None,
+    connect_timeout: float | None | Unset = UNSET,
+    read_timeout: float | None | Unset = UNSET,
     progress: BatchDownloadProgress | None = None,
     skip_existing: bool = False,
     force: bool = False,
@@ -209,12 +211,13 @@ async def async_download_batch(
     chunk_size:
         Number of bytes per read chunk.
     connect_timeout:
-        Timeout in seconds for establishing each connection.  If *None*,
-        the client's connect timeout is used (10 s without *client*).
+        Timeout in seconds for establishing each connection, or *None* for
+        no limit.  If not passed, the client's connect timeout is used
+        (10 s without *client*).
     read_timeout:
-        Timeout in seconds to wait on each read of a response body; it
-        also sets the write and pool timeouts.  If *None*, the client's
-        timeouts are used (300 s without *client*).
+        Timeout in seconds to wait on each read of a response body, or
+        *None* for no limit; it also sets the write and pool timeouts.  If
+        not passed, the client's timeouts are used (300 s without *client*).
     progress:
         Optional batch progress callback.
     skip_existing:
@@ -225,8 +228,8 @@ async def async_download_batch(
         Optional API key, sent as ``Authorization: Bearer <key>``.
     client:
         Optional :class:`httpx.AsyncClient` shared by all downloads.  A
-        *connect_timeout* or *read_timeout* that is set overrides the
-        client's timeout for each request; one left as *None* keeps the
+        *connect_timeout* or *read_timeout* that is passed overrides the
+        client's timeout for each request; one not passed keeps the
         client's value.
 
     Returns
@@ -288,8 +291,8 @@ def download_file(
     *,
     store_as: DownloadFormat | None = None,
     chunk_size: int = 1_048_576,
-    connect_timeout: float | None = None,
-    read_timeout: float | None = None,
+    connect_timeout: float | None | Unset = UNSET,
+    read_timeout: float | None | Unset = UNSET,
     progress_callback: DownloadProgressCallback | None = None,
     skip_existing: bool = False,
     force: bool = False,
@@ -323,8 +326,8 @@ def download_batch(
     store_as: DownloadFormat | None = None,
     parallel: int = 4,
     chunk_size: int = 1_048_576,
-    connect_timeout: float | None = None,
-    read_timeout: float | None = None,
+    connect_timeout: float | None | Unset = UNSET,
+    read_timeout: float | None | Unset = UNSET,
     progress: BatchDownloadProgress | None = None,
     skip_existing: bool = False,
     force: bool = False,

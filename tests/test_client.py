@@ -597,6 +597,23 @@ class TestSendBatch:
             _, kwargs = mock_send.call_args
             assert kwargs["chunk_size"] == 4096
 
+    @pytest.mark.parametrize("timeout", [42.0, None])
+    def test_timeout_passed_to_send_file(self, test_msz, _live_server, timeout):
+        """send_batch should forward timeout, including None, to async_send_file."""
+        with patch(
+            "mstransfer.client.sender.async_send_file",
+            wraps=async_send_file,
+        ) as mock_send:
+            send_batch(
+                [test_msz],
+                _live_server["base_url"],
+                parallel=1,
+                timeout=timeout,
+            )
+            mock_send.assert_called_once()
+            _, kwargs = mock_send.call_args
+            assert kwargs["timeout"] is timeout
+
     def test_batch_with_mscompress_objects(self, test_msz, other_mzml, _live_server):
         """send_batch accepts MSZFile and MZMLFile objects."""
         msz = MSZFile(str(test_msz).encode())
@@ -728,6 +745,11 @@ class TestAsyncSendFile:
             (
                 {"timeout": 42.0},
                 {"connect": 5.0, "read": 42.0, "write": 42.0, "pool": 42.0},
+            ),
+            # None means no limit, not "use the client's".
+            (
+                {"timeout": None},
+                {"connect": 5.0, "read": None, "write": None, "pool": None},
             ),
         ],
     )
