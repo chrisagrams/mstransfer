@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 import aiofiles
 import httpx
 
+from mstransfer.client.results import FileResult
 from mstransfer.client.utils import ThrottledCallback, optional_client
 from mstransfer.store import DownloadFormat, StorePlan
 
@@ -58,17 +59,10 @@ class DownloadRequest:
 
 @dataclass
 class DownloadResult:
-    """Result of a single download in a batch.
-
-    Exactly one of *path* and *error* is set: *path* is the final
-    destination on success, *error* the exception that failed the download.
-    An exception raised by :meth:`BatchDownloadProgress.on_file_complete`
-    is logged and does not count as a failure.
-    """
+    """A completed download: the request and where its output was written."""
 
     request: DownloadRequest
-    path: Path | None = field(default=None)
-    error: Exception | None = field(default=None)
+    path: Path
 
 
 async def async_download_file(
@@ -200,7 +194,7 @@ async def async_download_batch(
     force: bool = False,
     api_key: str | None = None,
     client: httpx.AsyncClient | None = None,
-) -> list[DownloadResult]:
+) -> list[FileResult[DownloadResult]]:
     """Download multiple files in parallel (async).
 
     Parameters
@@ -233,16 +227,18 @@ async def async_download_batch(
 
     Returns
     -------
-    list[DownloadResult]
-        One result per request, in input order, carrying either the final
-        destination path or the error.  A multi-member ``.mszx`` yields
-        its archive directory as the path.
+    list[FileResult[DownloadResult]]
+        One result per request, in input order, named after the request's
+        *dest*, carrying either a :class:`DownloadResult` or the error.  A
+        multi-member ``.mszx`` yields its archive directory as the path.
     """
     workers = min(parallel, len(files))
     sem = asyncio.Semaphore(workers)
 
     # Pre-allocate results list indexed by position for deterministic ordering.
-    results: list[DownloadResult] = [DownloadResult(request=req) for req in files]
+    results: list[FileResult[DownloadResult]] = [
+        FileResult(filename=req.dest.name) for req in files
+    ]
 
     async def _download_one(idx: int, req: DownloadRequest) -> None:
         filename = req.dest.name
@@ -277,7 +273,7 @@ async def async_download_batch(
                     progress.on_file_error(filename, exc)
                 logger.error("Failed to download %s: %s", filename, exc)
             else:
-                results[idx].path = result
+                results[idx].response = DownloadResult(request=req, path=result)
                 # A raising callback must not turn a finished download into
                 # a failure, or abort the rest of the batch.
                 if progress:
@@ -336,7 +332,7 @@ def download_batch(
     force: bool = False,
     api_key: str | None = None,
     client: httpx.AsyncClient | None = None,
-) -> list[DownloadResult]:
+) -> list[FileResult[DownloadResult]]:
     """Download multiple files in parallel.
 
     This is a synchronous wrapper around :func:`async_download_batch`.

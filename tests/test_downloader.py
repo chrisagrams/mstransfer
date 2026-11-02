@@ -18,7 +18,7 @@ import httpx
 import pytest
 from mscompress.mszx import compress_batch
 
-from mstransfer.client import DownloadRequest, DownloadResult
+from mstransfer.client import DownloadRequest, DownloadResult, FileResult
 from mstransfer.client.downloader import (
     _FileProgressAdapter,
     async_download_batch,
@@ -285,7 +285,12 @@ class TestDownloadBatch:
             DownloadRequest(url=f"{served_files['base_url']}/small.bin", dest=dest),
         ]
         results = download_batch(requests)
-        assert results == [DownloadResult(request=requests[0], path=dest)]
+        assert results == [
+            FileResult(
+                filename=dest.name,
+                response=DownloadResult(request=requests[0], path=dest),
+            )
+        ]
         assert dest.read_bytes() == b"hello world"
 
     def test_multiple_files(self, served_files, tmp_path):
@@ -301,7 +306,9 @@ class TestDownloadBatch:
             ),
         ]
         results = download_batch(requests, parallel=2)
-        assert [r.path for r in results] == [r.dest for r in requests]
+        assert [r.response for r in results] == [
+            DownloadResult(request=req, path=req.dest) for req in requests
+        ]
         assert all(r.error is None for r in results)
         assert (tmp_path / "small.bin").read_bytes() == b"hello world"
         assert (tmp_path / "medium.bin").read_bytes() == b"x" * 10_000
@@ -386,10 +393,12 @@ class TestDownloadBatch:
                 errors.append(filename)
 
         results = download_batch(requests, parallel=2, progress=Tracker())
-        assert [r.request for r in results] == requests
-        assert results[0].path == tmp_path / "small.bin"
+        assert [r.filename for r in results] == ["small.bin", "missing.bin"]
+        assert results[0].response == DownloadResult(
+            request=requests[0], path=tmp_path / "small.bin"
+        )
         assert results[0].error is None
-        assert results[1].path is None
+        assert results[1].response is None
         assert isinstance(results[1].error, httpx.HTTPStatusError)
         assert (tmp_path / "small.bin").read_bytes() == b"hello world"
         assert "missing.bin" in errors
@@ -403,7 +412,12 @@ class TestDownloadBatch:
             DownloadRequest(url=f"{served_files['base_url']}/small.bin", dest=dest),
         ]
         results = download_batch(requests, skip_existing=True)
-        assert results == [DownloadResult(request=requests[0], path=dest)]
+        assert results == [
+            FileResult(
+                filename=dest.name,
+                response=DownloadResult(request=requests[0], path=dest),
+            )
+        ]
         assert dest.read_bytes() == b"pre-existing"
 
     def test_raising_on_file_complete_is_not_a_failure(self, served_files, tmp_path):
@@ -437,9 +451,10 @@ class TestDownloadBatch:
         ]
         results = download_batch(requests, parallel=1, progress=Tracker())
 
-        assert results == [
+        assert [r.response for r in results] == [
             DownloadResult(request=req, path=req.dest) for req in requests
         ]
+        assert all(r.error is None for r in results)
         assert errors == []
         assert (tmp_path / "small.bin").read_bytes() == b"hello world"
         assert (tmp_path / "medium.bin").read_bytes() == b"x" * 10_000
@@ -458,8 +473,12 @@ class TestDownloadBatch:
         ]
         results = download_batch(requests, parallel=1)
 
-        assert [r.request for r in results] == requests
-        assert [r.path for r in results] == [None, tmp_path / "small.bin", None]
+        assert [r.filename for r in results] == ["a.bin", "small.bin", "b.bin"]
+        assert [r.response for r in results] == [
+            None,
+            DownloadResult(request=requests[1], path=tmp_path / "small.bin"),
+            None,
+        ]
         assert results[1].error is None
         for failed in (results[0], results[2]):
             assert isinstance(failed.error, httpx.HTTPStatusError)
@@ -528,17 +547,16 @@ class TestDownloadBatch:
             auth_headers.append(request.headers.get("authorization"))
             return httpx.Response(200, content=b"data")
 
+        req = DownloadRequest(url="http://test/f.bin", dest=tmp_path / "f.bin")
+
         async def _run() -> list:
             async with httpx.AsyncClient(
                 transport=httpx.MockTransport(handler)
             ) as client:
-                return await async_download_batch(
-                    [DownloadRequest(url="http://test/f.bin", dest=tmp_path / "f.bin")],
-                    api_key=api_key,
-                    client=client,
-                )
+                return await async_download_batch([req], api_key=api_key, client=client)
 
-        assert [r.path for r in asyncio.run(_run())] == [tmp_path / "f.bin"]
+        [result] = asyncio.run(_run())
+        assert result.response == DownloadResult(request=req, path=req.dest)
         assert auth_headers == [expected]
 
 
@@ -657,7 +675,7 @@ class TestFormatConversion:
             ),
         ]
         results = download_batch(requests, store_as="mzml")
-        assert results == [
+        assert [r.response for r in results] == [
             DownloadResult(request=requests[0], path=tmp_path / "result.mzML")
         ]
         assert (tmp_path / "result.mzML").stat().st_size == test_mzml.stat().st_size
@@ -738,7 +756,7 @@ class TestFormatConversion:
             ),
         ]
         results = download_batch(requests, store_as="mzml")
-        assert results == [
+        assert [r.response for r in results] == [
             DownloadResult(request=requests[0], path=tmp_path / "result.mzML")
         ]
         # Not silently kept as mszx.
@@ -764,8 +782,8 @@ class TestFormatConversion:
             ),
         ]
         [result] = download_batch(requests, store_as="mszx")
-        assert result.request == requests[0]
-        assert result.path is None
+        assert result.filename == "result.msz"
+        assert result.response is None
         assert isinstance(result.error, NotImplementedError)
 
     def test_mzml_to_mszx_raises(self, served_ms_files, tmp_path):
@@ -1077,7 +1095,10 @@ class TestBatchMszx:
             DownloadRequest(url=f"{base}/test.mszx", dest=out_dir / "single.mszx"),
         ]
         results = download_batch(requests, store_as="msz", parallel=1)
-        assert [r.path for r in results] == [out_dir / "batch", out_dir / "single.msz"]
+        assert [r.response for r in results] == [
+            DownloadResult(request=requests[0], path=out_dir / "batch"),
+            DownloadResult(request=requests[1], path=out_dir / "single.msz"),
+        ]
 
     def test_parallel_archives_sharing_member_name(self, served_batch_mszx, tmp_path):
         """Archives with a common member name don't clobber each other."""
@@ -1088,8 +1109,12 @@ class TestBatchMszx:
             DownloadRequest(url=f"{base}/batch.mszx", dest=out_dir / "batch.mszx"),
             DownloadRequest(url=f"{base}/batch2.mszx", dest=out_dir / "batch2.mszx"),
         ]
-        paths = [r.path for r in download_batch(requests, store_as="msz", parallel=2)]
-        assert paths == [out_dir / "batch", out_dir / "batch2"]
+        results = download_batch(requests, store_as="msz", parallel=2)
+        paths = [out_dir / "batch", out_dir / "batch2"]
+        assert [r.response for r in results] == [
+            DownloadResult(request=req, path=path)
+            for req, path in zip(requests, paths, strict=True)
+        ]
         assert sorted(p.name for p in (out_dir / "batch").iterdir()) == [
             "a.msz",
             "b.msz",
@@ -1267,7 +1292,12 @@ class TestAsyncDownloadBatch:
             DownloadRequest(url=f"{served_files['base_url']}/small.bin", dest=dest),
         ]
         results = await async_download_batch(requests)
-        assert results == [DownloadResult(request=requests[0], path=dest)]
+        assert results == [
+            FileResult(
+                filename=dest.name,
+                response=DownloadResult(request=requests[0], path=dest),
+            )
+        ]
         assert dest.read_bytes() == b"hello world"
 
     async def test_multiple_files(self, served_files, tmp_path):
@@ -1283,7 +1313,9 @@ class TestAsyncDownloadBatch:
             ),
         ]
         results = await async_download_batch(requests, parallel=2)
-        assert [r.path for r in results] == [r.dest for r in requests]
+        assert [r.response for r in results] == [
+            DownloadResult(request=req, path=req.dest) for req in requests
+        ]
         assert all(r.error is None for r in results)
         assert (tmp_path / "small.bin").read_bytes() == b"hello world"
         assert (tmp_path / "medium.bin").read_bytes() == b"x" * 10_000
@@ -1320,9 +1352,11 @@ class TestAsyncDownloadBatch:
                 errors.append(filename)
 
         results = await async_download_batch(requests, parallel=2, progress=Tracker())
-        assert [r.request for r in results] == requests
-        assert results[0].path == tmp_path / "small.bin"
-        assert results[1].path is None
+        assert [r.filename for r in results] == ["small.bin", "missing.bin"]
+        assert results[0].response == DownloadResult(
+            request=requests[0], path=tmp_path / "small.bin"
+        )
+        assert results[1].response is None
         assert isinstance(results[1].error, httpx.HTTPStatusError)
         assert (tmp_path / "small.bin").read_bytes() == b"hello world"
         assert "missing.bin" in errors

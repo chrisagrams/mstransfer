@@ -20,8 +20,7 @@ from mstransfer.cli import (
     main,
     parse_target,
 )
-from mstransfer.client.downloader import DownloadRequest, DownloadResult
-from mstransfer.client.sender import FileResult
+from mstransfer.client import DownloadRequest, DownloadResult, FileResult
 from mstransfer.server.models import (
     TransferState,
     UploadResponse,
@@ -467,8 +466,9 @@ class TestUploadProgressDisplay:
 
 
 def _ok_result(dest):
-    return DownloadResult(
-        request=DownloadRequest(url="http://host/x", dest=dest), path=dest
+    req = DownloadRequest(url="http://host/x", dest=dest)
+    return FileResult(
+        filename=dest.name, response=DownloadResult(request=req, path=dest)
     )
 
 
@@ -496,8 +496,7 @@ class TestCmdDownload:
     @patch("mstransfer.cli.async_download_batch", new_callable=AsyncMock)
     def test_successful_download(self, mock_batch, tmp_path):
         dest = tmp_path / "file.msz"
-        req = DownloadRequest(url="http://host/file.msz", dest=dest)
-        mock_batch.return_value = [DownloadResult(request=req, path=dest)]
+        mock_batch.return_value = [_ok_result(dest)]
 
         args = self._make_args(
             ["http://host/file.msz"],
@@ -512,7 +511,7 @@ class TestCmdDownload:
 
     @patch("mstransfer.cli.async_download_batch", new_callable=AsyncMock)
     def test_partial_failure(self, mock_batch, tmp_path, capsys):
-        """A failed download exits non-zero and names the URL and the error."""
+        """A failed download exits non-zero and names the file and the error."""
 
         async def _batch(requests, *, progress, **kwargs):
             progress.on_file_start("a.msz", 10)
@@ -520,8 +519,8 @@ class TestCmdDownload:
             progress.on_file_start("b.msz", 10)
             progress.on_file_error("b.msz", RuntimeError("boom"))
             return [
-                DownloadResult(request=requests[0], path=requests[0].dest),
-                DownloadResult(request=requests[1], error=RuntimeError("boom")),
+                _ok_result(requests[0].dest),
+                FileResult(filename="b.msz", error=RuntimeError("boom")),
             ]
 
         mock_batch.side_effect = _batch
@@ -536,8 +535,8 @@ class TestCmdDownload:
         out = capsys.readouterr().out
         assert "1 succeeded" in out
         assert "1 failed" in out
-        assert "http://host/b.msz: boom" in out
-        assert "http://host/a.msz:" not in out
+        assert "b.msz: boom" in out
+        assert "a.msz:" not in out
 
     @patch("mstransfer.cli.async_download_batch", new_callable=AsyncMock)
     def test_passes_store_as(self, mock_batch, tmp_path):

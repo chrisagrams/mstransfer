@@ -18,12 +18,14 @@ from mstransfer.client.downloader import (
     DownloadResult,
     async_download_batch,
 )
-from mstransfer.client.sender import FileResult, async_send_batch
+from mstransfer.client.sender import async_send_batch
 from mstransfer.client.utils import resolve_inputs
 from mstransfer.server.auth import APIKeyAuthProvider
 
 if TYPE_CHECKING:
     from rich.progress import TaskID
+
+    from mstransfer.client.results import FileResult
 
 from mstransfer.log import (
     console,
@@ -162,7 +164,7 @@ def cmd_upload(args: argparse.Namespace) -> None:
 
     display = UploadProgressDisplay(len(file_paths))
 
-    async def _run() -> list[FileResult]:
+    async def _run() -> list[FileResult[UploadResponse]]:
         async with httpx.AsyncClient(
             timeout=httpx.Timeout(3600.0, connect=10.0),
         ) as client:
@@ -254,7 +256,7 @@ def cmd_download(args: argparse.Namespace) -> None:
 
     display = DownloadProgressDisplay(len(requests))
 
-    async def _run() -> list[DownloadResult]:
+    async def _run() -> list[FileResult[DownloadResult]]:
         async with httpx.AsyncClient(
             timeout=httpx.Timeout(300.0, connect=10.0),
         ) as client:
@@ -278,7 +280,7 @@ def cmd_download(args: argparse.Namespace) -> None:
     if failed:
         console.print(f"\n[green]{ok} succeeded[/], [red]{len(failed)} failed[/]")
         for r in failed:
-            console.print(f"  [red]- {r.request.url}: {r.error}")
+            console.print(f"  [red]- {r.filename}: {r.error}")
         sys.exit(1)
     console.print(f"\n[green]All {ok} file(s) downloaded successfully.")
 
