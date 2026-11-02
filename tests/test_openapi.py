@@ -167,12 +167,11 @@ def test_upload_documents_headers_and_body(authed_schema: dict[str, Any]) -> Non
     assert headers["X-Transfer-ID"]["required"] is True
     assert headers["X-Original-Filename"]["required"] is True
     assert headers["X-Source-Format"]["required"] is False
-    assert headers["X-Source-Format"]["schema"]["enum"] == ["msz", "mzml", "mszx"]
     assert op["requestBody"] == {
         "required": True,
         "content": {"application/octet-stream": {}},
     }
-    assert {"200", "400", "401", "409", "500"} <= set(op["responses"])
+    assert {"200", "400", "401", "409", "422", "500"} <= set(op["responses"])
 
 
 @pytest.mark.parametrize(

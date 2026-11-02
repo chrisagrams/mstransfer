@@ -170,6 +170,12 @@ class TestAuthIntegration:
         assert resp.status_code == 401
 
     @pytest.mark.asyncio
+    async def test_upload_auth_checked_before_headers(self, authed_client):
+        """Missing credentials win over missing headers: 401, not 422."""
+        resp = await authed_client.post("/v1/upload", content=b"data")
+        assert resp.status_code == 401
+
+    @pytest.mark.asyncio
     async def test_upload_with_valid_auth(self, authed_client, test_msz):
         """Upload with valid credentials should succeed."""
         resp = await authed_client.post(

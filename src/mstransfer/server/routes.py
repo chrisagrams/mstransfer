@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Annotated, Any
 
 import aiofiles
 import aiofiles.os
-from fastapi import APIRouter, Depends, HTTPException, Request, Security
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, Security
 from fastapi.responses import StreamingResponse
 
 from mstransfer import __version__
@@ -122,36 +122,9 @@ def make_router(
         "/upload",
         response_model=UploadResponse,
         dependencies=protected,
-        # The headers and body are read from the raw request so the upload can
-        # stream, so FastAPI cannot infer them; declare them here instead.
-        # An empty media type object is OpenAPI 3.1's binary body.
         openapi_extra={
-            "parameters": [
-                {
-                    "name": "X-Transfer-ID",
-                    "in": "header",
-                    "required": True,
-                    "schema": {"type": "string"},
-                    "description": "A unique identifier for the transfer.",
-                },
-                {
-                    "name": "X-Original-Filename",
-                    "in": "header",
-                    "required": True,
-                    "schema": {"type": "string"},
-                    "description": "The original filename of the uploaded file.",
-                },
-                {
-                    "name": "X-Source-Format",
-                    "in": "header",
-                    "required": False,
-                    "schema": {"type": "string", "enum": [f.value for f in MSFormat]},
-                    "description": (
-                        "Format of the payload, case-insensitive.  Inferred "
-                        "from the filename extension when absent."
-                    ),
-                },
-            ],
+            # Streamed from request.stream(); a Body() param would buffer it.
+            # An empty media type object is OpenAPI 3.1's binary body.
             "requestBody": {
                 "required": True,
                 "content": {"application/octet-stream": {}},
@@ -159,30 +132,47 @@ def make_router(
             **auth_extra,
         },
         responses={
-            400: {
-                "model": ErrorResponse,
-                "description": "Missing header or unsupported X-Source-Format",
-            },
+            400: {"model": ErrorResponse},
             **auth_responses,
-            409: {
-                "model": ErrorResponse,
-                "description": "Output file exists or is being written",
-            },
-            500: {"model": ErrorResponse, "description": "Error receiving data"},
+            409: {"model": ErrorResponse},
+            500: {"model": ErrorResponse},
         },
     )
-    async def upload(request: Request, state: AppState = state_dep) -> UploadResponse:
+    async def upload(
+        request: Request,
+        transfer_id: Annotated[
+            str,
+            Header(
+                alias="X-Transfer-ID",
+                min_length=1,
+                description="A unique identifier for the transfer.",
+            ),
+        ],
+        original_filename: Annotated[
+            str,
+            Header(
+                alias="X-Original-Filename",
+                min_length=1,
+                description="The original filename of the uploaded file.",
+            ),
+        ],
+        source_header: Annotated[
+            str | None,
+            Header(
+                alias="X-Source-Format",
+                description=(
+                    "mzML, msz or mszx, case-insensitive.  Inferred from the "
+                    "filename extension when absent."
+                ),
+            ),
+        ] = None,
+        state: AppState = state_dep,
+    ) -> UploadResponse:
         """
         Endpoint to handle file uploads. Expects the file content in the request body
-        and requires the following headers:
-
-            - X-Transfer-ID: A unique identifier for the transfer.
-            - X-Original-Filename: The original filename of the uploaded file.
-
-        and optionally:
-
-            - X-Source-Format: ``mzML``, ``msz`` or ``mszx``.  Inferred from
-              the filename extension when absent.
+        and the ``X-Transfer-ID`` and ``X-Original-Filename`` headers, plus an
+        optional ``X-Source-Format`` header.  A missing or empty required header
+        responds 422; an unsupported ``X-Source-Format`` responds 400.
 
         Responds 409 Conflict, before reading the request body, if the output
         file already exists or another transfer is writing it.
@@ -191,21 +181,8 @@ def make_router(
         with the progress, and optionally decompress if configured to do so.  MSZX
         archives are always stored as-is, regardless of ``store_as``.
         """
-        # Get the transfer ID, raise if missing.
-        transfer_id = request.headers.get("X-Transfer-ID")
-        if not transfer_id:
-            raise HTTPException(status_code=400, detail="Missing X-Transfer-ID header")
-
-        # Get the original filename, raise if missing.
-        original_filename = request.headers.get("X-Original-Filename")
-        if not original_filename:
-            raise HTTPException(
-                status_code=400, detail="Missing X-Original-Filename header"
-            )
-
         # Determine the payload format, raise if unrecognised.
         # Without the header, the format is inferred from the filename.
-        source_header = request.headers.get("X-Source-Format")
         try:
             source = (
                 MSFormat.from_header(source_header)
