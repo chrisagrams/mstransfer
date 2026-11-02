@@ -66,6 +66,7 @@ async def async_download_file(
     progress_callback: DownloadProgressCallback | None = None,
     skip_existing: bool = False,
     force: bool = False,
+    api_key: str | None = None,
     client: httpx.AsyncClient | None = None,
 ) -> Path:
     """Download a single file from *url* to *dest* (async).
@@ -110,6 +111,8 @@ async def async_download_file(
     force:
         If *True*, re-download even if the destination already exists
         (overrides *skip_existing*).
+    api_key:
+        Optional API key, sent as ``Authorization: Bearer <key>``.
 
     Returns
     -------
@@ -132,6 +135,7 @@ async def async_download_file(
     part_path = plan.part_path
 
     timeout = httpx.Timeout(read_timeout, connect=connect_timeout)
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else None
 
     # Throttle progress callbacks to reduce overhead (default: every 8 MiB).
     throttled = (
@@ -140,7 +144,7 @@ async def async_download_file(
 
     async with (
         optional_client(client, timeout=timeout) as c,
-        c.stream("GET", url) as resp,
+        c.stream("GET", url, headers=headers) as resp,
     ):
         resp.raise_for_status()
 
@@ -173,6 +177,7 @@ async def async_download_batch(
     progress: BatchDownloadProgress | None = None,
     skip_existing: bool = False,
     force: bool = False,
+    api_key: str | None = None,
     client: httpx.AsyncClient | None = None,
 ) -> list[Path]:
     """Download multiple files in parallel (async).
@@ -199,6 +204,8 @@ async def async_download_batch(
         If *True*, skip files whose destination already exists.
     force:
         If *True*, re-download even if destination exists.
+    api_key:
+        Optional API key, sent as ``Authorization: Bearer <key>``.
 
     Returns
     -------
@@ -237,6 +244,7 @@ async def async_download_batch(
                     progress_callback=file_progress,
                     skip_existing=skip_existing,
                     force=force,
+                    api_key=api_key,
                     client=client,
                 )
                 results[idx] = result
@@ -263,6 +271,7 @@ def download_file(
     progress_callback: DownloadProgressCallback | None = None,
     skip_existing: bool = False,
     force: bool = False,
+    api_key: str | None = None,
     client: httpx.AsyncClient | None = None,
 ) -> Path:
     """Download a single file from *url* to *dest*.
@@ -280,6 +289,7 @@ def download_file(
             progress_callback=progress_callback,
             skip_existing=skip_existing,
             force=force,
+            api_key=api_key,
             client=client,
         )
     )
@@ -296,6 +306,7 @@ def download_batch(
     progress: BatchDownloadProgress | None = None,
     skip_existing: bool = False,
     force: bool = False,
+    api_key: str | None = None,
     client: httpx.AsyncClient | None = None,
 ) -> list[Path]:
     """Download multiple files in parallel.
@@ -313,6 +324,7 @@ def download_batch(
             progress=progress,
             skip_existing=skip_existing,
             force=force,
+            api_key=api_key,
             client=client,
         )
     )

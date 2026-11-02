@@ -475,6 +475,7 @@ class TestCmdDownload:
             "chunk_size": 1_048_576,
             "skip_existing": False,
             "force": False,
+            "api_key": None,
         }
         defaults.update(overrides)
         return argparse.Namespace(**defaults)
@@ -566,6 +567,19 @@ class TestCmdDownload:
         call_kwargs = mock_batch.call_args[1]
         assert call_kwargs["skip_existing"] is True
         assert call_kwargs["force"] is True
+
+    @patch("mstransfer.cli.async_download_batch", new_callable=AsyncMock)
+    def test_passes_api_key(self, mock_batch, tmp_path):
+        mock_batch.return_value = [tmp_path / "file.msz"]
+
+        args = self._make_args(
+            ["http://host/file.msz"],
+            output_dir=str(tmp_path),
+            api_key="secret",
+        )
+        cmd_download(args)
+
+        assert mock_batch.call_args[1]["api_key"] == "secret"
 
 
 # ---------------------------------------------------------------------------
@@ -671,6 +685,13 @@ class TestMain:
         with patch("sys.argv", ["mstransfer", "download", "http://host/f.msz"]):
             main()
         mock_cmd_download.assert_called_once()
+
+    @patch("mstransfer.cli.cmd_download")
+    def test_main_download_accepts_api_key(self, mock_cmd_download):
+        argv = ["mstransfer", "download", "http://host/f.msz", "--api-key", "k"]
+        with patch("sys.argv", argv):
+            main()
+        assert mock_cmd_download.call_args[0][0].api_key == "k"
 
     def test_main_no_command_prints_help(self, capsys):
         with patch("sys.argv", ["mstransfer"]), pytest.raises(SystemExit) as exc_info:

@@ -455,6 +455,31 @@ class TestDownloadBatch:
             ("complete", None),
         ]
 
+    @pytest.mark.parametrize(
+        ("api_key", "expected"),
+        [("secret", "Bearer secret"), (None, None)],
+    )
+    def test_api_key_sent_as_bearer(self, tmp_path, api_key, expected):
+        """Regression test for #77: the API key reaches the GET request."""
+        auth_headers: list[str | None] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            auth_headers.append(request.headers.get("authorization"))
+            return httpx.Response(200, content=b"data")
+
+        async def _run() -> list:
+            async with httpx.AsyncClient(
+                transport=httpx.MockTransport(handler)
+            ) as client:
+                return await async_download_batch(
+                    [DownloadRequest(url="http://test/f.bin", dest=tmp_path / "f.bin")],
+                    api_key=api_key,
+                    client=client,
+                )
+
+        assert asyncio.run(_run()) == [tmp_path / "f.bin"]
+        assert auth_headers == [expected]
+
 
 # ---------------------------------------------------------------------------
 # _FileProgressAdapter

@@ -263,6 +263,7 @@ def cmd_download(args: argparse.Namespace) -> None:
                 progress=display,
                 skip_existing=args.skip_existing,
                 force=args.force,
+                api_key=args.api_key,
                 client=client,
             )
 
@@ -381,6 +382,11 @@ def main() -> None:
         "--force",
         action="store_true",
         help="Re-download even if destination file exists",
+    )
+    dp.add_argument(
+        "--api-key",
+        default=None,
+        help="API key for authenticating with the server",
     )
     dp.set_defaults(func=cmd_download)
 
