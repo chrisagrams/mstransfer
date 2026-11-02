@@ -67,8 +67,13 @@ def parse_target(target: str) -> str:
 def cmd_serve(args: argparse.Namespace) -> None:
     setup_logging()
 
-    # Fail fast if the port is already in use.
+    # Fail fast if the port is already in use. SO_REUSEADDR matches uvicorn's
+    # listener so TIME-WAIT connections left by a previous server don't block
+    # a restart. On Windows it would allow binding a port another process is
+    # listening on, so leave it off there.
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        if sys.platform != "win32":
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
             sock.bind((args.host, args.port))
         except OSError:
