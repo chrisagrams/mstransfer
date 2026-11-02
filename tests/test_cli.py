@@ -546,10 +546,94 @@ class TestCmdDownload:
             cmd_download(args)
 
         out = capsys.readouterr().out
-        assert "1 succeeded" in out
+        assert "1 downloaded" in out
         assert "1 failed" in out
         assert "b.msz: boom" in out
         assert "a.msz:" not in out
+
+    @patch("mstransfer.cli.async_download_batch", new_callable=AsyncMock)
+    def test_skip_existing_counts_skips(self, mock_batch, tmp_path, capsys):
+        """Skipped files are counted and shown as skipped, not as downloaded."""
+        seen = {}
+
+        async def _batch(requests, *, progress, **kwargs):
+            seen["display"] = progress
+            results = []
+            for req in requests:
+                progress.on_file_start(req.dest.name, None)
+                skipped = req.dest.name != "new.msz"
+                if not skipped:
+                    progress.on_file_total(req.dest.name, 10)
+                    progress.on_file_progress(req.dest.name, 10)
+                progress.on_file_complete(req.dest.name)
+                results.append(
+                    FileResult(
+                        filename=req.dest.name,
+                        response=DownloadResult(
+                            request=req, path=req.dest, skipped=skipped
+                        ),
+                    )
+                )
+            return results
+
+        mock_batch.side_effect = _batch
+
+        args = self._make_args(
+            [
+                "http://host/new.msz",
+                "http://host/old1.msz",
+                "http://host/old2.msz",
+            ],
+            output_dir=str(tmp_path),
+            skip_existing=True,
+        )
+        cmd_download(args)  # a skip is not a failure: no SystemExit
+
+        out = capsys.readouterr().out
+        assert "1 downloaded, 2 skipped (already exist)" in out
+        assert "successfully" not in out
+        display = seen["display"]
+        new = display.files.tasks[display._task_ids["new.msz"]]
+        assert new.description == "[green]new.msz"
+        for name in ("old1.msz", "old2.msz"):
+            task = display.files.tasks[display._task_ids[name]]
+            assert task.description == f"[yellow]{name} (skipped)"
+            assert task.finished
+
+    @patch("mstransfer.cli.async_download_batch", new_callable=AsyncMock)
+    def test_skip_with_failure(self, mock_batch, tmp_path, capsys):
+        """Downloaded, skipped and failed files are all counted."""
+
+        async def _batch(requests, *, progress, **kwargs):
+            for name in ("a.msz", "b.msz"):
+                progress.on_file_start(name, None)
+                progress.on_file_complete(name)
+            progress.on_file_start("c.msz", None)
+            progress.on_file_error("c.msz", RuntimeError("boom"))
+            return [
+                _ok_result(requests[0].dest),
+                FileResult(
+                    filename="b.msz",
+                    response=DownloadResult(
+                        request=requests[1], path=requests[1].dest, skipped=True
+                    ),
+                ),
+                FileResult(filename="c.msz", error=RuntimeError("boom")),
+            ]
+
+        mock_batch.side_effect = _batch
+
+        args = self._make_args(
+            ["http://host/a.msz", "http://host/b.msz", "http://host/c.msz"],
+            output_dir=str(tmp_path),
+            skip_existing=True,
+        )
+        with pytest.raises(SystemExit, match="1"):
+            cmd_download(args)
+
+        out = capsys.readouterr().out
+        assert "1 downloaded, 1 skipped (already exist), 1 failed" in out
+        assert "c.msz: boom" in out
 
     @patch("mstransfer.cli.async_download_batch", new_callable=AsyncMock)
     def test_passes_store_as(self, mock_batch, tmp_path):

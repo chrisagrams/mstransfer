@@ -464,21 +464,71 @@ class TestDownloadBatch:
         assert "missing.bin" in errors
 
     def test_skip_existing_in_batch(self, served_files, tmp_path):
-        """skip_existing is forwarded to individual downloads."""
+        """Existing files are skipped and flagged; new ones are downloaded."""
         dest = tmp_path / "small.bin"
         dest.write_bytes(b"pre-existing")
 
         requests = [
             DownloadRequest(url=f"{served_files['base_url']}/small.bin", dest=dest),
+            DownloadRequest(
+                url=f"{served_files['base_url']}/medium.bin",
+                dest=tmp_path / "medium.bin",
+            ),
         ]
-        results = download_batch(requests, skip_existing=True)
-        assert results == [
-            FileResult(
-                filename=dest.name,
-                response=DownloadResult(request=requests[0], path=dest),
-            )
+        completed: list[str] = []
+
+        class Tracker:
+            def on_file_start(self, filename: str, total_bytes: int | None) -> None:
+                pass
+
+            def on_file_total(self, filename: str, total_bytes: int | None) -> None:
+                pass
+
+            def on_file_progress(self, filename: str, bytes_delta: int) -> None:
+                pass
+
+            def on_file_complete(self, filename: str) -> None:
+                completed.append(filename)
+
+            def on_file_error(self, filename: str, error: Exception) -> None:
+                pass
+
+        results = download_batch(requests, skip_existing=True, progress=Tracker())
+        assert [r.response for r in results] == [
+            DownloadResult(request=requests[0], path=dest, skipped=True),
+            DownloadResult(request=requests[1], path=tmp_path / "medium.bin"),
         ]
         assert dest.read_bytes() == b"pre-existing"
+        assert (tmp_path / "medium.bin").read_bytes() == b"x" * 10_000
+        assert sorted(completed) == ["medium.bin", "small.bin"]
+
+    def test_force_in_batch_is_not_skipped(self, served_files, tmp_path):
+        """With force, an existing file is downloaded again, not skipped."""
+        dest = tmp_path / "small.bin"
+        dest.write_bytes(b"pre-existing")
+        requests = [
+            DownloadRequest(url=f"{served_files['base_url']}/small.bin", dest=dest),
+        ]
+        results = download_batch(requests, skip_existing=True, force=True)
+        assert results[0].response == DownloadResult(request=requests[0], path=dest)
+        assert dest.read_bytes() == b"hello world"
+
+    def test_skip_existing_archive_dir_in_batch(self, served_batch_mszx, tmp_path):
+        """An existing .mszx archive directory is reported as skipped."""
+        existing = tmp_path / "gone"
+        existing.mkdir()
+        # gone.mszx isn't served, so any request would fail with a 404.
+        requests = [
+            DownloadRequest(
+                url=f"{served_batch_mszx['base_url']}/gone.mszx",
+                dest=tmp_path / "gone.mszx",
+            ),
+        ]
+        results = download_batch(requests, store_as="msz", skip_existing=True)
+        assert results[0].error is None
+        assert results[0].response == DownloadResult(
+            request=requests[0], path=existing, skipped=True
+        )
 
     def test_raising_on_file_complete_is_not_a_failure(self, served_files, tmp_path):
         """A raising on_file_complete leaves the result a success.
