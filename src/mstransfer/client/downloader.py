@@ -151,7 +151,8 @@ async def async_download_file(
         *dest* and keep this one's partial if it is interrupted.  Only one
         download to *dest* at a time can do so; a concurrent one uses a
         private ``.part`` file that is never resumed.  If *False*,
-        start from zero and keep nothing on failure.
+        start from zero and keep nothing on failure; on success, remove
+        the partial an earlier download left, unless one is using it.
     api_key:
         Optional API key, sent as ``Authorization: Bearer <key>``.
     client:
@@ -186,11 +187,10 @@ async def async_download_file(
     # is never resumed, so concurrent downloads to one dest never share it.
     part_path = plan.unique_part_path()
     meta_path = plan.part_path.with_name(plan.part_path.name + ".json")
+    lock_path = plan.part_path.with_name(plan.part_path.name + ".lock")
     lock: BaseFileLock | None = None
     if resume:
-        candidate = FileLock(
-            plan.part_path.with_name(plan.part_path.name + ".lock"), timeout=0
-        )
+        candidate = FileLock(lock_path, timeout=0)
         try:
             candidate.acquire()
         except Timeout:
@@ -316,7 +316,20 @@ async def async_download_file(
             retain = False
             raise ValueError(f"Downloaded {size} bytes of {url}, but expected {total}")
 
-        return await plan.finalize(part_path)
+        result = await plan.finalize(part_path)
+        if not resume:
+            # A partial left by an earlier resumable attempt is dead weight now
+            # that the output exists.  Take its lock so a download still using
+            # it keeps it; the finally block removes its metadata and the lock.
+            candidate = FileLock(lock_path, timeout=0)
+            try:
+                candidate.acquire()
+            except Timeout:
+                pass
+            else:
+                lock = candidate
+                plan.part_path.unlink(missing_ok=True)
+        return result
     finally:
         # Keep a resumable partial for a later attempt.  Anything else, like
         # the .part of a cancelled download without an ETag, is dead
