@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Any
 import aiofiles
 import aiofiles.os
 from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse
 
 from mstransfer import __version__
 from mstransfer.server.models import (
@@ -19,8 +19,7 @@ from mstransfer.server.models import (
 from mstransfer.store import MSFormat, StorePlan
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator, Callable
-    from pathlib import Path
+    from collections.abc import Callable
 
     from mstransfer.server.state import AppState
 
@@ -251,10 +250,13 @@ def make_router(
         return FileListResponse(files=files)
 
     @router.get("/files/{filename}", dependencies=protected)
-    async def download_file(
-        filename: str, state: AppState = state_dep
-    ) -> StreamingResponse:
-        """Download a single file by name."""
+    async def download_file(filename: str, state: AppState = state_dep) -> FileResponse:
+        """Download a single file by name.
+
+        Supports byte ``Range`` requests (``206``/``416``) and ``If-Range``,
+        and sends ``ETag`` and ``Last-Modified`` validators, so an
+        interrupted download can be resumed.
+        """
         path = await state.files.get_file(filename)
         if path is None:
             raise HTTPException(status_code=404, detail="File not found")
@@ -266,25 +268,8 @@ def make_router(
             else "application/octet-stream"
         )
 
-        return StreamingResponse(
-            _stream_file(path),
-            media_type=content_type,
-            headers={
-                "Content-Length": str(stat.st_size),
-                "Content-Disposition": f'attachment; filename="{path.name}"',
-            },
+        return FileResponse(
+            path, media_type=content_type, filename=path.name, stat_result=stat
         )
 
     return router
-
-
-async def _stream_file(
-    path: Path, chunk_size: int = 1_048_576
-) -> AsyncGenerator[bytes, None]:
-    """Async generator that reads a file in chunks."""
-    async with aiofiles.open(path, "rb") as f:
-        while True:
-            chunk = await f.read(chunk_size)
-            if not chunk:
-                break
-            yield chunk

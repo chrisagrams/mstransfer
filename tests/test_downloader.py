@@ -26,6 +26,7 @@ from mstransfer.client.downloader import (
     download_batch,
     download_file,
 )
+from mstransfer.server.app import create_app
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -1419,3 +1420,443 @@ class TestAsyncDownloadBatch:
         assert isinstance(results[1].error, httpx.HTTPStatusError)
         assert (tmp_path / "small.bin").read_bytes() == b"hello world"
         assert "missing.bin" in errors
+
+
+class _Body(httpx.AsyncByteStream):
+    """A response body that drops the connection after *fail_after* bytes."""
+
+    def __init__(self, data: bytes, fail_after: int | None) -> None:
+        self._data = data
+        self._fail_after = fail_after
+
+    async def __aiter__(self):
+        end = len(self._data) if self._fail_after is None else self._fail_after
+        for i in range(0, end, 1000):
+            yield self._data[i : min(i + 1000, end)]
+        if self._fail_after is not None:
+            raise httpx.ReadError("connection lost")
+
+
+class RangeServer:
+    """A mock HTTP server for *body*, with optional byte-range support.
+
+    Set :attr:`fail_after` to cut the next response short.
+    """
+
+    def __init__(
+        self,
+        body: bytes,
+        *,
+        etag: str | None = '"v1"',
+        ranges: bool = True,
+        honor_if_range: bool = True,
+        sized: bool = True,
+    ) -> None:
+        self.body = body
+        self.etag = etag
+        self.ranges = ranges
+        self.honor_if_range = honor_if_range
+        self.sized = sized
+        self.fail_after: int | None = None
+        self.requests: list[httpx.Request] = []
+        self.statuses: list[int] = []
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        self.requests.append(request)
+        headers = {}
+        if self.etag:
+            headers["etag"] = self.etag
+        body, status = self.body, 200
+        range_ = request.headers.get("range")
+        if_range = request.headers.get("if-range")
+        unchanged = if_range is None or if_range == self.etag
+        if range_ and self.ranges and (unchanged or not self.honor_if_range):
+            start = int(range_.removeprefix("bytes=").removesuffix("-"))
+            size = len(self.body)
+            if start >= size:
+                self.statuses.append(416)
+                return httpx.Response(416, headers={"content-range": f"bytes */{size}"})
+            body, status = self.body[start:], 206
+            headers["content-range"] = f"bytes {start}-{size - 1}/{size}"
+        if self.sized:
+            headers["content-length"] = str(len(body))
+        fail_after, self.fail_after = self.fail_after, None
+        self.statuses.append(status)
+        return httpx.Response(status, headers=headers, stream=_Body(body, fail_after))
+
+
+class _Progress:
+    def __init__(self) -> None:
+        self.totals: list[int | None] = []
+        self.received = 0
+
+    def on_total(self, total_bytes: int | None) -> None:
+        self.totals.append(total_bytes)
+
+    def on_progress(self, bytes_delta: int) -> None:
+        self.received += bytes_delta
+
+
+def _fetch(server: RangeServer, dest, url: str = "http://test/f.bin", **kwargs):
+    async def _run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(server)) as client:
+            return await async_download_file(
+                url, dest, chunk_size=1000, client=client, **kwargs
+            )
+
+    return asyncio.run(_run())
+
+
+def _interrupt(server: RangeServer, dest, at: int = 4000, **kwargs) -> None:
+    server.fail_after = at
+    with pytest.raises(httpx.ReadError):
+        _fetch(server, dest, **kwargs)
+
+
+BODY = bytes(range(256)) * 40
+
+
+class TestResume:
+    def test_resumes_from_partial(self, tmp_path):
+        """An interrupted download continues from the bytes it had."""
+        server = RangeServer(BODY)
+        dest = tmp_path / "f.bin"
+        _interrupt(server, dest)
+
+        part = tmp_path / "f.bin.part"
+        assert part.read_bytes() == BODY[:4000]
+        assert json.loads((tmp_path / "f.bin.part.json").read_text()) == {
+            "url": "http://test/f.bin",
+            "etag": '"v1"',
+            "total": len(BODY),
+        }
+
+        progress = _Progress()
+        assert _fetch(server, dest, progress_callback=progress) == dest
+        assert dest.read_bytes() == BODY
+        assert list(tmp_path.iterdir()) == [dest]
+        assert server.requests[-1].headers["range"] == "bytes=4000-"
+        assert server.requests[-1].headers["if-range"] == '"v1"'
+        assert server.statuses[-1] == 206
+        assert progress.totals == [len(BODY)]
+        assert progress.received == len(BODY)
+
+    def test_cancelled_download_keeps_partial(self, tmp_path):
+        """Cancellation keeps a resumable partial too."""
+        started = asyncio.Event()
+
+        class Stalls(httpx.AsyncByteStream):
+            async def __aiter__(self):
+                yield BODY[:3000]
+                started.set()
+                await asyncio.Event().wait()
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            headers = {"etag": '"v1"', "content-length": str(len(BODY))}
+            return httpx.Response(200, headers=headers, stream=Stalls())
+
+        dest = tmp_path / "f.bin"
+
+        async def _run() -> None:
+            async with httpx.AsyncClient(
+                transport=httpx.MockTransport(handler)
+            ) as client:
+                task = asyncio.create_task(
+                    async_download_file(
+                        "http://test/f.bin", dest, chunk_size=1000, client=client
+                    )
+                )
+                await started.wait()
+                await asyncio.sleep(0.05)
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+
+        asyncio.run(_run())
+        assert (tmp_path / "f.bin.part").read_bytes() == BODY[:3000]
+
+        server = RangeServer(BODY)
+        _fetch(server, dest)
+        assert dest.read_bytes() == BODY
+        assert server.requests[0].headers["range"] == "bytes=3000-"
+
+    def test_server_without_ranges_restarts(self, tmp_path):
+        """A server that ignores Range sends the whole file to replace the partial."""
+        server = RangeServer(BODY, ranges=False)
+        dest = tmp_path / "f.bin"
+        _interrupt(server, dest)
+
+        _fetch(server, dest)
+        assert server.statuses[-1] == 200
+        assert dest.read_bytes() == BODY
+        assert list(tmp_path.iterdir()) == [dest]
+
+    def test_changed_file_restarts(self, tmp_path):
+        """If-Range makes the server send a changed file in full."""
+        server = RangeServer(BODY)
+        dest = tmp_path / "f.bin"
+        _interrupt(server, dest)
+
+        server.body, server.etag = b"new" * 5000, '"v2"'
+        _fetch(server, dest)
+        assert server.statuses[-1] == 200
+        assert dest.read_bytes() == b"new" * 5000
+        assert list(tmp_path.iterdir()) == [dest]
+
+    def test_failed_restart_does_not_mislabel_partial(self, tmp_path):
+        """A restart that fails early leaves no old bytes under the new ETag."""
+        server = RangeServer(BODY)
+        dest = tmp_path / "f.bin"
+        _interrupt(server, dest)
+
+        class Raises(_Progress):
+            def on_total(self, total_bytes: int | None) -> None:
+                raise RuntimeError("boom")
+
+        new = b"new" * 5000
+        server.body, server.etag = new, '"v2"'
+        with pytest.raises(RuntimeError):
+            _fetch(server, dest, progress_callback=Raises())
+
+        _fetch(server, dest)
+        assert dest.read_bytes() == new
+
+    def test_range_of_changed_file_is_rejected(self, tmp_path):
+        """A 206 for a different file version is not appended to the partial."""
+        server = RangeServer(BODY, honor_if_range=False)
+        dest = tmp_path / "f.bin"
+        _interrupt(server, dest)
+
+        server.body, server.etag = b"new" * 5000, '"v2"'
+        _fetch(server, dest)
+        assert server.statuses[-2:] == [206, 200]
+        assert "range" not in server.requests[-1].headers
+        assert dest.read_bytes() == b"new" * 5000
+
+    def test_range_of_resized_file_is_rejected(self, tmp_path):
+        """A 206 whose Content-Range does not continue the partial restarts."""
+        server = RangeServer(BODY, honor_if_range=False)
+        dest = tmp_path / "f.bin"
+        _interrupt(server, dest)
+
+        server.body = BODY + b"more"
+        _fetch(server, dest)
+        assert server.statuses[-2:] == [206, 200]
+        assert dest.read_bytes() == BODY + b"more"
+
+    def test_unsatisfiable_range_restarts(self, tmp_path):
+        """A 416 (the file shrank) restarts the download."""
+        server = RangeServer(BODY, honor_if_range=False)
+        dest = tmp_path / "f.bin"
+        _interrupt(server, dest)
+
+        server.body = BODY[:100]
+        _fetch(server, dest)
+        assert server.statuses[-2:] == [416, 200]
+        assert dest.read_bytes() == BODY[:100]
+        assert list(tmp_path.iterdir()) == [dest]
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [{"etag": None}, {"etag": 'W/"v1"'}, {"sized": False}],
+        ids=["no-etag", "weak-etag", "no-size"],
+    )
+    def test_unverifiable_partial_is_not_kept(self, tmp_path, kwargs):
+        """Without a strong ETag and a size, a failed download keeps nothing."""
+        server = RangeServer(BODY, **kwargs)
+        dest = tmp_path / "f.bin"
+        _interrupt(server, dest)
+        assert list(tmp_path.iterdir()) == []
+
+    @pytest.mark.parametrize(
+        "meta",
+        [
+            "not json",
+            '{"url": "http://test/f.bin", "etag": "\\"v1\\""}',
+            '{"url": "http://test/f.bin", "etag": 1, "total": 10240}',
+            '{"url": "http://test/f.bin", "etag": "\\"v1\\"", "total": 0}',
+        ],
+        ids=["not-json", "missing-total", "non-string-etag", "zero-total"],
+    )
+    def test_invalid_partial_info_restarts(self, tmp_path, meta):
+        """A .part.json that does not validate is ignored, not trusted or fatal."""
+        server = RangeServer(BODY)
+        dest = tmp_path / "f.bin"
+        _interrupt(server, dest)
+        (tmp_path / "f.bin.part.json").write_text(meta)
+
+        _fetch(server, dest)
+        assert "range" not in server.requests[-1].headers
+        assert dest.read_bytes() == BODY
+        assert list(tmp_path.iterdir()) == [dest]
+
+    def test_empty_file(self, tmp_path):
+        """An empty file with an ETag downloads and leaves nothing behind."""
+        server = RangeServer(b"")
+        dest = tmp_path / "f.bin"
+        assert _fetch(server, dest) == dest
+        assert dest.read_bytes() == b""
+        assert list(tmp_path.iterdir()) == [dest]
+
+    def test_resume_false_keeps_nothing(self, tmp_path):
+        """resume=False neither uses nor keeps a partial."""
+        server = RangeServer(BODY)
+        dest = tmp_path / "f.bin"
+        _interrupt(server, dest, resume=False)
+        assert list(tmp_path.iterdir()) == []
+
+        _interrupt(server, dest)
+        _fetch(server, dest, resume=False)
+        assert "range" not in server.requests[-1].headers
+        assert dest.read_bytes() == BODY
+
+    def test_force_discards_partial(self, tmp_path):
+        """force=True starts from zero."""
+        server = RangeServer(BODY)
+        dest = tmp_path / "f.bin"
+        _interrupt(server, dest)
+
+        _fetch(server, dest, force=True)
+        assert "range" not in server.requests[-1].headers
+        assert dest.read_bytes() == BODY
+        assert list(tmp_path.iterdir()) == [dest]
+
+    def test_partial_of_other_url_is_discarded(self, tmp_path):
+        """A partial of another URL to the same dest is not resumed."""
+        server = RangeServer(BODY)
+        dest = tmp_path / "f.bin"
+        _interrupt(server, dest, url="http://test/a/f.bin")
+
+        _fetch(server, dest, url="http://test/b/f.bin")
+        assert "range" not in server.requests[-1].headers
+        assert dest.read_bytes() == BODY
+        assert list(tmp_path.iterdir()) == [dest]
+
+    def test_size_mismatch_raises(self, tmp_path):
+        """A body shorter than announced fails and keeps nothing."""
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            headers = {"etag": '"v1"', "content-length": "20"}
+            return httpx.Response(200, headers=headers, stream=_Body(b"x" * 10, None))
+
+        async def _run() -> None:
+            async with httpx.AsyncClient(
+                transport=httpx.MockTransport(handler)
+            ) as client:
+                await async_download_file(
+                    "http://test/f.bin", tmp_path / "f.bin", client=client
+                )
+
+        with pytest.raises(ValueError, match="expected 20"):
+            asyncio.run(_run())
+        assert list(tmp_path.iterdir()) == []
+
+    def test_unrequested_partial_response_raises(self, tmp_path):
+        """A 206 to a request without a Range is not taken as the whole file."""
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            headers = {
+                "etag": '"v1"',
+                "content-length": "10",
+                "content-range": f"bytes 10-19/{len(BODY)}",
+            }
+            return httpx.Response(206, headers=headers, stream=_Body(BODY[10:20], None))
+
+        async def _run() -> None:
+            async with httpx.AsyncClient(
+                transport=httpx.MockTransport(handler)
+            ) as client:
+                await async_download_file(
+                    "http://test/f.bin", tmp_path / "f.bin", client=client
+                )
+
+        with pytest.raises(ValueError, match="without asking for a range"):
+            asyncio.run(_run())
+        assert list(tmp_path.iterdir()) == []
+
+    def test_concurrent_download_does_not_touch_owned_partial(self, tmp_path):
+        """A second download to a dest whose partial is in use streams elsewhere."""
+        stalled = asyncio.Event()
+
+        class Stalls(httpx.AsyncByteStream):
+            async def __aiter__(self):
+                yield b"a" * 3000
+                stalled.set()
+                await asyncio.Event().wait()
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            headers = {"etag": '"v1"', "content-length": str(len(BODY))}
+            if request.url.path == "/stall":
+                return httpx.Response(200, headers=headers, stream=Stalls())
+            return httpx.Response(200, headers=headers, stream=_Body(BODY, None))
+
+        dest = tmp_path / "f.bin"
+        part = tmp_path / "f.bin.part"
+
+        async def _run() -> None:
+            async with httpx.AsyncClient(
+                transport=httpx.MockTransport(handler)
+            ) as client:
+                owner = asyncio.create_task(
+                    async_download_file(
+                        "http://test/stall", dest, chunk_size=1000, client=client
+                    )
+                )
+                await stalled.wait()
+                await asyncio.sleep(0.05)
+                await async_download_file("http://test/f.bin", dest, client=client)
+                assert dest.read_bytes() == BODY
+                owner.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await owner
+
+        asyncio.run(_run())
+        assert part.read_bytes() == b"a" * 3000
+        assert sorted(p.name for p in tmp_path.iterdir()) == [
+            "f.bin",
+            "f.bin.part",
+            "f.bin.part.json",
+        ]
+
+    def test_resumes_from_mstransfer_server(self, tmp_path):
+        """Resume works end to end against the mstransfer server."""
+        served = tmp_path / "served"
+        served.mkdir()
+        (served / "run.msz").write_bytes(BODY)
+        app = httpx.ASGITransport(app=create_app(output_dir=served))
+        cut = [4000]
+        requests: list[httpx.Request] = []
+        statuses: list[int] = []
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            resp = await app.handle_async_request(request)
+            statuses.append(resp.status_code)
+            body = await resp.aread()
+            fail_after = cut.pop() if cut else None
+            return httpx.Response(
+                resp.status_code, headers=resp.headers, stream=_Body(body, fail_after)
+            )
+
+        dest = tmp_path / "out" / "run.msz"
+
+        async def _run() -> None:
+            async with httpx.AsyncClient(
+                transport=httpx.MockTransport(handler)
+            ) as client:
+                with pytest.raises(httpx.ReadError):
+                    await async_download_file(
+                        "http://test/v1/files/run.msz",
+                        dest,
+                        chunk_size=1000,
+                        client=client,
+                    )
+                await async_download_file(
+                    "http://test/v1/files/run.msz", dest, client=client
+                )
+
+        asyncio.run(_run())
+        assert dest.read_bytes() == BODY
+        assert requests[-1].headers["range"] == "bytes=4000-"
+        assert statuses == [200, 206]
+        assert list(dest.parent.iterdir()) == [dest]

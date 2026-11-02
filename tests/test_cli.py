@@ -483,6 +483,7 @@ class TestCmdDownload:
             "chunk_size": 1_048_576,
             "skip_existing": False,
             "force": False,
+            "no_resume": False,
             "api_key": None,
         }
         defaults.update(overrides)
@@ -509,6 +510,17 @@ class TestCmdDownload:
         call_kwargs = mock_batch.call_args[1]
         assert call_kwargs["parallel"] == 4
         assert call_kwargs["store_as"] is None
+        assert call_kwargs["resume"] is True
+
+    @patch("mstransfer.cli.async_download_batch", new_callable=AsyncMock)
+    def test_no_resume(self, mock_batch, tmp_path):
+        """--no-resume turns resuming off."""
+        mock_batch.return_value = [_ok_result(tmp_path / "file.msz")]
+        args = self._make_args(
+            ["http://host/file.msz"], output_dir=str(tmp_path), no_resume=True
+        )
+        cmd_download(args)
+        assert mock_batch.call_args[1]["resume"] is False
 
     @patch("mstransfer.cli.async_download_batch", new_callable=AsyncMock)
     def test_partial_failure(self, mock_batch, tmp_path, capsys):

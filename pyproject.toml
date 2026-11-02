@@ -7,12 +7,14 @@ requires-python = ">=3.11"
 dependencies = [
     "mscompress>=1.2.2",
     "fastapi",
+    "starlette>=0.39",  # FileResponse range requests
     "uvicorn[standard]",
     "httpx",
     "rich",
     "python-multipart",
     "pydantic>=2.0",
     "aiofiles",
+    "filelock>=3.24.3",
 ]
 
 [project.scripts]

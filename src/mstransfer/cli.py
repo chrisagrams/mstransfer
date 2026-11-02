@@ -269,6 +269,7 @@ def cmd_download(args: argparse.Namespace) -> None:
                 progress=display,
                 skip_existing=args.skip_existing,
                 force=args.force,
+                resume=not args.no_resume,
                 api_key=args.api_key,
                 client=client,
             )
@@ -392,6 +393,11 @@ def main() -> None:
         "--force",
         action="store_true",
         help="Re-download even if destination file exists",
+    )
+    dp.add_argument(
+        "--no-resume",
+        action="store_true",
+        help="Start interrupted downloads over instead of resuming them",
     )
     dp.add_argument(
         "--api-key",

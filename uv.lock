@@ -730,11 +730,13 @@ source = { editable = "." }
 dependencies = [
     { name = "aiofiles" },
     { name = "fastapi" },
+    { name = "filelock" },
     { name = "httpx" },
     { name = "mscompress" },
     { name = "pydantic" },
     { name = "python-multipart" },
     { name = "rich" },
+    { name = "starlette" },
     { name = "uvicorn", extra = ["standard"] },
 ]
 
@@ -754,11 +756,13 @@ dev = [
 requires-dist = [
     { name = "aiofiles" },
     { name = "fastapi" },
+    { name = "filelock", specifier = ">=3.24.3" },
     { name = "httpx" },
     { name = "mscompress", specifier = ">=1.2.2" },
     { name = "pydantic", specifier = ">=2.0" },
     { name = "python-multipart" },
     { name = "rich" },
+    { name = "starlette", specifier = ">=0.39" },
     { name = "uvicorn", extras = ["standard"] },
 ]
 

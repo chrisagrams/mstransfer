@@ -72,6 +72,25 @@ The client sends the format in an `X-Source-Format` header (`mzML`, `msz` or `ms
 
 The server names each stored file after the upload's stem, so `run1.mzML` and `run1.msz` both become `run1.msz`. It refuses an upload with **409 Conflict** if that output file already exists or another transfer is still writing it. The refused file counts as failed, and the CLI exits non-zero.
 
+### `mstransfer download`
+
+Download files from a server by URL, e.g. `http://remote-host:1319/v1/files/run1.msz`.
+
+```
+mstransfer download <urls...> [--output-dir ./downloads] [--parallel 4] [--store-as msz|mzml|mszx] [--skip-existing] [--force] [--no-resume]
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--output-dir`, `-o` | `./downloads` | Where downloaded files are written |
+| `--parallel`, `-p` | `4` | Number of concurrent downloads |
+| `--store-as` | as-is | Convert each download to `msz`, `mzml` or (for `.mszx` only) `mszx` |
+| `--skip-existing` | off | Skip files whose output already exists |
+| `--force` | off | Download again even if the output exists, discarding any partial download |
+| `--no-resume` | off | Start interrupted downloads over instead of resuming them |
+
+If a download is interrupted (for example by a dropped connection or Ctrl-C), running the same command again picks up where it left off instead of starting over. If the file changed on the server in the meantime, or the server can't resume downloads, it starts from the beginning.
+
 ### Authentication
 
 `serve`, `upload` and `download` all take `--api-key`. On `serve` it makes the server require that key; on `upload` and `download` it is sent as `Authorization: Bearer <key>`. When `--api-key` is not given, each command reads the `MS_API_KEY` environment variable instead. If neither is set (or `MS_API_KEY` is empty), no key is used.
