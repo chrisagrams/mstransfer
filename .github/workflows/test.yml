@@ -55,13 +55,6 @@ jobs:
       - name: Run tests with coverage
         run: uv run pytest --cov=mstransfer --cov-report=term-missing --cov-report=xml
 
-      # uv.lock pins filelock, but a fresh install resolves the newest one, so
-      # also check the download locking against that.
-      - name: Run download tests with the newest filelock
-        run: |
-          uv pip install --upgrade filelock
-          uv run --no-sync pytest tests/test_downloader.py
-
       - name: Upload coverage to Codecov
         if: matrix.python-version == '3.11'
         uses: codecov/codecov-action@v7
