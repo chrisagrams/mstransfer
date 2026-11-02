@@ -64,7 +64,6 @@ async def async_send_file(
     Accepts a file path, or an already-opened MZMLFile / MSZFile / MSZXFile
     from mscompress.  Returns the final transfer status from the server.
     """
-
     # Generate a unique transfer ID.
     transfer_id = str(uuid.uuid4())
 
@@ -139,7 +138,6 @@ async def _async_poll_status(
     client: httpx.AsyncClient | None = None,
 ) -> TransferState:
     """Poll transfer status until terminal state or timeout (async)."""
-
     # Configure a deadline for the polling operation.
     deadline = time.monotonic() + timeout
 
@@ -260,7 +258,7 @@ def send_file(
     Accepts a file path, or an already-opened MZMLFile / MSZFile / MSZXFile
     from mscompress.  Returns the final transfer status from the server.
 
-    This is a synchronous wrapper around :func:`async_send_file`.
+    This is a synchronous wrapper around `async_send_file`.
     """
     return asyncio.run(
         async_send_file(
@@ -286,7 +284,7 @@ def send_batch(
 ) -> list[FileResult]:
     """Send multiple files with configurable parallelism.
 
-    This is a synchronous wrapper around :func:`async_send_batch`.
+    This is a synchronous wrapper around `async_send_batch`.
     """
     return asyncio.run(
         async_send_batch(
