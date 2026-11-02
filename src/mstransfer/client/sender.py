@@ -54,7 +54,7 @@ async def async_send_file(
     source: Path | MZMLFile | MSZFile | MSZXFile,
     base_url: str,
     progress_callback: Callable[[int], None] | None = None,
-    timeout: float = 3600.0,
+    timeout: float | None = None,
     chunk_size: int = 1_048_576,
     api_key: str | None = None,
     client: httpx.AsyncClient | None = None,
@@ -64,10 +64,12 @@ async def async_send_file(
     Accepts a file path, or an already-opened MZMLFile / MSZFile / MSZXFile
     from mscompress.  Returns the final transfer status from the server.
 
-    *timeout* is the read timeout for the upload request, and how long to
-    wait without server-side progress while polling for completion.  It is
-    applied per request, so it takes precedence over the timeout configured
-    on *client*; each status poll likewise uses its own 10 s timeout.
+    *timeout*, if set, sets the read, write and pool timeouts of the upload
+    request, overriding *client*'s; if *None*, *client*'s timeouts are used
+    (3600 s, with a 10 s connect timeout, without *client*).  It is also how
+    long to wait without server-side progress while polling for completion
+    (3600 s if *None*).  Status polls use *client*'s timeout, or 10 s
+    without *client*.
     """
 
     # Generate a unique transfer ID.
@@ -105,12 +107,19 @@ async def async_send_file(
         headers["Authorization"] = f"Bearer {api_key}"
 
     # Send the POST request with streaming upload and handle the response.
-    async with optional_client(client) as c:
+    async with optional_client(
+        client, timeout=httpx.Timeout(3600.0, connect=10.0)
+    ) as c:
+        # A timeout that is set overrides the client's; otherwise keep its own.
         resp = await c.post(
             f"{base_url}/v1/upload",
             headers=headers,
             content=stream,
-            timeout=httpx.Timeout(timeout, connect=10.0),
+            timeout=(
+                c.timeout
+                if timeout is None
+                else httpx.Timeout(timeout, connect=c.timeout.connect)
+            ),
         )
         resp.raise_for_status()
         upload_result = UploadResponse.model_validate(resp.json())
@@ -125,7 +134,7 @@ async def async_send_file(
         state = await _async_poll_status(
             base_url,
             transfer_id,
-            timeout=timeout,
+            timeout=3600.0 if timeout is None else timeout,
             headers=poll_headers,
             client=client,
         )
@@ -152,14 +161,13 @@ async def _async_poll_status(
     last_bytes: int = 0
 
     # Individual request timeout should be reasonably short.
-    async with optional_client(client) as c:
+    async with optional_client(client, timeout=10.0) as c:
         # Continuously poll until we hit a terminal state or exceed the deadline.
         while time.monotonic() < deadline:
             # Make a GET request to the status endpoint for this transfer ID.
             resp = await c.get(
                 f"{base_url}/v1/transfer/{transfer_id}/status",
                 headers=headers,
-                timeout=10.0,
             )
             if resp.status_code == 200:
                 record = TransferRecord.model_validate(resp.json())
@@ -263,7 +271,7 @@ def send_file(
     source: Path | MZMLFile | MSZFile | MSZXFile,
     base_url: str,
     progress_callback: Callable[[int], None] | None = None,
-    timeout: float = 3600.0,
+    timeout: float | None = None,
     chunk_size: int = 1_048_576,
     api_key: str | None = None,
     client: httpx.AsyncClient | None = None,

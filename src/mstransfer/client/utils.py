@@ -4,7 +4,7 @@ import asyncio
 import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import httpx
 
@@ -74,12 +74,13 @@ def normalize_source(
 @asynccontextmanager
 async def optional_client(
     client: httpx.AsyncClient | None,
+    **kwargs: Any,
 ) -> AsyncIterator[httpx.AsyncClient]:
     """Yield *client* if provided, otherwise create and close a temporary one."""
     if client is not None:
         yield client
     else:
-        async with httpx.AsyncClient() as c:
+        async with httpx.AsyncClient(**kwargs) as c:
             yield c
 
 

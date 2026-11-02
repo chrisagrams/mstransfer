@@ -719,8 +719,20 @@ class TestAsyncSendFile:
         with pytest.raises(TypeError, match="Unsupported source type"):
             await async_send_file("not_a_path_or_file", _live_server["base_url"])  # type: ignore[arg-type]
 
-    async def test_timeouts_override_client(self, test_msz):
-        """The upload and poll timeouts apply even when client= is passed."""
+    @pytest.mark.parametrize(
+        ("kwargs", "upload"),
+        [
+            # Unset, the upload keeps the client's own timeout.
+            ({}, {"connect": 5.0, "read": 5.0, "write": 5.0, "pool": 5.0}),
+            # Set, it overrides the client's, even when client= is passed.
+            (
+                {"timeout": 42.0},
+                {"connect": 5.0, "read": 42.0, "write": 42.0, "pool": 42.0},
+            ),
+        ],
+    )
+    async def test_timeouts_with_client(self, test_msz, kwargs, upload):
+        """An explicit timeout overrides client=; status polls keep its timeout."""
         seen: dict[str, dict[str, float | None]] = {}
 
         async def handler(request: httpx.Request) -> httpx.Response:
@@ -748,22 +760,12 @@ class TestAsyncSendFile:
             transport=httpx.MockTransport(handler), headers={"X-Auth": "t"}
         ) as client:
             result = await async_send_file(
-                test_msz, "http://test", timeout=42.0, client=client
+                test_msz, "http://test", client=client, **kwargs
             )
 
         assert result.state == "done"
-        assert seen["upload"] == {
-            "connect": 10.0,
-            "read": 42.0,
-            "write": 42.0,
-            "pool": 42.0,
-        }
-        assert seen["poll"] == {
-            "connect": 10.0,
-            "read": 10.0,
-            "write": 10.0,
-            "pool": 10.0,
-        }
+        assert seen["upload"] == upload
+        assert seen["poll"] == {"connect": 5.0, "read": 5.0, "write": 5.0, "pool": 5.0}
 
 
 # ---------------------------------------------------------------------------

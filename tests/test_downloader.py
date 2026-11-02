@@ -1118,8 +1118,28 @@ class TestAsyncDownloadFile:
             await async_download_file(f"{served_files['base_url']}/nonexistent", dest)
         assert not dest.exists()
 
-    async def test_timeouts_override_client(self, tmp_path):
-        """connect_timeout/read_timeout apply even when client= is passed."""
+    @pytest.mark.parametrize(
+        ("kwargs", "expected"),
+        [
+            # Unset timeouts keep the client's own configuration.
+            ({}, {"connect": 5.0, "read": 5.0, "write": 5.0, "pool": 5.0}),
+            # Set timeouts override it, even when client= is passed.
+            (
+                {"connect_timeout": 7.0, "read_timeout": 42.0},
+                {"connect": 7.0, "read": 42.0, "write": 42.0, "pool": 42.0},
+            ),
+            (
+                {"connect_timeout": 7.0},
+                {"connect": 7.0, "read": 5.0, "write": 5.0, "pool": 5.0},
+            ),
+            (
+                {"read_timeout": 42.0},
+                {"connect": 5.0, "read": 42.0, "write": 42.0, "pool": 42.0},
+            ),
+        ],
+    )
+    async def test_timeouts_with_client(self, tmp_path, kwargs, expected):
+        """Explicit timeouts override client=; unset ones keep its values."""
         seen: list[dict[str, float | None]] = []
 
         def handler(request: httpx.Request) -> httpx.Response:
@@ -1131,14 +1151,28 @@ class TestAsyncDownloadFile:
             transport=httpx.MockTransport(handler), headers={"X-Auth": "t"}
         ) as client:
             await async_download_file(
-                "http://test/f.bin",
-                tmp_path / "f.bin",
-                connect_timeout=7.0,
-                read_timeout=42.0,
-                client=client,
+                "http://test/f.bin", tmp_path / "f.bin", client=client, **kwargs
             )
 
-        assert seen == [{"connect": 7.0, "read": 42.0, "write": 42.0, "pool": 42.0}]
+        assert seen == [expected]
+
+    async def test_default_timeouts_without_client(self, tmp_path):
+        """Without client=, unset timeouts fall back to 10 s connect, 300 s read."""
+        seen: list[dict[str, float | None]] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen.append(request.extensions["timeout"])
+            return httpx.Response(200, content=b"data")
+
+        real_client = httpx.AsyncClient
+
+        def make_client(**kwargs: object) -> httpx.AsyncClient:
+            return real_client(transport=httpx.MockTransport(handler), **kwargs)  # type: ignore[arg-type]
+
+        with patch("mstransfer.client.utils.httpx.AsyncClient", make_client):
+            await async_download_file("http://test/f.bin", tmp_path / "f.bin")
+
+        assert seen == [{"connect": 10.0, "read": 300.0, "write": 300.0, "pool": 300.0}]
 
 
 # ---------------------------------------------------------------------------
