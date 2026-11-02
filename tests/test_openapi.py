@@ -5,13 +5,21 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 import pytest
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.security import APIKeyHeader
 
 from mstransfer.server.app import create_app
-from mstransfer.server.auth import APIKeyAuthProvider, make_auth_dependency
+from mstransfer.server.auth import (
+    APIKeyAuthProvider,
+    AuthContext,
+    AuthProvider,
+    SecuritySchemeProvider,
+    make_auth_dependency,
+)
 from mstransfer.server.routes import make_router
 
 if TYPE_CHECKING:
+    from collections.abc import Callable, Sequence
     from pathlib import Path
 
 PROTECTED = [
@@ -93,6 +101,52 @@ def test_raw_callable_auth_marked_without_scheme(tmp_output: Path) -> None:
         assert "security" not in op
 
 
+class HeaderKeyProvider:
+    """A custom provider that documents its own scheme."""
+
+    @property
+    def security_schemes(self) -> Sequence[Callable[..., Any]]:
+        return (APIKeyHeader(name="X-Key", auto_error=False),)
+
+    async def authenticate(self, request: Request) -> AuthContext:
+        return AuthContext()
+
+
+class PlainProvider:
+    """A custom provider that implements only ``authenticate``."""
+
+    async def authenticate(self, request: Request) -> AuthContext:
+        return AuthContext()
+
+
+def test_provider_protocols() -> None:
+    assert isinstance(APIKeyAuthProvider("k"), AuthProvider)
+    assert isinstance(APIKeyAuthProvider("k"), SecuritySchemeProvider)
+    assert isinstance(HeaderKeyProvider(), SecuritySchemeProvider)
+    # Opting out of the schema contract keeps a provider valid.
+    assert isinstance(PlainProvider(), AuthProvider)
+    assert not isinstance(PlainProvider(), SecuritySchemeProvider)
+
+
+def test_custom_provider_documents_own_scheme(tmp_output: Path) -> None:
+    schema = create_app(output_dir=str(tmp_output), auth=HeaderKeyProvider()).openapi()
+    assert schema["components"]["securitySchemes"] == {
+        "APIKeyHeader": {"type": "apiKey", "in": "header", "name": "X-Key"}
+    }
+    for method, path in PROTECTED:
+        assert _op(schema, method, path)["security"] == [{"APIKeyHeader": []}]
+
+
+def test_custom_provider_without_schemes(tmp_output: Path) -> None:
+    schema = create_app(output_dir=str(tmp_output), auth=PlainProvider()).openapi()
+    assert "securitySchemes" not in schema.get("components", {})
+    for method, path in PROTECTED:
+        op = _op(schema, method, path)
+        assert op["x-requires-auth"] is True
+        assert "401" in op["responses"]
+        assert "security" not in op
+
+
 def test_make_router_accepts_security_schemes() -> None:
     provider = APIKeyAuthProvider("k")
     app = FastAPI()
@@ -114,8 +168,9 @@ def test_upload_documents_headers_and_body(authed_schema: dict[str, Any]) -> Non
     assert headers["X-Original-Filename"]["required"] is True
     assert headers["X-Source-Format"]["required"] is False
     assert headers["X-Source-Format"]["schema"]["enum"] == ["msz", "mzml", "mszx"]
-    assert op["requestBody"]["content"] == {
-        "application/octet-stream": {"schema": {"type": "string", "format": "binary"}}
+    assert op["requestBody"] == {
+        "required": True,
+        "content": {"application/octet-stream": {}},
     }
     assert {"200", "400", "401", "409", "500"} <= set(op["responses"])
 
@@ -139,4 +194,4 @@ def test_error_responses_documented(
 
 def test_download_documents_binary_content(authed_schema: dict[str, Any]) -> None:
     ok = _op(authed_schema, "get", "/v1/files/{filename}")["responses"]["200"]
-    assert set(ok["content"]) == {"application/octet-stream", "application/xml"}
+    assert ok["content"] == {"application/octet-stream": {}, "application/xml": {}}

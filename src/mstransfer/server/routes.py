@@ -33,43 +33,6 @@ def _state_from_app(request: Request) -> AppState:
 
 logger = logging.getLogger(__name__)
 
-_BINARY = {"schema": {"type": "string", "format": "binary"}}
-
-# /upload reads its headers and body from the raw request, so FastAPI cannot
-# infer them; declare them for the OpenAPI schema instead.
-_UPLOAD_OPENAPI: dict[str, Any] = {
-    "parameters": [
-        {
-            "name": "X-Transfer-ID",
-            "in": "header",
-            "required": True,
-            "schema": {"type": "string"},
-            "description": "A unique identifier for the transfer.",
-        },
-        {
-            "name": "X-Original-Filename",
-            "in": "header",
-            "required": True,
-            "schema": {"type": "string"},
-            "description": "The original filename of the uploaded file.",
-        },
-        {
-            "name": "X-Source-Format",
-            "in": "header",
-            "required": False,
-            "schema": {"type": "string", "enum": [f.value for f in MSFormat]},
-            "description": (
-                "Format of the payload, case-insensitive.  Inferred from the "
-                "filename extension when absent."
-            ),
-        },
-    ],
-    "requestBody": {
-        "required": True,
-        "content": {"application/octet-stream": _BINARY},
-    },
-}
-
 
 def make_router(
     auth_dep: Callable[..., Any] | None = None,
@@ -159,7 +122,42 @@ def make_router(
         "/upload",
         response_model=UploadResponse,
         dependencies=protected,
-        openapi_extra={**_UPLOAD_OPENAPI, **auth_extra},
+        # The headers and body are read from the raw request so the upload can
+        # stream, so FastAPI cannot infer them; declare them here instead.
+        # An empty media type object is OpenAPI 3.1's binary body.
+        openapi_extra={
+            "parameters": [
+                {
+                    "name": "X-Transfer-ID",
+                    "in": "header",
+                    "required": True,
+                    "schema": {"type": "string"},
+                    "description": "A unique identifier for the transfer.",
+                },
+                {
+                    "name": "X-Original-Filename",
+                    "in": "header",
+                    "required": True,
+                    "schema": {"type": "string"},
+                    "description": "The original filename of the uploaded file.",
+                },
+                {
+                    "name": "X-Source-Format",
+                    "in": "header",
+                    "required": False,
+                    "schema": {"type": "string", "enum": [f.value for f in MSFormat]},
+                    "description": (
+                        "Format of the payload, case-insensitive.  Inferred "
+                        "from the filename extension when absent."
+                    ),
+                },
+            ],
+            "requestBody": {
+                "required": True,
+                "content": {"application/octet-stream": {}},
+            },
+            **auth_extra,
+        },
         responses={
             400: {
                 "model": ErrorResponse,
@@ -340,10 +338,7 @@ def make_router(
         responses={
             200: {
                 "description": "The file's bytes",
-                "content": {
-                    "application/octet-stream": _BINARY,
-                    "application/xml": _BINARY,
-                },
+                "content": {"application/octet-stream": {}, "application/xml": {}},
             },
             **auth_responses,
             404: {"model": ErrorResponse, "description": "File not found"},

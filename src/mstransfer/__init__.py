@@ -8,6 +8,7 @@ from mstransfer.server.auth import (
     AuthContext,
     AuthProvider,
     NoAuthProvider,
+    SecuritySchemeProvider,
     make_auth_dependency,
 )
 from mstransfer.server.routes import make_router
@@ -20,6 +21,7 @@ __all__ = [
     "AuthContext",
     "AuthProvider",
     "NoAuthProvider",
+    "SecuritySchemeProvider",
     "create_app",
     "make_auth_dependency",
     "make_router",
