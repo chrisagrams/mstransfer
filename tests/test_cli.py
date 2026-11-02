@@ -181,15 +181,38 @@ class TestCmdServe:
         )
 
     def test_serve_port_in_use_exits(self):
-        """If the port is already bound, cmd_serve should exit with code 1."""
-        # Bind a port so it's "in use"
+        """If another process is listening on the port, cmd_serve exits 1."""
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.bind(("127.0.0.1", 0))
+            s.listen()
             port = s.getsockname()[1]
 
             args = self._make_args(host="127.0.0.1", port=port)
             with pytest.raises(SystemExit, match="1"):
                 cmd_serve(args)
+
+    @pytest.mark.skipif(
+        sys.platform == "win32", reason="probe skips SO_REUSEADDR on Windows"
+    )
+    @patch("mstransfer.cli.uvicorn.run")
+    @patch("mstransfer.cli.create_app")
+    def test_serve_starts_with_time_wait_connections(self, mock_create_app, mock_run):
+        """TIME-WAIT connections left by a killed server must not block a restart."""
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as srv:
+            srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            srv.bind(("127.0.0.1", 0))
+            srv.listen()
+            port = srv.getsockname()[1]
+            with socket.create_connection(("127.0.0.1", port)) as client:
+                conn, _ = srv.accept()
+                # Server side closes first, so its end goes into TIME-WAIT.
+                conn.close()
+                client.recv(1)
+
+        args = self._make_args(host="127.0.0.1", port=port)
+        cmd_serve(args)
+
+        mock_run.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
