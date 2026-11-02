@@ -143,8 +143,9 @@ async def async_download_file(
     # Ensure the parent directory exists.
     plan.final_dest.parent.mkdir(parents=True, exist_ok=True)
 
-    # Write to a temp .part file to avoid partial downloads.
-    part_path = plan.part_path
+    # Write to a temp .part file to avoid partial downloads.  It is unique so
+    # concurrent downloads to the same dest never share it.
+    part_path = plan.unique_part_path()
 
     headers = {"Authorization": f"Bearer {api_key}"} if api_key else None
 
@@ -153,33 +154,39 @@ async def async_download_file(
         ThrottledCallback(progress_callback.on_progress) if progress_callback else None
     )
 
-    async with (
-        optional_client(client, timeout=httpx.Timeout(300.0, connect=10.0)) as c,
-        c.stream(
-            "GET",
-            url,
-            headers=headers,
-            timeout=httpx.USE_CLIENT_DEFAULT if timeout is None else timeout,
-        ) as resp,
-    ):
-        resp.raise_for_status()
+    try:
+        async with (
+            optional_client(client, timeout=httpx.Timeout(300.0, connect=10.0)) as c,
+            c.stream(
+                "GET",
+                url,
+                headers=headers,
+                timeout=httpx.USE_CLIENT_DEFAULT if timeout is None else timeout,
+            ) as resp,
+        ):
+            resp.raise_for_status()
 
-        if progress_callback:
-            # Content-Length counts encoded bytes, but the body is read decoded.
-            cl = resp.headers.get("content-length")
-            encoded = "content-encoding" in resp.headers
-            progress_callback.on_total(int(cl) if cl and not encoded else None)
+            if progress_callback:
+                # Content-Length counts encoded bytes, but the body is read decoded.
+                cl = resp.headers.get("content-length")
+                encoded = "content-encoding" in resp.headers
+                progress_callback.on_total(int(cl) if cl and not encoded else None)
 
-        async with aiofiles.open(part_path, "wb") as f:
-            async for chunk in resp.aiter_bytes(chunk_size=chunk_size):
-                await f.write(chunk)
-                if throttled:
-                    throttled(len(chunk))
+            async with aiofiles.open(part_path, "wb") as f:
+                async for chunk in resp.aiter_bytes(chunk_size=chunk_size):
+                    await f.write(chunk)
+                    if throttled:
+                        throttled(len(chunk))
 
-        if throttled:
-            throttled.flush()
+            if throttled:
+                throttled.flush()
 
-    return await plan.finalize(part_path)
+        return await plan.finalize(part_path)
+    except BaseException:
+        # There is no resume, so a partial .part file is dead weight.  This
+        # also covers cancellation, which is not an Exception.
+        part_path.unlink(missing_ok=True)
+        raise
 
 
 async def async_download_batch(
