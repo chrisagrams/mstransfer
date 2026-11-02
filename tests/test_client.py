@@ -16,6 +16,7 @@ from mscompress import MSZFile, MZMLFile
 from mscompress.mszx import MSZXFile
 
 from mstransfer.client.sender import (
+    _async_poll_status,
     async_send_batch,
     async_send_file,
     send_batch,
@@ -27,6 +28,7 @@ from mstransfer.client.utils import (
     resolve_inputs,
 )
 from mstransfer.server.app import create_app
+from mstransfer.server.models import TransferState
 from mstransfer.store import MSFormat
 
 # ---------------------------------------------------------------------------
@@ -789,6 +791,48 @@ class TestAsyncSendFile:
         assert result.state == "done"
         assert seen["upload"] == upload
         assert seen["poll"] == {"connect": 5.0, "read": 5.0, "write": 5.0, "pool": 5.0}
+
+
+def _status_client(states: list[tuple[str, int]]) -> httpx.AsyncClient:
+    """Client whose status endpoint replies with *states* in turn, then the last."""
+    replies = iter(states)
+    last = states[-1]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal last
+        state, bytes_received = last = next(replies, last)
+        return httpx.Response(
+            200,
+            json={
+                "transfer_id": "t",
+                "filename": "test.msz",
+                "state": state,
+                "bytes_received": bytes_received,
+            },
+        )
+
+    return httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+
+@pytest.mark.asyncio
+class TestAsyncPollStatus:
+    @pytest.mark.parametrize("timeout", [None, 1.0])
+    async def test_progress_until_done(self, timeout):
+        """Polling follows the server through progress to a terminal state."""
+        states = [("receiving", 0), ("receiving", 10), ("decompressing", 10)]
+        async with _status_client([*states, ("done", 10)]) as client:
+            state = await _async_poll_status(
+                "http://test", "t", timeout=timeout, interval=0.001, client=client
+            )
+        assert state == TransferState.DONE
+
+    async def test_no_progress_times_out(self):
+        """Without progress, polling gives up once *timeout* has passed."""
+        async with _status_client([("receiving", 0)]) as client:
+            with pytest.raises(TimeoutError, match="did not complete"):
+                await _async_poll_status(
+                    "http://test", "t", timeout=0.05, interval=0.01, client=client
+                )
 
 
 # ---------------------------------------------------------------------------
