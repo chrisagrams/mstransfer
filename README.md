@@ -72,6 +72,17 @@ The client sends the format in an `X-Source-Format` header (`mzML`, `msz` or `ms
 
 The server names each stored file after the upload's stem, so `run1.mzML` and `run1.msz` both become `run1.msz`. It refuses an upload with **409 Conflict** if that output file already exists or another transfer is still writing it. The refused file counts as failed, and the CLI exits non-zero.
 
+### Authentication
+
+`serve`, `upload` and `download` all take `--api-key`. On `serve` it makes the server require that key; on `upload` and `download` it is sent as `Authorization: Bearer <key>`. When `--api-key` is not given, each command reads the `MS_API_KEY` environment variable instead. If neither is set (or `MS_API_KEY` is empty), no key is used.
+
+```
+export MS_API_KEY=secret
+mstransfer serve                                        # requires the key
+mstransfer upload run1.mzML remote-host                 # sends the key
+mstransfer download http://remote-host:1319/v1/files/run1.msz
+```
+
 ## Programmatic access
 
 You can use mstransfer as a library to send files from your own Python code:

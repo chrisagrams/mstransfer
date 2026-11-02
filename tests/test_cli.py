@@ -693,6 +693,36 @@ class TestMain:
             main()
         assert mock_cmd_download.call_args[0][0].api_key == "k"
 
+    @pytest.mark.parametrize(
+        ("argv", "cmd"),
+        [
+            (["serve"], "cmd_serve"),
+            (["upload", "file.mzML", "host"], "cmd_upload"),
+            (["download", "http://host/f.msz"], "cmd_download"),
+        ],
+    )
+    @pytest.mark.parametrize(
+        ("env", "flag", "expected"),
+        [
+            ("from-env", [], "from-env"),
+            ("from-env", ["--api-key", "from-flag"], "from-flag"),
+            (None, [], None),
+            ("", [], ""),
+        ],
+    )
+    def test_api_key_from_env(self, monkeypatch, argv, cmd, env, flag, expected):
+        """--api-key falls back to $MS_API_KEY; the flag wins over it."""
+        if env is None:
+            monkeypatch.delenv("MS_API_KEY", raising=False)
+        else:
+            monkeypatch.setenv("MS_API_KEY", env)
+        with (
+            patch(f"mstransfer.cli.{cmd}") as mock_cmd,
+            patch("sys.argv", ["mstransfer", *argv, *flag]),
+        ):
+            main()
+        assert mock_cmd.call_args[0][0].api_key == expected
+
     def test_main_no_command_prints_help(self, capsys):
         with patch("sys.argv", ["mstransfer"]), pytest.raises(SystemExit) as exc_info:
             main()

@@ -166,8 +166,8 @@ echo "target,file,size_bytes,duration_s,throughput_mbps" > "$CSV_FILE"
 
 upload_mstransfer() {
     local file=$1
-    if [[ -n "${MSTRANSFER_API_KEY:-}" ]]; then
-        mstransfer upload "$file" "$MSTRANSFER_HOST" --api-key "$MSTRANSFER_API_KEY"
+    if [[ -n "${MS_API_KEY:-}" ]]; then
+        mstransfer upload "$file" "$MSTRANSFER_HOST" --api-key "$MS_API_KEY"
     else
         mstransfer upload "$file" "$MSTRANSFER_HOST"
     fi
@@ -187,8 +187,8 @@ upload_s3() {
 # ── Batch upload functions (all files in one command) ────────────────────────
 
 batch_upload_mstransfer() {
-    if [[ -n "${MSTRANSFER_API_KEY:-}" ]]; then
-        mstransfer upload "${FILES[@]}" "$MSTRANSFER_HOST" --api-key "$MSTRANSFER_API_KEY"
+    if [[ -n "${MS_API_KEY:-}" ]]; then
+        mstransfer upload "${FILES[@]}" "$MSTRANSFER_HOST" --api-key "$MS_API_KEY"
     else
         mstransfer upload "${FILES[@]}" "$MSTRANSFER_HOST"
     fi
