@@ -1,11 +1,10 @@
 from __future__ import annotations
 
 import asyncio
-import enum
 import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Final
+from typing import TYPE_CHECKING, Any
 
 import httpx
 
@@ -19,17 +18,6 @@ from mscompress.utils import detect_filetype
 from mstransfer.store import MSFormat
 
 logger = logging.getLogger(__name__)
-
-
-class Unset(enum.Enum):
-    """Type of :data:`UNSET`."""
-
-    UNSET = enum.auto()
-
-
-#: Default for a timeout argument that was not passed, so that *None* can
-#: still mean "no limit".
-UNSET: Final = Unset.UNSET
 
 
 def resolve_inputs(paths: list[str], recursive: bool = False) -> list[Path]:

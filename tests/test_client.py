@@ -597,9 +597,9 @@ class TestSendBatch:
             _, kwargs = mock_send.call_args
             assert kwargs["chunk_size"] == 4096
 
-    @pytest.mark.parametrize("timeout", [42.0, None])
-    def test_timeout_passed_to_send_file(self, test_msz, _live_server, timeout):
-        """send_batch should forward timeout, including None, to async_send_file."""
+    def test_timeouts_passed_to_send_file(self, test_msz, _live_server):
+        """send_batch should forward timeout and poll_timeout to async_send_file."""
+        timeout = httpx.Timeout(42.0)
         with patch(
             "mstransfer.client.sender.async_send_file",
             wraps=async_send_file,
@@ -609,10 +609,12 @@ class TestSendBatch:
                 _live_server["base_url"],
                 parallel=1,
                 timeout=timeout,
+                poll_timeout=None,
             )
             mock_send.assert_called_once()
             _, kwargs = mock_send.call_args
             assert kwargs["timeout"] is timeout
+            assert kwargs["poll_timeout"] is None
 
     def test_batch_with_mscompress_objects(self, test_msz, other_mzml, _live_server):
         """send_batch accepts MSZFile and MZMLFile objects."""
@@ -739,22 +741,21 @@ class TestAsyncSendFile:
     @pytest.mark.parametrize(
         ("kwargs", "upload"),
         [
-            # Unset, the upload keeps the client's own timeout.
+            # No timeout, the upload keeps the client's own.
             ({}, {"connect": 5.0, "read": 5.0, "write": 5.0, "pool": 5.0}),
-            # Set, it overrides the client's, even when client= is passed.
+            # A timeout replaces the client's, even when client= is passed.
             (
-                {"timeout": 42.0},
-                {"connect": 5.0, "read": 42.0, "write": 42.0, "pool": 42.0},
+                {"timeout": httpx.Timeout(42.0, connect=7.0)},
+                {"connect": 7.0, "read": 42.0, "write": 42.0, "pool": 42.0},
             ),
-            # None means no limit, not "use the client's".
             (
-                {"timeout": None},
-                {"connect": 5.0, "read": None, "write": None, "pool": None},
+                {"timeout": httpx.Timeout(None)},
+                {"connect": None, "read": None, "write": None, "pool": None},
             ),
         ],
     )
     async def test_timeouts_with_client(self, test_msz, kwargs, upload):
-        """An explicit timeout overrides client=; status polls keep its timeout."""
+        """A passed timeout replaces client='s; status polls keep its timeout."""
         seen: dict[str, dict[str, float | None]] = {}
 
         async def handler(request: httpx.Request) -> httpx.Response:

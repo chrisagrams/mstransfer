@@ -1121,30 +1121,21 @@ class TestAsyncDownloadFile:
     @pytest.mark.parametrize(
         ("kwargs", "expected"),
         [
-            # Unset timeouts keep the client's own configuration.
+            # No timeout keeps the client's own configuration.
             ({}, {"connect": 5.0, "read": 5.0, "write": 5.0, "pool": 5.0}),
-            # Set timeouts override it, even when client= is passed.
+            # A timeout replaces it, even when client= is passed.
             (
-                {"connect_timeout": 7.0, "read_timeout": 42.0},
+                {"timeout": httpx.Timeout(42.0, connect=7.0)},
                 {"connect": 7.0, "read": 42.0, "write": 42.0, "pool": 42.0},
             ),
             (
-                {"connect_timeout": 7.0},
-                {"connect": 7.0, "read": 5.0, "write": 5.0, "pool": 5.0},
-            ),
-            (
-                {"read_timeout": 42.0},
-                {"connect": 5.0, "read": 42.0, "write": 42.0, "pool": 42.0},
-            ),
-            # None means no limit, not "use the client's".
-            (
-                {"connect_timeout": None, "read_timeout": None},
+                {"timeout": httpx.Timeout(None)},
                 {"connect": None, "read": None, "write": None, "pool": None},
             ),
         ],
     )
     async def test_timeouts_with_client(self, tmp_path, kwargs, expected):
-        """Explicit timeouts override client=; unset ones keep its values."""
+        """A passed timeout replaces client='s; without one, its own is kept."""
         seen: list[dict[str, float | None]] = []
 
         def handler(request: httpx.Request) -> httpx.Response:
@@ -1162,7 +1153,7 @@ class TestAsyncDownloadFile:
         assert seen == [expected]
 
     async def test_default_timeouts_without_client(self, tmp_path):
-        """Without client=, unset timeouts fall back to 10 s connect, 300 s read."""
+        """Without client= or timeout, requests use 10 s connect, 300 s otherwise."""
         seen: list[dict[str, float | None]] = []
 
         def handler(request: httpx.Request) -> httpx.Response:
