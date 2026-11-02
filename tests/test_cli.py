@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 import pytest
 
+from mstransfer import __version__
 from mstransfer.cli import (
     DownloadProgressDisplay,
     UploadProgressDisplay,
@@ -737,3 +738,10 @@ class TestMain:
         captured = capsys.readouterr()
         assert "usage: mstransfer" in captured.out
         assert "{serve,upload,download}" in captured.out
+
+    @pytest.mark.parametrize("flag", ["--version", "-V"])
+    def test_main_version_flag(self, capsys, flag):
+        with patch("sys.argv", ["mstransfer", flag]), pytest.raises(SystemExit) as exc:
+            main()
+        assert exc.value.code == 0
+        assert capsys.readouterr().out == f"mstransfer {__version__}\n"
