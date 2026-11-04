@@ -1581,6 +1581,7 @@ class TestResume:
 
         asyncio.run(_run())
         assert (tmp_path / "f.bin.part").read_bytes() == BODY[:3000]
+        assert (tmp_path / "f.bin.part.json").exists()
 
         server = RangeServer(BODY)
         _fetch(server, dest)
