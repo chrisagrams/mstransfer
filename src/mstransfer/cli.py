@@ -179,8 +179,15 @@ def cmd_upload(args: argparse.Namespace) -> None:
                 client=client,
             )
 
-    with Live(display.table, console=console, refresh_per_second=10):
-        results = asyncio.run(_run())
+    try:
+        with Live(display.table, console=console, refresh_per_second=10):
+            results = asyncio.run(_run())
+    except KeyboardInterrupt:
+        # Live ends its last frame with a newline only on a terminal.
+        if not console.is_terminal:
+            console.line()
+        console.print("[yellow]Interrupted.")
+        sys.exit(130)
 
     ok = sum(
         1 for r in results if r.response and r.response.state == TransferState.DONE
@@ -274,17 +281,26 @@ def cmd_download(args: argparse.Namespace) -> None:
                 client=client,
             )
 
-    with Live(display.table, console=console, refresh_per_second=10):
-        results = asyncio.run(_run())
-        # A skipped file never reports a size, so finish its row as skipped
-        # rather than leave it spinning at 0/? bytes.
-        for r in results:
-            if r.response is not None and r.response.skipped:
-                display.files.update(
-                    display._task_ids[r.filename],
-                    description=f"[yellow]{r.filename} (skipped)",
-                    total=0,
-                )
+    try:
+        with Live(display.table, console=console, refresh_per_second=10):
+            results = asyncio.run(_run())
+            # A skipped file never reports a size, so finish its row as skipped
+            # rather than leave it spinning at 0/? bytes.
+            for r in results:
+                if r.response is not None and r.response.skipped:
+                    display.files.update(
+                        display._task_ids[r.filename],
+                        description=f"[yellow]{r.filename} (skipped)",
+                        total=0,
+                    )
+    except KeyboardInterrupt:
+        # Without --no-resume, interrupted downloads keep their partials.
+        hint = "" if args.no_resume else " Run the same command again to resume."
+        # Live ends its last frame with a newline only on a terminal.
+        if not console.is_terminal:
+            console.line()
+        console.print(f"[yellow]Interrupted.{hint}")
+        sys.exit(130)
 
     failed = [r for r in results if r.error is not None]
     skipped = sum(1 for r in results if r.response is not None and r.response.skipped)
