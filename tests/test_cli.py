@@ -18,6 +18,7 @@ from mstransfer.cli import (
     cmd_download,
     cmd_serve,
     cmd_upload,
+    describe_error,
     main,
     parse_target,
 )
@@ -195,6 +196,47 @@ class TestCmdServe:
 # ---------------------------------------------------------------------------
 # cmd_upload tests
 # ---------------------------------------------------------------------------
+
+
+def _status_error(status: int, **response_kwargs) -> httpx.HTTPStatusError:
+    """The error ``raise_for_status`` raises for a *status* response."""
+    request = httpx.Request("POST", "http://host:1319/v1/upload")
+    response = httpx.Response(status, request=request, **response_kwargs)
+    try:
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        return exc
+    raise AssertionError(f"{status} is not an error status")
+
+
+class TestDescribeError:
+    def test_server_detail(self):
+        exc = _status_error(409, json={"detail": "run1.msz already exists"})
+        assert describe_error(exc) == "409 Conflict: run1.msz already exists"
+
+    @pytest.mark.parametrize(
+        "response_kwargs",
+        [
+            {"text": "<html>Bad Gateway</html>"},
+            {"json": {"error": "no detail key"}},
+            {"json": {"detail": [{"msg": "not a string"}]}},
+            {"json": ["not", "an", "object"]},
+            {},
+        ],
+    )
+    def test_falls_back_to_status_line(self, response_kwargs):
+        exc = _status_error(502, **response_kwargs)
+        assert describe_error(exc) == "502 Bad Gateway"
+
+    def test_unread_streamed_body_falls_back(self):
+        """A streamed error whose body was never read still gets a status."""
+        request = httpx.Request("GET", "http://host:1319/v1/files/a.msz")
+        response = httpx.Response(404, request=request, stream=httpx.ByteStream(b"{}"))
+        exc = httpx.HTTPStatusError("404", request=request, response=response)
+        assert describe_error(exc) == "404 Not Found"
+
+    def test_other_errors_use_their_own_text(self):
+        assert describe_error(ConnectionError("Connection reset")) == "Connection reset"
 
 
 class TestCmdUpload:
@@ -381,6 +423,47 @@ class TestCmdUpload:
         with pytest.raises(SystemExit, match="1"):
             cmd_upload(args)
 
+    @pytest.mark.parametrize(
+        ("status", "detail", "expected"),
+        [
+            (
+                401,
+                "Invalid or missing API key",
+                "401 Unauthorized: Invalid or missing API key",
+            ),
+            (404, "File not found", "404 Not Found: File not found"),
+            (
+                409,
+                "run1.msz already exists on the server",
+                "409 Conflict: run1.msz already exists on the server",
+            ),
+        ],
+    )
+    @patch("mstransfer.cli.async_send_batch", new_callable=AsyncMock)
+    @patch("mstransfer.cli.httpx.get")
+    @patch("mstransfer.cli.resolve_inputs")
+    def test_http_error_shows_server_detail(
+        self, mock_resolve, mock_get, mock_send_batch, status, detail, expected, capsys
+    ):
+        """Regression test for #99: show the server's reason, not httpx's text."""
+        mock_resolve.return_value = [Path("/data/run1.msz")]
+        mock_get.return_value = MagicMock(status_code=200)
+        mock_send_batch.return_value = [
+            FileResult(
+                filename="run1.msz",
+                error=_status_error(status, json={"detail": detail}),
+            ),
+        ]
+
+        args = self._make_args(["/data/run1.msz", "host"])
+        with pytest.raises(SystemExit, match="1"):
+            cmd_upload(args)
+
+        out = " ".join(capsys.readouterr().out.split())
+        assert f"- run1.msz: {expected}" in out
+        assert "developer.mozilla.org" not in out
+        assert "Client error" not in out
+
 
 # ---------------------------------------------------------------------------
 # UploadProgressDisplay tests
@@ -550,6 +633,45 @@ class TestCmdDownload:
         assert "1 failed" in out
         assert "b.msz: boom" in out
         assert "a.msz:" not in out
+
+    @pytest.mark.parametrize(
+        ("status", "detail", "expected"),
+        [
+            (
+                401,
+                "Invalid or missing API key",
+                "401 Unauthorized: Invalid or missing API key",
+            ),
+            (404, "File not found", "404 Not Found: File not found"),
+            (409, "Conflict here", "409 Conflict: Conflict here"),
+            # Server text is printed literally, not read as Rich markup.
+            (
+                400,
+                "Unsupported [bold]x[/bold]",
+                "400 Bad Request: Unsupported [bold]x[/bold]",
+            ),
+        ],
+    )
+    @patch("mstransfer.cli.async_download_batch", new_callable=AsyncMock)
+    def test_http_error_shows_server_detail(
+        self, mock_batch, tmp_path, capsys, status, detail, expected
+    ):
+        """Regression test for #99: show the server's reason, not httpx's text."""
+        mock_batch.return_value = [
+            FileResult(
+                filename="nope.msz",
+                error=_status_error(status, json={"detail": detail}),
+            ),
+        ]
+
+        args = self._make_args(["http://host/nope.msz"], output_dir=str(tmp_path))
+        with pytest.raises(SystemExit, match="1"):
+            cmd_download(args)
+
+        out = " ".join(capsys.readouterr().out.split())
+        assert f"- nope.msz: {expected}" in out
+        assert "developer.mozilla.org" not in out
+        assert "Client error" not in out
 
     @patch("mstransfer.cli.async_download_batch", new_callable=AsyncMock)
     def test_passes_store_as(self, mock_batch, tmp_path):

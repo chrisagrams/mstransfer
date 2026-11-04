@@ -255,6 +255,9 @@ async def async_download_file(
                         logger.info("Range rejected for %s, restarting", url)
                         offset, retain = 0, False
                         continue
+                    if resp.is_error:
+                        # Keep the body so callers can show the server's reason.
+                        await resp.aread()
                     resp.raise_for_status()
 
                     if offset and resp.status_code == 206:

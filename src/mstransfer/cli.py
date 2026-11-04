@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING
 import httpx
 import uvicorn
 from rich.live import Live
+from rich.markup import escape
 from rich.table import Table
 
 from mstransfer import __version__
@@ -62,6 +63,25 @@ def parse_target(target: str) -> str:
             sys.exit(1)
         return f"http://{host}:{port}"
     return f"http://{target}:{default_port}"
+
+
+def describe_error(exc: Exception) -> str:
+    """Describe a per-file failure, preferring the server's ``detail``.
+
+    httpx's own text for a status error wraps the URL and links to MDN, which
+    pushes the server's actual reason off screen.
+    """
+    if not isinstance(exc, httpx.HTTPStatusError):
+        return str(exc)
+    resp = exc.response
+    status = f"{resp.status_code} {resp.reason_phrase}".strip()
+    try:
+        detail = resp.json().get("detail")
+    except Exception:  # unread, non-JSON, or not an object
+        detail = None
+    if isinstance(detail, str) and detail:
+        return f"{status}: {detail}"
+    return status
 
 
 def cmd_serve(args: argparse.Namespace) -> None:
@@ -191,8 +211,11 @@ def cmd_upload(args: argparse.Namespace) -> None:
         for r in results:
             if r.response and r.response.state == TransferState.DONE:
                 continue
-            err = r.error or (r.response.state.value if r.response else "unknown")
-            console.print(f"  [red]- {r.filename}: {err}")
+            if r.error is not None:
+                err = describe_error(r.error)
+            else:
+                err = r.response.state.value if r.response else "unknown"
+            console.print(f"  [red]- {escape(r.filename)}: {escape(err)}")
         sys.exit(1)
     console.print(f"\n[green]All {ok} file(s) transferred successfully.")
 
@@ -277,12 +300,14 @@ def cmd_download(args: argparse.Namespace) -> None:
     with Live(display.table, console=console, refresh_per_second=10):
         results = asyncio.run(_run())
 
-    failed = [r for r in results if r.error is not None]
+    failed = [(r.filename, r.error) for r in results if r.error is not None]
     ok = len(results) - len(failed)
     if failed:
         console.print(f"\n[green]{ok} succeeded[/], [red]{len(failed)} failed[/]")
-        for r in failed:
-            console.print(f"  [red]- {r.filename}: {r.error}")
+        for filename, error in failed:
+            console.print(
+                f"  [red]- {escape(filename)}: {escape(describe_error(error))}"
+            )
         sys.exit(1)
     console.print(f"\n[green]All {ok} file(s) downloaded successfully.")
 

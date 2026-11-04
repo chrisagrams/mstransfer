@@ -1292,6 +1292,22 @@ class TestAsyncDownloadFile:
             await async_download_file(f"{served_files['base_url']}/nonexistent", dest)
         assert not dest.exists()
 
+    async def test_http_error_keeps_server_detail(self, tmp_path):
+        """Regression test for #99: an error's body is read before raising.
+
+        The response is streamed, so without that the body is gone once the
+        stream closes and callers can't show the server's ``detail``.
+        """
+        app = create_app(output_dir=tmp_path / "served")
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app)) as client:
+            with pytest.raises(httpx.HTTPStatusError) as excinfo:
+                await async_download_file(
+                    "http://test/v1/files/nope.msz",
+                    tmp_path / "nope.msz",
+                    client=client,
+                )
+        assert excinfo.value.response.json() == {"detail": "File not found"}
+
     @pytest.mark.parametrize(
         ("kwargs", "expected"),
         [
