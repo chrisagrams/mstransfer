@@ -322,21 +322,27 @@ async def async_download_file(
         # the .part of a cancelled download without an ETag, is dead
         # weight.  Cancellation is covered too, as it is not an Exception.
         try:
-            keep = retain and part_path.stat().st_size > 0
-        except FileNotFoundError:
-            keep = False
-        if not keep:
-            part_path.unlink(missing_ok=True)
-        if lock is not None:
+            try:
+                keep = retain and part_path.stat().st_size > 0
+            except FileNotFoundError:
+                keep = False
             if not keep:
-                meta_path.unlink(missing_ok=True)
-            lock.release()
-            if sys.platform == "win32":
-                # filelock removes its lock file on release elsewhere, but not
-                # here.  Windows cannot delete a file another download holds
-                # open, so this never removes a lock that is in use.
-                with contextlib.suppress(OSError):
-                    Path(lock.lock_file).unlink()
+                part_path.unlink(missing_ok=True)
+                if lock is not None:
+                    meta_path.unlink(missing_ok=True)
+        finally:
+            # Release even if cleanup fails, so the lock is never left held.
+            if lock is not None:
+                # filelock tries to remove the lock file after release on
+                # Windows, but not on Unix, so remove it here while still
+                # holding the lock.  A download that opened the old file
+                # meanwhile then fails to lock it, as filelock rejects a lock
+                # on an unlinked file.  A file left behind is harmless: a later
+                # download removes it.
+                if sys.platform != "win32":
+                    with contextlib.suppress(OSError):
+                        Path(lock.lock_file).unlink(missing_ok=True)
+                lock.release()
 
 
 async def async_download_batch(
