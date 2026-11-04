@@ -1833,7 +1833,7 @@ class TestResume:
         assert list(tmp_path.iterdir()) == [dest]
 
     @pytest.mark.skipif(
-        sys.platform == "win32", reason="filelock removes it after release"
+        sys.platform == "win32", reason="filelock tries to remove it after release"
     )
     def test_lock_file_is_removed_before_release(self, tmp_path):
         """The lock file goes while held, so nobody can lock it after release."""
@@ -1848,6 +1848,59 @@ class TestResume:
             _fetch(RangeServer(BODY), tmp_path / "f.bin")
         assert lock_exists
         assert not any(lock_exists)
+
+    @pytest.mark.skipif(
+        sys.platform == "win32", reason="filelock tries to remove it after release"
+    )
+    def test_lock_file_unlink_failure_still_releases(self, tmp_path):
+        """Failing to remove the lock file neither fails nor keeps the lock."""
+        released: list[str] = []
+        release, unlink = FileLock.release, Path.unlink
+
+        def tracked_release(self, *args, **kwargs):
+            if not kwargs.get("force"):  # Not the release in FileLock.__del__.
+                released.append(self.lock_file)
+            return release(self, *args, **kwargs)
+
+        def failing_unlink(self, *args, **kwargs):
+            if self.name.endswith(".lock"):
+                raise PermissionError(self)
+            return unlink(self, *args, **kwargs)
+
+        dest = tmp_path / "f.bin"
+        with (
+            patch.object(FileLock, "release", tracked_release),
+            patch.object(Path, "unlink", failing_unlink),
+        ):
+            _fetch(RangeServer(BODY), dest)
+        assert dest.read_bytes() == BODY
+        assert released == [str(tmp_path / "f.bin.part.lock")]
+
+    def test_cleanup_failure_still_releases(self, tmp_path):
+        """A failure removing the partial still releases the lock."""
+        released: list[str] = []
+        release, unlink = FileLock.release, Path.unlink
+
+        def tracked_release(self, *args, **kwargs):
+            if not kwargs.get("force"):  # Not the release in FileLock.__del__.
+                released.append(self.lock_file)
+            return release(self, *args, **kwargs)
+
+        def failing_unlink(self, *args, **kwargs):
+            if self.name.endswith(".part"):
+                raise PermissionError(self)
+            return unlink(self, *args, **kwargs)
+
+        # Without an ETag the partial is not kept, so it is removed.
+        server = RangeServer(BODY, etag=None)
+        server.fail_after = 4000
+        with (
+            patch.object(FileLock, "release", tracked_release),
+            patch.object(Path, "unlink", failing_unlink),
+            pytest.raises(PermissionError),
+        ):
+            _fetch(server, tmp_path / "f.bin")
+        assert released == [str(tmp_path / "f.bin.part.lock")]
 
     def test_resumes_from_mstransfer_server(self, tmp_path):
         """Resume works end to end against the mstransfer server."""
