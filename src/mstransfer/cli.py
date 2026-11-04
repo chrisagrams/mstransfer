@@ -284,6 +284,15 @@ def cmd_download(args: argparse.Namespace) -> None:
     try:
         with Live(display.table, console=console, refresh_per_second=10):
             results = asyncio.run(_run())
+            # A skipped file never reports a size, so finish its row as skipped
+            # rather than leave it spinning at 0/? bytes.
+            for r in results:
+                if r.response is not None and r.response.skipped:
+                    display.files.update(
+                        display._task_ids[r.filename],
+                        description=f"[yellow]{r.filename} (skipped)",
+                        total=0,
+                    )
     except KeyboardInterrupt:
         # Without --no-resume, interrupted downloads keep their partials.
         hint = "" if args.no_resume else " Run the same command again to resume."
@@ -294,13 +303,20 @@ def cmd_download(args: argparse.Namespace) -> None:
         sys.exit(130)
 
     failed = [r for r in results if r.error is not None]
-    ok = len(results) - len(failed)
+    skipped = sum(1 for r in results if r.response is not None and r.response.skipped)
+    downloaded = len(results) - len(failed) - skipped
+    summary = f"[green]{downloaded} downloaded[/]"
+    if skipped:
+        summary += f", [yellow]{skipped} skipped (already exist)[/]"
     if failed:
-        console.print(f"\n[green]{ok} succeeded[/], [red]{len(failed)} failed[/]")
+        console.print(f"\n{summary}, [red]{len(failed)} failed[/]")
         for r in failed:
             console.print(f"  [red]- {r.filename}: {r.error}")
         sys.exit(1)
-    console.print(f"\n[green]All {ok} file(s) downloaded successfully.")
+    if skipped:
+        console.print(f"\n{summary}")
+    else:
+        console.print(f"\n[green]All {downloaded} file(s) downloaded successfully.")
 
 
 def main() -> None:
