@@ -10,6 +10,7 @@ from fastapi.responses import FileResponse
 
 from mstransfer import __version__
 from mstransfer.server.models import (
+    ErrorResponse,
     FileListResponse,
     HealthResponse,
     TransferRecord,
@@ -62,6 +63,8 @@ def make_router(
 
     router = APIRouter()
     protected: list[Any] = [Depends(auth_dep)] if auth_dep else []
+    error: dict[str, Any] = {"model": ErrorResponse}
+    auth_errors: dict[int | str, dict[str, Any]] = {401: error} if auth_dep else {}
 
     @router.get("/health", response_model=HealthResponse)
     async def health(state: AppState = state_dep) -> HealthResponse:
@@ -79,6 +82,7 @@ def make_router(
         "/transfer/{transfer_id}/status",
         response_model=TransferRecord,
         dependencies=protected,
+        responses={**auth_errors, 404: error},
     )
     async def transfer_status(
         transfer_id: str, state: AppState = state_dep
@@ -94,7 +98,12 @@ def make_router(
             raise HTTPException(status_code=404, detail="Transfer not found")
         return record
 
-    @router.post("/upload", response_model=UploadResponse, dependencies=protected)
+    @router.post(
+        "/upload",
+        response_model=UploadResponse,
+        dependencies=protected,
+        responses={**auth_errors, 400: error, 409: error, 500: error},
+    )
     async def upload(request: Request, state: AppState = state_dep) -> UploadResponse:
         """
         Endpoint to handle file uploads. Expects the file content in the request body
@@ -237,7 +246,7 @@ def make_router(
         finally:
             state.outputs.release(dest)
 
-    @router.get("/files", dependencies=protected)
+    @router.get("/files", dependencies=protected, responses=auth_errors)
     async def list_files(state: AppState = state_dep) -> FileListResponse:
         """List all files available for download.
 
@@ -249,7 +258,11 @@ def make_router(
         files = await state.files.list_files()
         return FileListResponse(files=files)
 
-    @router.get("/files/{filename}", dependencies=protected)
+    @router.get(
+        "/files/{filename}",
+        dependencies=protected,
+        responses={**auth_errors, 404: error},
+    )
     async def download_file(filename: str, state: AppState = state_dep) -> FileResponse:
         """Download a single file by name.
 

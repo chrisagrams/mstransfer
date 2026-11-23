@@ -10,7 +10,9 @@ from typing import TYPE_CHECKING
 
 import httpx
 import uvicorn
+from pydantic import ValidationError
 from rich.live import Live
+from rich.markup import escape
 from rich.table import Table
 
 from mstransfer import __version__
@@ -35,7 +37,7 @@ from mstransfer.log import (
     setup_logging,
 )
 from mstransfer.server.app import create_app
-from mstransfer.server.models import TransferState, UploadResponse
+from mstransfer.server.models import ErrorResponse, TransferState, UploadResponse
 
 
 def parse_target(target: str) -> str:
@@ -62,6 +64,23 @@ def parse_target(target: str) -> str:
             sys.exit(1)
         return f"http://{host}:{port}"
     return f"http://{target}:{default_port}"
+
+
+def describe_error(exc: Exception) -> str:
+    """Describe a per-file failure, preferring the server's ``detail``.
+
+    httpx's own text for a status error wraps the URL and links to MDN, which
+    pushes the server's actual reason off screen.
+    """
+    if not isinstance(exc, httpx.HTTPStatusError):
+        return str(exc)
+    resp = exc.response
+    status = f"{resp.status_code} {resp.reason_phrase}".strip()
+    try:
+        body = ErrorResponse.model_validate_json(resp.content)
+    except (ValidationError, httpx.ResponseNotRead):
+        return status
+    return f"{status}: {body.detail}"
 
 
 def cmd_serve(args: argparse.Namespace) -> None:
@@ -198,8 +217,11 @@ def cmd_upload(args: argparse.Namespace) -> None:
         for r in results:
             if r.response and r.response.state == TransferState.DONE:
                 continue
-            err = r.error or (r.response.state.value if r.response else "unknown")
-            console.print(f"  [red]- {r.filename}: {err}")
+            if r.error is not None:
+                err = describe_error(r.error)
+            else:
+                err = r.response.state.value if r.response else "unknown"
+            console.print(f"  [red]- {escape(r.filename)}: {escape(err)}")
         sys.exit(1)
     console.print(f"\n[green]All {ok} file(s) transferred successfully.")
 
@@ -290,7 +312,7 @@ def cmd_download(args: argparse.Namespace) -> None:
                 if r.response is not None and r.response.skipped:
                     display.files.update(
                         display._task_ids[r.filename],
-                        description=f"[yellow]{r.filename} (skipped)",
+                        description=f"[yellow]{escape(r.filename)} (skipped)",
                         total=0,
                     )
     except KeyboardInterrupt:
@@ -302,7 +324,7 @@ def cmd_download(args: argparse.Namespace) -> None:
         console.print(f"[yellow]Interrupted.{hint}")
         sys.exit(130)
 
-    failed = [r for r in results if r.error is not None]
+    failed = [(r.filename, r.error) for r in results if r.error is not None]
     skipped = sum(1 for r in results if r.response is not None and r.response.skipped)
     downloaded = len(results) - len(failed) - skipped
     summary = f"[green]{downloaded} downloaded[/]"
@@ -310,8 +332,10 @@ def cmd_download(args: argparse.Namespace) -> None:
         summary += f", [yellow]{skipped} skipped (already exist)[/]"
     if failed:
         console.print(f"\n{summary}, [red]{len(failed)} failed[/]")
-        for r in failed:
-            console.print(f"  [red]- {r.filename}: {r.error}")
+        for filename, error in failed:
+            console.print(
+                f"  [red]- {escape(filename)}: {escape(describe_error(error))}"
+            )
         sys.exit(1)
     if skipped:
         console.print(f"\n{summary}")
