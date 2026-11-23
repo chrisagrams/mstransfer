@@ -257,8 +257,8 @@ def make_router(
     async def download_file(filename: str, state: AppState = state_dep) -> FileResponse:
         """Download a single file by name.
 
-        Supports byte ``Range`` requests (``206``/``416``) and ``If-Range``,
-        and sends ``ETag`` and ``Last-Modified`` validators, so an
+        Supports byte `Range` requests (`206`/`416`) and `If-Range`,
+        and sends `ETag` and `Last-Modified` validators, so an
         interrupted download can be resumed.
         """
         path = await state.files.get_file(filename)

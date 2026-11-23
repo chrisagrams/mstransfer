@@ -49,9 +49,9 @@ class UploadResponse(BaseModel):
 
 
 class ErrorResponse(BaseModel):
-    """Body of the errors the routes raise via ``HTTPException``.
+    """Body of the errors the routes raise via `HTTPException`.
 
-    FastAPI's own 422 validation errors use a list ``detail`` instead.
+    FastAPI's own 422 validation errors use a list `detail` instead.
     """
 
     detail: str = Field(min_length=1)

@@ -67,7 +67,7 @@ def parse_target(target: str) -> str:
 
 
 def describe_error(exc: Exception) -> str:
-    """Describe a per-file failure, preferring the server's ``detail``.
+    """Describe a per-file failure, preferring the server's `detail`.
 
     httpx's own text for a status error wraps the URL and links to MDN, which
     pushes the server's actual reason off screen.
