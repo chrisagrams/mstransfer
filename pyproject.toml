@@ -1,18 +1,20 @@
 [project]
 name = "mstransfer"
-version = "0.2.3"
+version = "0.3.0"
 description = "Transfer mass spectrometry files (mzML/MSZ) between endpoints using mscompress"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11.5"
 dependencies = [
-    "mscompress>=1.0.13",
+    "mscompress>=1.2.2",
     "fastapi",
+    "starlette>=0.39",  # FileResponse range requests
     "uvicorn[standard]",
     "httpx",
     "rich",
     "python-multipart",
     "pydantic>=2.0",
     "aiofiles",
+    "filelock>=4.2.7",
 ]
 
 [project.scripts]
@@ -26,18 +28,27 @@ build-backend = "hatchling.build"
 packages = ["src/mstransfer"]
 
 [tool.ruff]
-target-version = "py310"
+target-version = "py311"
 line-length = 88
 
 [tool.ruff.lint]
-select = ["E", "F", "W", "I", "N", "UP", "B", "A", "SIM", "TCH", "PLC0415"]
+select = ["E", "F", "W", "I", "N", "UP", "B", "A", "SIM", "TCH", "PLC0415", "D"]
+# Check docstring format, not coverage.
+ignore = ["D1"]
+
+[tool.ruff.lint.per-file-ignores]
+# Test docstrings often start with an identifier (httpx, mzML).
+"tests/**" = ["D403"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
 
 [tool.pyright]
 include = ["src", "tests"]
 exclude = ["benchmark", ".venv", "**/__pycache__", "**/node_modules", "build", "dist"]
 
 [tool.mypy]
-python_version = "3.10"
+python_version = "3.11"
 strict = true
 warn_return_any = true
 warn_unused_configs = true
@@ -59,4 +70,11 @@ dev = [
     "pre-commit",
     "pyright>=1.1.408",
     "mypy>=1.10",
+]
+docs = [
+    "zensical>=0.0.73",
+    "mkdocstrings[python]>=1.0.8",
+    "mkdocs-llmstxt>=0.5.1",
+    "pymdown-extensions>=12.3",
+    "ruff>=0.17.2",
 ]

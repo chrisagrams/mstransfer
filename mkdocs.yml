@@ -1,0 +1,158 @@
+site_name: mstransfer
+site_description: Transfer mass spectrometry files (mzML / MSZ / MSZX) between machines over HTTP
+site_url: https://chrisagrams.github.io/mstransfer/
+repo_url: https://github.com/chrisagrams/mstransfer
+repo_name: chrisagrams/mstransfer
+edit_uri: edit/main/docs/
+
+docs_dir: docs
+
+theme:
+  name: material
+  variant: classic
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/weather-night
+        name: Switch to light mode
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.indexes
+    - navigation.top
+    - navigation.tracking
+    - toc.follow
+    - content.code.copy
+    - content.code.annotate
+    - content.tabs.link
+    - search.suggest
+    - search.highlight
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - def_list
+  - footnotes
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.tasklist:
+      custom_checkbox: true
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+
+plugins:
+  - search
+  - mkdocstrings:
+      default_handler: python
+      handlers:
+        python:
+          paths:
+            - src
+          options:
+            show_source: false
+            show_root_heading: true
+            show_root_full_path: false
+            show_symbol_type_heading: true
+            show_symbol_type_toc: true
+            members_order: source
+            separate_signature: true
+            show_signature_annotations: true
+            signature_crossrefs: true
+            line_length: 60
+            docstring_style: google
+            merge_init_into_class: true
+            filters:
+              - "!^_"
+  # Must come after mkdocstrings so API reference pages are rendered first.
+  # Emits /llms.txt (index), /llms-full.txt (all pages concatenated), and a
+  # Markdown copy of every listed page next to its HTML (e.g. /cli/index.md).
+  # Globs keep new pages included automatically; mkdocs sorts index.md first.
+  - llmstxt:
+      full_output: llms-full.txt
+      markdown_description: |
+        mstransfer moves mass spectrometry files (mzML, MSZ, MSZX) between
+        machines over HTTP. Files always travel as compressed MSZ using
+        mscompress: mzML sources are compressed on the fly during upload, and
+        the receiver can store them as MSZ or decompress back to mzML. It
+        ships a CLI (`serve`, `upload`, `download`), a Python client library
+        with sync and async APIs, and an embeddable FastAPI server with
+        pluggable auth and file discovery. Every page below is available as
+        Markdown; `llms-full.txt` contains all of them in one file.
+      sections:
+        Getting started:
+          - index.md
+          - getting-started/*.md
+        CLI:
+          - cli/*.md
+        Python guides:
+          - guides/*.md
+        Server:
+          - server/*.md
+        API reference:
+          - reference/*.md
+        Contributing:
+          - contributing/*.md
+
+extra:
+  generator: false
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/chrisagrams/mstransfer
+
+extra_css:
+  - stylesheets/extra.css
+
+nav:
+  - Home: index.md
+  - Getting Started:
+    - getting-started/index.md
+    - Installation: getting-started/installation.md
+    - Quick Start: getting-started/quickstart.md
+  - CLI:
+    - cli/index.md
+  - Python Guides:
+    - guides/index.md
+    - Uploading files: guides/uploading.md
+    - Downloading files: guides/downloading.md
+    - Progress reporting: guides/progress.md
+  - Server:
+    - server/index.md
+    - HTTP API: server/http-api.md
+    - Embedding in FastAPI: server/embedding.md
+    - Authentication: server/auth.md
+    - File providers: server/file-providers.md
+    - Deployment: server/deployment.md
+  - API Reference:
+    - reference/index.md
+    - Client: reference/client.md
+    - Server: reference/server.md
+    - Models: reference/models.md
+    - Storage: reference/store.md
+  - Contributing:
+    - contributing/index.md

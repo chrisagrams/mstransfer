@@ -4,15 +4,17 @@ from collections.abc import (
     Sequence,  # noqa: TC003 (Pydantic resolves annotations at runtime)
 )
 from datetime import datetime
-from enum import Enum
+from enum import StrEnum
 from typing import Literal
 
 from pydantic import BaseModel, Field, SerializeAsAny
 
+from mstransfer.store import MSFormat  # noqa: TC001 (Pydantic resolves annotations at runtime)
+
 StoreFormat = Literal["msz", "mzml"]
 
 
-class TransferState(str, Enum):
+class TransferState(StrEnum):
     """Enumeration of possible states for a file transfer."""
 
     RECEIVING = "receiving"
@@ -46,17 +48,26 @@ class UploadResponse(BaseModel):
     bytes_received: int
 
 
+class ErrorResponse(BaseModel):
+    """Body of the errors the routes raise via `HTTPException`.
+
+    FastAPI's own 422 validation errors use a list `detail` instead.
+    """
+
+    detail: str = Field(min_length=1)
+
+
 class FileInfo(BaseModel):
     """Metadata for a single stored file.
 
     Subclass this to add provider-specific fields (e.g. checksum, URL,
     upload timestamp).  Extra fields are preserved in the API response
-    thanks to :pydantic:`SerializeAsAny` on :class:`FileListResponse`.
+    thanks to `SerializeAsAny` on `FileListResponse`.
     """
 
     name: str
     size_bytes: int
-    format: StoreFormat
+    format: MSFormat
 
 
 class FileListResponse(BaseModel):

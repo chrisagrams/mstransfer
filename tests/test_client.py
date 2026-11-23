@@ -3,24 +3,33 @@
 from __future__ import annotations
 
 import asyncio
+import shutil
 import threading
 import time
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
+import httpx
 import pytest
 import uvicorn
 from mscompress import MSZFile, MZMLFile
 from mscompress.mszx import MSZXFile
 
 from mstransfer.client.sender import (
+    _async_poll_status,
     async_send_batch,
     async_send_file,
     send_batch,
     send_file,
 )
-from mstransfer.client.utils import ThrottledCallback, resolve_inputs
+from mstransfer.client.utils import (
+    ThrottledCallback,
+    normalize_source,
+    resolve_inputs,
+)
 from mstransfer.server.app import create_app
+from mstransfer.server.models import TransferState
+from mstransfer.store import MSFormat
 
 # ---------------------------------------------------------------------------
 # resolve_inputs
@@ -82,6 +91,62 @@ class TestResolveInputs:
     def test_no_duplicates(self, sample_files):
         result = resolve_inputs([str(sample_files), str(sample_files)], recursive=True)
         assert len(result) == len(set(result))
+
+    def test_directory_finds_mszx_and_any_case(self, tmp_path):
+        (tmp_path / "a.mszx").write_bytes(b"mszx")
+        (tmp_path / "b.MZML").write_bytes(b"mzml")
+        (tmp_path / "c.MsZ").write_bytes(b"msz")
+        (tmp_path / "d.txt").write_bytes(b"other")
+        result = resolve_inputs([str(tmp_path)])
+        assert [p.name for p in result] == ["a.mszx", "b.MZML", "c.MsZ"]
+
+    def test_directory_skips_matching_subdirectory(self, tmp_path):
+        (tmp_path / "looks_like.msz").mkdir()
+        (tmp_path / "real.msz").write_bytes(b"msz")
+        result = resolve_inputs([str(tmp_path)])
+        assert [p.name for p in result] == ["real.msz"]
+
+
+class TestNormalizeSource:
+    def test_mzml_path(self, test_mzml):
+        path, fmt, mzml_obj = normalize_source(test_mzml)
+        assert (path, fmt) == (test_mzml, MSFormat.MZML)
+        assert isinstance(mzml_obj, MZMLFile)
+
+    def test_msz_path(self, test_msz):
+        assert normalize_source(test_msz) == (test_msz, MSFormat.MSZ, None)
+
+    def test_mszx_path(self, test_mszx):
+        assert normalize_source(test_mszx) == (test_mszx, MSFormat.MSZX, None)
+
+    def test_detects_by_contents_not_extension(self, tmp_path, test_msz):
+        renamed = tmp_path / "data.mzML"
+        renamed.write_bytes(test_msz.read_bytes())
+        assert normalize_source(renamed)[1] is MSFormat.MSZ
+
+    def test_unknown_contents_rejected(self, tmp_path):
+        bogus = tmp_path / "bogus.msz"
+        bogus.write_bytes(b"not ms data")
+        with pytest.raises(ValueError, match="Unsupported file type"):
+            normalize_source(bogus)
+
+    def test_mscompress_objects(self, test_mzml, test_msz):
+        mzml = MZMLFile(str(test_mzml).encode())
+        assert normalize_source(mzml) == (test_mzml, MSFormat.MZML, mzml)
+        msz = MSZFile(str(test_msz).encode())
+        assert normalize_source(msz) == (test_msz, MSFormat.MSZ, None)
+
+    def test_mszxfile_object(self, test_mszx):
+        """MSZXFile subclasses MSZFile but must still be reported as mszx."""
+        mszx = MSZXFile.open(test_mszx)
+        try:
+            assert normalize_source(mszx) == (test_mszx, MSFormat.MSZX, None)
+        finally:
+            mszx.close()
+
+    def test_rejects_unsupported_type(self):
+        with pytest.raises(TypeError, match="Unsupported source type"):
+            normalize_source("not_a_path")  # type: ignore[arg-type]
 
 
 # ---------------------------------------------------------------------------
@@ -242,6 +307,15 @@ class TestSendFile:
         assert mzml_out.exists()
         assert mzml_out.stat().st_size == test_mzml.stat().st_size
 
+    def test_send_file_conflict_raises(self, test_msz, _live_server):
+        """A 409 from the server raises; nothing is replaced."""
+        stored = _live_server["output_dir"] / "test.msz"
+        stored.write_bytes(b"stored earlier")
+        with pytest.raises(httpx.HTTPStatusError) as exc_info:
+            send_file(test_msz, _live_server["base_url"])
+        assert exc_info.value.response.status_code == 409
+        assert stored.read_bytes() == b"stored earlier"
+
     def test_send_file_progress_callback(self, test_msz, _live_server):
         """Progress callback should be invoked with byte deltas."""
         deltas = []
@@ -273,7 +347,7 @@ class TestSendFile:
         assert result.state == "done"
         assert result.bytes_received > 0
 
-    def test_chunk_size_affects_generator(self, test_msz, _live_server):
+    def test_chunk_size_affects_generator(self, test_msz, _live_server, tmp_path):
         """Both small and large chunk sizes should transfer the full file."""
         small_deltas: list[int] = []
         send_file(
@@ -282,9 +356,12 @@ class TestSendFile:
             progress_callback=small_deltas.append,
             chunk_size=256,
         )
+        # A second name, so the server doesn't refuse it as a duplicate.
+        copy = tmp_path / "copy.msz"
+        shutil.copyfile(test_msz, copy)
         large_deltas: list[int] = []
         send_file(
-            test_msz,
+            copy,
             _live_server["base_url"],
             progress_callback=large_deltas.append,
             chunk_size=1_048_576,
@@ -330,6 +407,7 @@ class TestSendFile:
         assert result.state == "done"
         assert result.filename == "test.mszx"
         assert result.bytes_received == test_mszx.stat().st_size
+        assert Path(result.stored_as).name == "test.mszx"
         mszx.close()
 
     def test_send_file_rejects_invalid_type(self, _live_server):
@@ -386,10 +464,10 @@ class TestSendBatch:
         result_names = {r.filename for r in results}
         assert result_names == {f.name for f in files}
 
-    def test_mixed_msz_and_mzml(self, test_msz, test_mzml, _live_server):
+    def test_mixed_msz_and_mzml(self, test_msz, other_mzml, _live_server):
         """send_batch handles a mix of .msz and .mzML files."""
         results = send_batch(
-            [test_msz, test_mzml],
+            [test_msz, other_mzml],
             _live_server["base_url"],
             parallel=2,
         )
@@ -417,9 +495,24 @@ class TestSendBatch:
             )
         assert len(results) == 1
         r = results[0]
-        assert r.error is not None
-        assert "server exploded" in r.error
+        assert isinstance(r.error, ConnectionError)
+        assert str(r.error) == "server exploded"
         assert r.filename == "test.msz"
+
+    def test_same_stem_conflict_is_per_file_error(
+        self, test_msz, test_mzml, _live_server
+    ):
+        """test.msz and test.mzML collide; one succeeds and the other fails."""
+        results = send_batch(
+            [test_msz, test_mzml],
+            _live_server["base_url"],
+            parallel=1,
+        )
+        assert results[0].response is not None
+        assert results[0].response.state == "done"
+        assert results[1].response is None
+        assert isinstance(results[1].error, httpx.HTTPStatusError)
+        assert results[1].error.response.status_code == 409
 
     def test_partial_failure(self, test_msz, _live_server, tmp_path):
         """One failure does not prevent other files from succeeding."""
@@ -451,7 +544,57 @@ class TestSendBatch:
         by_name = {r.filename: r for r in results}
         assert by_name["good.msz"].response is not None
         assert by_name["good.msz"].response.state == "done"
-        assert by_name["bad.msz"].error is not None
+        assert isinstance(by_name["bad.msz"].error, ConnectionError)
+        assert by_name["bad.msz"].response is None
+
+    def test_missing_file_is_per_file_error(self, test_msz, _live_server, tmp_path):
+        """A missing .msz path fails on its own without aborting the batch."""
+        missing = tmp_path / "missing.msz"
+        progress = MagicMock()
+
+        results = send_batch(
+            [test_msz, missing],
+            _live_server["base_url"],
+            parallel=2,
+            progress=progress,
+        )
+
+        assert len(results) == 2
+        assert results[0].response is not None
+        assert results[0].response.state == "done"
+        assert results[1].filename == "missing.msz"
+        assert results[1].response is None
+        assert isinstance(results[1].error, FileNotFoundError)
+        progress.file_started.assert_any_call(1, missing, None)
+        progress.file_error.assert_called_once()
+        assert progress.file_error.call_args.args[0] == 1
+        assert isinstance(progress.file_error.call_args.args[1], FileNotFoundError)
+
+    def test_raising_file_done_is_not_a_failure(self, test_msz, _live_server, tmp_path):
+        """A raising file_done leaves the result a success.
+
+        Its exception is logged, not reported through file_error, and the
+        other uploads in the batch still finish.
+        """
+        other = tmp_path / "other.msz"
+        other.write_bytes(test_msz.read_bytes())
+        progress = MagicMock()
+        progress.file_done.side_effect = RuntimeError("callback bug")
+
+        results = send_batch(
+            [test_msz, other],
+            _live_server["base_url"],
+            parallel=1,
+            progress=progress,
+        )
+
+        assert [r.filename for r in results] == ["test.msz", "other.msz"]
+        for r in results:
+            assert r.error is None
+            assert r.response is not None
+            assert r.response.state == "done"
+        assert progress.file_done.call_count == 2
+        progress.file_error.assert_not_called()
 
     def test_parallel_capped_to_file_count(self, test_msz, _live_server):
         """Semaphore should not exceed the number of files."""
@@ -482,10 +625,29 @@ class TestSendBatch:
             _, kwargs = mock_send.call_args
             assert kwargs["chunk_size"] == 4096
 
-    def test_batch_with_mscompress_objects(self, test_msz, test_mzml, _live_server):
+    def test_timeouts_passed_to_send_file(self, test_msz, _live_server):
+        """send_batch should forward timeout and poll_timeout to async_send_file."""
+        timeout = httpx.Timeout(42.0)
+        with patch(
+            "mstransfer.client.sender.async_send_file",
+            wraps=async_send_file,
+        ) as mock_send:
+            send_batch(
+                [test_msz],
+                _live_server["base_url"],
+                parallel=1,
+                timeout=timeout,
+                poll_timeout=None,
+            )
+            mock_send.assert_called_once()
+            _, kwargs = mock_send.call_args
+            assert kwargs["timeout"] is timeout
+            assert kwargs["poll_timeout"] is None
+
+    def test_batch_with_mscompress_objects(self, test_msz, other_mzml, _live_server):
         """send_batch accepts MSZFile and MZMLFile objects."""
         msz = MSZFile(str(test_msz).encode())
-        mzml = MZMLFile(str(test_mzml).encode())
+        mzml = MZMLFile(str(other_mzml).encode())
         results = send_batch(
             [msz, mzml],
             _live_server["base_url"],
@@ -496,9 +658,9 @@ class TestSendBatch:
             assert r.response is not None
             assert r.response.state == "done"
 
-    def test_batch_mixed_paths_and_objects(self, test_msz, test_mzml, _live_server):
+    def test_batch_mixed_paths_and_objects(self, test_msz, other_mzml, _live_server):
         """send_batch accepts a mix of Path and mscompress objects."""
-        mzml = MZMLFile(str(test_mzml).encode())
+        mzml = MZMLFile(str(other_mzml).encode())
         results = send_batch(
             [test_msz, mzml],
             _live_server["base_url"],
@@ -506,7 +668,7 @@ class TestSendBatch:
         )
         assert len(results) == 2
         names = {r.filename for r in results}
-        assert names == {"test.msz", "test.mzML"}
+        assert names == {"test.msz", "other.mzML"}
         for r in results:
             assert r.response is not None
             assert r.response.state == "done"
@@ -604,6 +766,100 @@ class TestAsyncSendFile:
         with pytest.raises(TypeError, match="Unsupported source type"):
             await async_send_file("not_a_path_or_file", _live_server["base_url"])  # type: ignore[arg-type]
 
+    @pytest.mark.parametrize(
+        ("kwargs", "upload"),
+        [
+            # No timeout, the upload keeps the client's own.
+            ({}, {"connect": 5.0, "read": 5.0, "write": 5.0, "pool": 5.0}),
+            # A timeout replaces the client's, even when client= is passed.
+            (
+                {"timeout": httpx.Timeout(42.0, connect=7.0)},
+                {"connect": 7.0, "read": 42.0, "write": 42.0, "pool": 42.0},
+            ),
+            (
+                {"timeout": httpx.Timeout(None)},
+                {"connect": None, "read": None, "write": None, "pool": None},
+            ),
+        ],
+    )
+    async def test_timeouts_with_client(self, test_msz, kwargs, upload):
+        """A passed timeout replaces client='s; status polls keep its timeout."""
+        seen: dict[str, dict[str, float | None]] = {}
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            transfer_id = request.headers.get("X-Transfer-ID", "t")
+            if request.method == "POST":
+                await request.aread()
+                seen["upload"] = request.extensions["timeout"]
+                state = "received"
+            else:
+                seen["poll"] = request.extensions["timeout"]
+                state = "done"
+            return httpx.Response(
+                200,
+                json={
+                    "transfer_id": transfer_id,
+                    "filename": "test.msz",
+                    "stored_as": "test.msz",
+                    "state": state,
+                    "bytes_received": 0,
+                },
+            )
+
+        # A client built only for headers keeps httpx's default 5 s timeout.
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler), headers={"X-Auth": "t"}
+        ) as client:
+            result = await async_send_file(
+                test_msz, "http://test", client=client, **kwargs
+            )
+
+        assert result.state == "done"
+        assert seen["upload"] == upload
+        assert seen["poll"] == {"connect": 5.0, "read": 5.0, "write": 5.0, "pool": 5.0}
+
+
+def _status_client(states: list[tuple[str, int]]) -> httpx.AsyncClient:
+    """Client whose status endpoint replies with *states* in turn, then the last."""
+    replies = iter(states)
+    last = states[-1]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal last
+        state, bytes_received = last = next(replies, last)
+        return httpx.Response(
+            200,
+            json={
+                "transfer_id": "t",
+                "filename": "test.msz",
+                "state": state,
+                "bytes_received": bytes_received,
+            },
+        )
+
+    return httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+
+@pytest.mark.asyncio
+class TestAsyncPollStatus:
+    @pytest.mark.parametrize("timeout", [None, 1.0])
+    async def test_progress_until_done(self, timeout):
+        """Polling follows the server through progress to a terminal state."""
+        states = [("receiving", 0), ("receiving", 10), ("decompressing", 10)]
+        async with _status_client([*states, ("done", 10)]) as client:
+            state = await _async_poll_status(
+                "http://test", "t", timeout=timeout, interval=0.001, client=client
+            )
+        assert state == TransferState.DONE
+
+    async def test_no_progress_times_out(self):
+        """Without progress, polling gives up once *timeout* has passed."""
+        async with _status_client([("receiving", 0)]) as client:
+            with pytest.raises(TimeoutError, match="did not complete"):
+                await _async_poll_status(
+                    "http://test", "t", timeout=0.05, interval=0.01, client=client
+                )
+
 
 # ---------------------------------------------------------------------------
 # async_send_batch
@@ -643,10 +899,10 @@ class TestAsyncSendBatch:
             assert r.response is not None
             assert r.response.state == "done"
 
-    async def test_mixed_msz_and_mzml(self, test_msz, test_mzml, _live_server):
+    async def test_mixed_msz_and_mzml(self, test_msz, other_mzml, _live_server):
         """async_send_batch handles a mix of .msz and .mzML files."""
         results = await async_send_batch(
-            [test_msz, test_mzml],
+            [test_msz, other_mzml],
             _live_server["base_url"],
             parallel=2,
         )

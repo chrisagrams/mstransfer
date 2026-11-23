@@ -9,7 +9,7 @@ from mscompress import MZMLFile
 
 from mstransfer.server.fileprovider import DirectoryFileProvider
 from mstransfer.server.models import TransferState
-from mstransfer.server.state import TransferRegistry
+from mstransfer.server.state import OutputClaims, TransferRegistry
 
 # ---------------------------------------------------------------------------
 # TransferRegistry unit tests
@@ -97,6 +97,20 @@ class TestTransferRegistry:
         assert reg.get("t2") is None
         assert reg.get("t3") is None
         assert reg.get("t1") is not None
+
+
+class TestOutputClaims:
+    def test_claim_is_exclusive_until_released(self, tmp_path):
+        claims = OutputClaims()
+        assert claims.claim(tmp_path / "run.msz")
+        assert not claims.claim(tmp_path / "run.msz")
+        claims.release(tmp_path / "run.msz")
+        assert claims.claim(tmp_path / "run.msz")
+
+    def test_claims_compare_case_insensitively(self, tmp_path):
+        claims = OutputClaims()
+        assert claims.claim(tmp_path / "run.mzML")
+        assert not claims.claim(tmp_path / "RUN.mzml")
 
 
 # ---------------------------------------------------------------------------
@@ -225,6 +239,130 @@ async def test_upload_mzml_stream_store_as_mzml(mzml_client, tmp_output, test_mz
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("client_fixture", ["msz_client", "mzml_client"])
+@pytest.mark.parametrize("source_format", ["mszx", "MSZX", None])
+async def test_upload_mszx_stored_as_is(
+    request, client_fixture, source_format, tmp_output, test_mszx
+):
+    """An .mszx archive is kept byte-for-byte as .mszx, whatever store_as says."""
+    client = request.getfixturevalue(client_fixture)
+    payload = test_mszx.read_bytes()
+    headers = {
+        "X-Transfer-ID": "mszx-upload",
+        "X-Original-Filename": "run.mszx",
+    }
+    if source_format is not None:
+        headers["X-Source-Format"] = source_format
+    resp = await client.post("/v1/upload", content=payload, headers=headers)
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["state"] == "done"
+    assert data["stored_as"] == str(tmp_output / "run.mszx")
+    assert (tmp_output / "run.mszx").read_bytes() == payload
+    assert sorted(p.name for p in tmp_output.iterdir()) == ["run.mszx"]
+
+
+@pytest.mark.asyncio
+async def test_upload_source_format_header_overrides_extension(
+    msz_client, tmp_output, test_mszx
+):
+    """X-Source-Format wins over the filename extension."""
+    payload = test_mszx.read_bytes()
+    resp = await msz_client.post(
+        "/v1/upload",
+        content=payload,
+        headers={
+            "X-Transfer-ID": "mszx-renamed",
+            "X-Original-Filename": "run.bin",
+            "X-Source-Format": "mszx",
+        },
+    )
+    assert resp.status_code == 200
+    assert (tmp_output / "run.mszx").read_bytes() == payload
+
+
+@pytest.mark.asyncio
+async def test_upload_mzml_source_format_header(mzml_client, tmp_output, test_mzml):
+    """The client's X-Source-Format: mzML still means an MSZ stream."""
+    mzml = MZMLFile(str(test_mzml).encode())
+    compressed = b"".join(mzml.compress_stream(chunk_size=1_048_576))
+    resp = await mzml_client.post(
+        "/v1/upload",
+        content=compressed,
+        headers={
+            "X-Transfer-ID": "mzml-header",
+            "X-Original-Filename": "test.mzML",
+            "X-Source-Format": "mzML",
+        },
+    )
+    assert resp.status_code == 200
+    assert resp.json()["state"] == "done"
+    assert (tmp_output / "test.mzML").stat().st_size == test_mzml.stat().st_size
+
+
+@pytest.mark.asyncio
+async def test_upload_unknown_source_format_rejected(msz_client, tmp_output):
+    resp = await msz_client.post(
+        "/v1/upload",
+        content=b"data",
+        headers={
+            "X-Transfer-ID": "bad-format",
+            "X-Original-Filename": "run.raw",
+            "X-Source-Format": "raw",
+        },
+    )
+    assert resp.status_code == 400
+    assert list(tmp_output.iterdir()) == []
+    status = await msz_client.get("/v1/transfer/bad-format/status")
+    assert status.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_upload_receive_failure_marks_error(msz_client, tmp_output, test_msz):
+    """If the upload can't be written, the transfer ends in ERROR with a 500."""
+    tmp_output.rmdir()
+    resp = await msz_client.post(
+        "/v1/upload",
+        content=test_msz.read_bytes(),
+        headers={
+            "X-Transfer-ID": "receive-fail",
+            "X-Original-Filename": "test.msz",
+            "X-Source-Format": "msz",
+        },
+    )
+    assert resp.status_code == 500
+    assert "Error receiving data" in resp.json()["detail"]
+
+    status = (await msz_client.get("/v1/transfer/receive-fail/status")).json()
+    assert status["state"] == "error"
+    assert status["error"]
+
+
+@pytest.mark.asyncio
+async def test_upload_conversion_failure_marks_error(mzml_client, tmp_output):
+    """A payload that can't be decompressed ends in ERROR and leaves no files."""
+    resp = await mzml_client.post(
+        "/v1/upload",
+        content=b"not an msz file" * 256,
+        headers={
+            "X-Transfer-ID": "convert-fail",
+            "X-Original-Filename": "bad.msz",
+            "X-Source-Format": "msz",
+        },
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["state"] == "error"
+    assert data["stored_as"] == ""
+
+    status = (await mzml_client.get("/v1/transfer/convert-fail/status")).json()
+    assert status["state"] == "error"
+    assert status["error"]
+    # Neither the .part file, the renamed source nor a partial mzML remain.
+    assert list(tmp_output.iterdir()) == []
+
+
+@pytest.mark.asyncio
 async def test_upload_missing_transfer_id(msz_client):
     resp = await msz_client.post(
         "/v1/upload",
@@ -316,6 +454,135 @@ async def test_decompress_does_not_block_event_loop(mzml_client, tmp_output, tes
     assert upload_resp.json()["state"] == "done"
 
 
+def _upload_headers(transfer_id, filename, **extra):
+    return {"X-Transfer-ID": transfer_id, "X-Original-Filename": filename, **extra}
+
+
+@pytest.mark.asyncio
+async def test_upload_conflicting_with_stored_file_rejected(
+    msz_client, tmp_output, test_msz
+):
+    """An upload whose output already exists gets a 409 and changes nothing."""
+    stored = tmp_output / "test.msz"
+    stored.write_bytes(b"stored earlier")
+    consumed = False
+
+    async def body():
+        nonlocal consumed
+        consumed = True
+        yield test_msz.read_bytes()
+
+    resp = await msz_client.post(
+        "/v1/upload",
+        content=body(),
+        headers=_upload_headers("conflict", "test.mzML"),
+    )
+    assert resp.status_code == 409
+    assert resp.json()["detail"] == "test.msz already exists on the server"
+    # Rejected before the body was read; no transfer record or files left.
+    assert not consumed
+    assert stored.read_bytes() == b"stored earlier"
+    assert list(tmp_output.iterdir()) == [stored]
+    status = await msz_client.get("/v1/transfer/conflict/status")
+    assert status.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_upload_same_stem_different_format_rejected(msz_client, test_msz):
+    """test.mzML and test.msz both map to test.msz; the second is refused."""
+    first = await msz_client.post(
+        "/v1/upload",
+        content=test_msz.read_bytes(),
+        headers=_upload_headers("first", "test.msz"),
+    )
+    assert first.json()["state"] == "done"
+
+    second = await msz_client.post(
+        "/v1/upload",
+        content=test_msz.read_bytes(),
+        headers=_upload_headers("second", "test.mzML"),
+    )
+    assert second.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_upload_conflicting_with_in_flight_transfer_rejected(
+    msz_client, tmp_output, test_msz
+):
+    """Two concurrent uploads to one output can't interleave."""
+    payload = test_msz.read_bytes()
+    release = asyncio.Event()
+
+    async def slow_body():
+        yield payload[:1024]
+        await release.wait()
+        yield payload[1024:]
+
+    first = asyncio.create_task(
+        msz_client.post(
+            "/v1/upload",
+            content=slow_body(),
+            headers=_upload_headers("in-flight", "run1.mzML"),
+        )
+    )
+    # Wait until the first upload has claimed its output.
+    for _ in range(100):
+        status = await msz_client.get("/v1/transfer/in-flight/status")
+        if status.status_code == 200:
+            break
+        await asyncio.sleep(0.01)
+
+    second = await msz_client.post(
+        "/v1/upload",
+        content=payload,
+        headers=_upload_headers("racing", "run1.msz"),
+    )
+    assert second.status_code == 409
+    assert second.json()["detail"] == (
+        "run1.msz is already being written by another transfer"
+    )
+
+    release.set()
+    first_resp = await first
+    assert first_resp.json()["state"] == "done"
+    assert (tmp_output / "run1.msz").read_bytes() == payload
+
+    # The claim is released once the first transfer finishes.
+    (tmp_output / "run1.msz").unlink()
+    third = await msz_client.post(
+        "/v1/upload",
+        content=payload,
+        headers=_upload_headers("after", "run1.msz"),
+    )
+    assert third.json()["state"] == "done"
+
+
+@pytest.mark.asyncio
+async def test_upload_store_as_mzml_leaves_unrelated_msz_alone(
+    mzml_client, tmp_output, test_msz
+):
+    """With store_as=mzml, a stored <stem>.msz is neither replaced nor removed."""
+    stored_msz = tmp_output / "test.msz"
+    stored_msz.write_bytes(b"stored earlier")
+    resp = await mzml_client.post(
+        "/v1/upload",
+        content=test_msz.read_bytes(),
+        headers=_upload_headers("mzml-side", "test.msz"),
+    )
+    assert resp.json()["state"] == "done"
+    assert stored_msz.read_bytes() == b"stored earlier"
+    assert (tmp_output / "test.mzML").exists()
+
+    # The mzML output now exists, so a second upload of the same stem conflicts.
+    again = await mzml_client.post(
+        "/v1/upload",
+        content=test_msz.read_bytes(),
+        headers=_upload_headers("mzml-again", "test.mzML"),
+    )
+    assert again.status_code == 409
+    assert again.json()["detail"] == "test.mzML already exists on the server"
+
+
 # ---------------------------------------------------------------------------
 # DirectoryFileProvider unit tests
 # ---------------------------------------------------------------------------
@@ -340,6 +607,14 @@ class TestDirectoryFileProvider:
         assert "a.msz" in names
         assert "b.mzML" in names
         assert "c.txt" not in names
+
+    @pytest.mark.asyncio
+    async def test_list_files_finds_mszx(self, tmp_path):
+        (tmp_path / "a.mszx").write_bytes(b"mszx data")
+
+        provider = DirectoryFileProvider(tmp_path)
+        files = await provider.list_files()
+        assert [(f.name, f.format) for f in files] == [("a.mszx", "mszx")]
 
     @pytest.mark.asyncio
     async def test_list_files_reports_correct_metadata(self, tmp_path):
@@ -424,6 +699,28 @@ async def test_list_files_after_upload(msz_client, test_msz):
 
 
 @pytest.mark.asyncio
+async def test_list_files_after_mszx_upload(msz_client, test_mszx):
+    """An uploaded archive is listed as mszx and downloads unchanged."""
+    payload = test_mszx.read_bytes()
+    await msz_client.post(
+        "/v1/upload",
+        content=payload,
+        headers={
+            "X-Transfer-ID": "list-mszx",
+            "X-Original-Filename": "run.mszx",
+            "X-Source-Format": "mszx",
+        },
+    )
+
+    files = (await msz_client.get("/v1/files")).json()["files"]
+    assert files == [{"name": "run.mszx", "size_bytes": len(payload), "format": "mszx"}]
+
+    resp = await msz_client.get("/v1/files/run.mszx")
+    assert resp.status_code == 200
+    assert resp.content == payload
+
+
+@pytest.mark.asyncio
 async def test_download_msz(msz_client, test_msz):
     """Download a previously uploaded .msz file."""
     payload = test_msz.read_bytes()
@@ -441,6 +738,66 @@ async def test_download_msz(msz_client, test_msz):
     assert resp.content == payload
     assert resp.headers["content-disposition"] == 'attachment; filename="test.msz"'
     assert resp.headers["content-length"] == str(len(payload))
+
+
+@pytest.mark.asyncio
+async def test_download_range(msz_client, test_msz):
+    """A Range request gets a 206 with that slice and the file's validators."""
+    payload = test_msz.read_bytes()
+    await msz_client.post(
+        "/v1/upload",
+        content=payload,
+        headers={"X-Transfer-ID": "dl-range", "X-Original-Filename": "test.msz"},
+    )
+
+    full = await msz_client.get("/v1/files/test.msz")
+    assert full.headers["accept-ranges"] == "bytes"
+    etag = full.headers["etag"]
+    assert not etag.startswith("W/")
+    assert "last-modified" in full.headers
+
+    resp = await msz_client.get(
+        "/v1/files/test.msz", headers={"Range": "bytes=10-", "If-Range": etag}
+    )
+    assert resp.status_code == 206
+    assert resp.content == payload[10:]
+    assert (
+        resp.headers["content-range"] == f"bytes 10-{len(payload) - 1}/{len(payload)}"
+    )
+    assert resp.headers["etag"] == etag
+
+
+@pytest.mark.asyncio
+async def test_download_range_if_range_mismatch(msz_client, test_msz):
+    """A stale If-Range validator gets the whole file."""
+    payload = test_msz.read_bytes()
+    await msz_client.post(
+        "/v1/upload",
+        content=payload,
+        headers={"X-Transfer-ID": "dl-if-range", "X-Original-Filename": "test.msz"},
+    )
+
+    resp = await msz_client.get(
+        "/v1/files/test.msz", headers={"Range": "bytes=10-", "If-Range": '"stale"'}
+    )
+    assert resp.status_code == 200
+    assert resp.content == payload
+
+
+@pytest.mark.asyncio
+async def test_download_range_not_satisfiable(msz_client, test_msz):
+    """A range past the end of the file gets a 416."""
+    payload = test_msz.read_bytes()
+    await msz_client.post(
+        "/v1/upload",
+        content=payload,
+        headers={"X-Transfer-ID": "dl-416", "X-Original-Filename": "test.msz"},
+    )
+
+    resp = await msz_client.get(
+        "/v1/files/test.msz", headers={"Range": f"bytes={len(payload)}-"}
+    )
+    assert resp.status_code == 416
 
 
 @pytest.mark.asyncio
