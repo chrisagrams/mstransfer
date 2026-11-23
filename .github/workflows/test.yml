@@ -8,16 +8,25 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
-        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
+    env:
+      # Override .python-version so uv uses the matrix version.
+      UV_PYTHON: ${{ matrix.python-version }}
+    defaults:
+      run:
+        # Use bash on Windows too so globs like dist/*.whl expand.
+        shell: bash
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@v7
 
       - name: Set up Python ${{ matrix.python-version }}
         run: uv python install ${{ matrix.python-version }}
@@ -26,7 +35,12 @@ jobs:
         run: uv sync --dev
 
       - name: Lint
+        if: runner.os == 'Linux'
         run: uv run ruff check .
+
+      - name: Format check
+        if: runner.os == 'Linux'
+        run: uv run ruff format --check .
 
       - name: Type check (mypy)
         run: uv run mypy src/
@@ -35,15 +49,16 @@ jobs:
         run: |
           uv build
           uv pip install dist/*.whl
-          echo 'import mstransfer' > /tmp/check_typed.py
-          uv run mypy --strict /tmp/check_typed.py
+          echo 'import mstransfer' > "$RUNNER_TEMP/check_typed.py"
+          uv run mypy --strict "$RUNNER_TEMP/check_typed.py"
 
       - name: Run tests with coverage
         run: uv run pytest --cov=mstransfer --cov-report=term-missing --cov-report=xml
 
       - name: Upload coverage to Codecov
-        if: matrix.python-version == '3.10'
-        uses: codecov/codecov-action@v5
+        if: matrix.python-version == '3.11'
+        uses: codecov/codecov-action@v7
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: coverage.xml
+          flags: ${{ runner.os }}

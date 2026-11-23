@@ -1,13 +1,18 @@
 exclude: ^benchmark/
 repos:
-  - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.9.1
-    hooks:
-      - id: ruff
-        args: [--fix]
-      - id: ruff-format
   - repo: local
     hooks:
+      - id: ruff
+        name: ruff
+        entry: uv run ruff check --fix
+        language: system
+        types_or: [python, pyi]
+      - id: ruff-format
+        name: ruff format
+        entry: uv run ruff format --check .
+        language: system
+        types_or: [python, pyi, markdown]
+        pass_filenames: false
       - id: pyright
         name: pyright
         entry: uv run pyright

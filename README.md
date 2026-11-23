@@ -5,6 +5,8 @@
 
 Transfer mass spectrometry files (mzML / MSZ) between machines over HTTP. Files are always transported in compressed MSZ format using [mscompress](https://github.com/chrisagrams/mscompress) — mzML sources are compressed on-the-fly without temp files, and the receiving end can optionally decompress back to mzML.
 
+**Documentation:** https://chrisagrams.github.io/mstransfer/
+
 ## Install
 
 ```bash
@@ -48,7 +50,7 @@ mstransfer serve [--host 0.0.0.0] [--port 1319] [--output-dir ./received] [--sto
 | `--host` | `0.0.0.0` | Bind address |
 | `--port` | `1319` | Listen port |
 | `--output-dir` | `./received` | Where received files are written |
-| `--store-as` | `msz` | Store as `msz` (compressed) or `mzml` (decompress on arrival) |
+| `--store-as` | `msz` | Store as `msz` (compressed) or `mzml` (decompress on arrival). `.mszx` archives are always stored as-is. |
 
 ### `mstransfer upload`
 
@@ -67,6 +69,40 @@ Supported file types: `.mzML`, `.msz`, `.mszx`.
 
 - **mzML files** are compressed to MSZ on-the-fly via `compress_stream()` and streamed directly into the HTTP request — no temp files on the sender.
 - **MSZ / MSZX files** are streamed as-is.
+
+The client sends the format in an `X-Source-Format` header (`mzML`, `msz` or `mszx`). The server stores `.mszx` uploads untouched as `<stem>.mszx`, whatever `--store-as` says.
+
+The server names each stored file after the upload's stem, so `run1.mzML` and `run1.msz` both become `run1.msz`. It refuses an upload with **409 Conflict** if that output file already exists or another transfer is still writing it. The refused file counts as failed, and the CLI exits non-zero.
+
+### `mstransfer download`
+
+Download files from a server by URL, e.g. `http://remote-host:1319/v1/files/run1.msz`.
+
+```
+mstransfer download <urls...> [--output-dir ./downloads] [--parallel 4] [--store-as msz|mzml|mszx] [--skip-existing] [--force] [--no-resume]
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--output-dir`, `-o` | `./downloads` | Where downloaded files are written |
+| `--parallel`, `-p` | `4` | Number of concurrent downloads |
+| `--store-as` | as-is | Convert each download to `msz`, `mzml` or (for `.mszx` only) `mszx` |
+| `--skip-existing` | off | Skip files whose output already exists |
+| `--force` | off | Download again even if the output exists, discarding any partial download |
+| `--no-resume` | off | Start interrupted downloads over instead of resuming them |
+
+If a download is interrupted (for example by a dropped connection or Ctrl-C), running the same command again picks up where it left off instead of starting over. If the file changed on the server in the meantime, or the server can't resume downloads, it starts from the beginning.
+
+### Authentication
+
+`serve`, `upload` and `download` all take `--api-key`. On `serve` it makes the server require that key; on `upload` and `download` it is sent as `Authorization: Bearer <key>`. When `--api-key` is not given, each command reads the `MS_API_KEY` environment variable instead. If neither is set (or `MS_API_KEY` is empty), no key is used.
+
+```
+export MS_API_KEY=secret
+mstransfer serve                                        # requires the key
+mstransfer upload run1.mzML remote-host                 # sends the key
+mstransfer download http://remote-host:1319/v1/files/run1.msz
+```
 
 ## Programmatic access
 
@@ -124,6 +160,7 @@ app = create_app(output_dir="/data/ms", store_as="mzml")
 
 # Mount in an existing FastAPI app
 from fastapi import FastAPI
+
 main_app = FastAPI()
 main_app.mount("/transfer", create_app())
 ```
@@ -141,7 +178,9 @@ flowchart LR
     read --> upload
 
     subgraph Server
-        upload --> mode{store-as?}
+        upload --> kind{source format?}
+        kind -- mszx --> keep["write .mszx as-is"]
+        kind -- mzML / msz --> mode{store-as?}
         mode -- msz --> write["write to disk"]
         mode -- mzml --> temp["write temp .msz"]
         temp --> decompress["decompress"]

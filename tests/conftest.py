@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import shutil
 import tarfile
 from pathlib import Path
 
@@ -24,6 +25,14 @@ def test_mzml() -> Path:
 def test_msz() -> Path:
     """Path to the real test.msz file."""
     return DATA_DIR / "test.msz"
+
+
+@pytest.fixture()
+def other_mzml(tmp_path) -> Path:
+    """A copy of test.mzML whose stem doesn't collide with test.msz on upload."""
+    path = tmp_path / "other.mzML"
+    shutil.copyfile(DATA_DIR / "test.mzML", path)
+    return path
 
 
 @pytest.fixture()

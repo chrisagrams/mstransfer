@@ -4,7 +4,6 @@ import asyncio
 import logging
 import time
 import uuid
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
@@ -15,6 +14,7 @@ import httpx
 from mscompress import MSZFile, MZMLFile
 from mscompress.mszx import MSZXFile
 
+from mstransfer.client.results import FileResult
 from mstransfer.client.utils import (
     ThrottledCallback,
     async_counting_generator,
@@ -41,20 +41,12 @@ class BatchProgressCallback(Protocol):
     def file_error(self, index: int, exc: Exception) -> None: ...
 
 
-@dataclass
-class FileResult:
-    """Result of uploading a single file in a batch."""
-
-    filename: str
-    response: UploadResponse | None = field(default=None)
-    error: str | None = field(default=None)
-
-
 async def async_send_file(
     source: Path | MZMLFile | MSZFile | MSZXFile,
     base_url: str,
     progress_callback: Callable[[int], None] | None = None,
-    timeout: float = 3600.0,
+    timeout: httpx.Timeout | None = None,
+    poll_timeout: float | None = 3600.0,
     chunk_size: int = 1_048_576,
     api_key: str | None = None,
     client: httpx.AsyncClient | None = None,
@@ -63,13 +55,20 @@ async def async_send_file(
 
     Accepts a file path, or an already-opened MZMLFile / MSZFile / MSZXFile
     from mscompress.  Returns the final transfer status from the server.
-    """
 
+    *timeout* replaces *client*'s timeouts for the upload request; pass
+    `httpx.Timeout(None)` for no limit.  If *None*, *client*'s timeouts
+    are used (10 s connect, 3600 s otherwise, without *client*).
+
+    *poll_timeout* is how long to wait without server-side progress while
+    polling for completion, in seconds, or *None* to wait forever.  Status
+    polls use *client*'s timeout, or 10 s without *client*.
+    """
     # Generate a unique transfer ID.
     transfer_id = str(uuid.uuid4())
 
-    # Normalize source into (file_path, filetype, mzml_obj | None).
-    file_path, filetype, mzml_obj = normalize_source(source)
+    # Normalize source into (file_path, format, mzml_obj | None).
+    file_path, fmt, mzml_obj = normalize_source(source)
 
     # Throttle progress callbacks to reduce overhead (default: every 8 MiB).
     throttled = ThrottledCallback(progress_callback) if progress_callback else None
@@ -93,7 +92,7 @@ async def async_send_file(
     headers = {
         "X-Transfer-ID": transfer_id,
         "X-Original-Filename": file_path.name,
-        "X-Source-Format": filetype,
+        "X-Source-Format": fmt.value,
         "Content-Type": "application/octet-stream",
     }
     if api_key:
@@ -101,12 +100,13 @@ async def async_send_file(
 
     # Send the POST request with streaming upload and handle the response.
     async with optional_client(
-        client, timeout=httpx.Timeout(timeout, connect=10.0)
+        client, timeout=httpx.Timeout(3600.0, connect=10.0)
     ) as c:
         resp = await c.post(
             f"{base_url}/v1/upload",
             headers=headers,
             content=stream,
+            timeout=httpx.USE_CLIENT_DEFAULT if timeout is None else timeout,
         )
         resp.raise_for_status()
         upload_result = UploadResponse.model_validate(resp.json())
@@ -121,7 +121,7 @@ async def async_send_file(
         state = await _async_poll_status(
             base_url,
             transfer_id,
-            timeout=timeout,
+            timeout=poll_timeout,
             headers=poll_headers,
             client=client,
         )
@@ -133,15 +133,17 @@ async def async_send_file(
 async def _async_poll_status(
     base_url: str,
     transfer_id: str,
-    timeout: float = 300.0,
+    timeout: float | None = 300.0,
     interval: float = 0.5,
     headers: dict[str, str] | None = None,
     client: httpx.AsyncClient | None = None,
 ) -> TransferState:
-    """Poll transfer status until terminal state or timeout (async)."""
+    """Poll transfer status until terminal state or timeout (async).
 
-    # Configure a deadline for the polling operation.
-    deadline = time.monotonic() + timeout
+    *timeout* is how long to wait without progress; *None* waits forever.
+    """
+    # Configure a deadline for the polling operation (None polls forever).
+    deadline = None if timeout is None else time.monotonic() + timeout
 
     # Keep track of the last seen state and bytes to detect progress.
     last_state: TransferState | None = None
@@ -150,7 +152,7 @@ async def _async_poll_status(
     # Individual request timeout should be reasonably short.
     async with optional_client(client, timeout=10.0) as c:
         # Continuously poll until we hit a terminal state or exceed the deadline.
-        while time.monotonic() < deadline:
+        while deadline is None or time.monotonic() < deadline:
             # Make a GET request to the status endpoint for this transfer ID.
             resp = await c.get(
                 f"{base_url}/v1/transfer/{transfer_id}/status",
@@ -168,7 +170,8 @@ async def _async_poll_status(
                 if record.state != last_state or record.bytes_received > last_bytes:
                     last_state = record.state
                     last_bytes = record.bytes_received
-                    deadline = time.monotonic() + timeout
+                    if timeout is not None:
+                        deadline = time.monotonic() + timeout
             # Sleep until the next poll interval before checking again.
             await asyncio.sleep(interval)
     raise TimeoutError(f"Transfer {transfer_id} did not complete within {timeout}s")
@@ -182,13 +185,22 @@ async def async_send_batch(
     progress: BatchProgressCallback | None = None,
     api_key: str | None = None,
     client: httpx.AsyncClient | None = None,
-) -> list[FileResult]:
-    """Send multiple files with configurable parallelism (async)."""
+    timeout: httpx.Timeout | None = None,
+    poll_timeout: float | None = 3600.0,
+) -> list[FileResult[UploadResponse]]:
+    """Send multiple files with configurable parallelism (async).
+
+    Returns one `FileResult` per source, in input order, carrying
+    the final transfer status or the error.
+
+    *timeout* and *poll_timeout* are passed to `async_send_file` for
+    each file.
+    """
     workers = min(parallel, len(sources))
     sem = asyncio.Semaphore(workers)
 
     # Pre-allocate results list indexed by position for deterministic ordering.
-    results: list[FileResult | None] = [None] * len(sources)
+    results: list[FileResult[UploadResponse] | None] = [None] * len(sources)
 
     async def _upload_one(idx: int, src: Path | MZMLFile | MSZFile | MSZXFile) -> None:
         # Extract a Path for progress reporting and metadata.
@@ -199,20 +211,7 @@ async def async_send_batch(
         else:
             fpath = src
 
-        # We can determine total bytes for compressed files (MSZ/MSZX).
-        # For mzML, compression is on-the-fly so the total is unknown.
-        if isinstance(src, MSZFile | MSZXFile):
-            total_bytes: int | None = fpath.stat().st_size
-        elif isinstance(src, MZMLFile):
-            total_bytes = None
-        else:
-            is_compressed = fpath.suffix.lower() in (".msz", ".mszx")
-            total_bytes = fpath.stat().st_size if is_compressed else None
-
         async with sem:
-            # If the progress callback is provided, notify that this file is starting.
-            if progress:
-                progress.file_started(idx, fpath, total_bytes)
 
             def make_callback(i: int) -> Callable[[int], None]:
                 """Create a callback that captures the file index for progress."""
@@ -223,7 +222,25 @@ async def async_send_batch(
 
                 return cb
 
+            started = False
             try:
+                # We can determine total bytes for compressed files (MSZ/MSZX).
+                # For mzML, compression is on-the-fly so the total is unknown.
+                # stat() is inside the try so a missing or unreadable file
+                # becomes a per-file error instead of aborting the batch.
+                if isinstance(src, MSZFile | MSZXFile):
+                    total_bytes: int | None = fpath.stat().st_size
+                elif isinstance(src, MZMLFile):
+                    total_bytes = None
+                else:
+                    is_compressed = fpath.suffix.lower() in (".msz", ".mszx")
+                    total_bytes = fpath.stat().st_size if is_compressed else None
+
+                # Notify the progress callback that this file is starting.
+                if progress:
+                    progress.file_started(idx, fpath, total_bytes)
+                started = True
+
                 result = await async_send_file(
                     src,
                     base_url,
@@ -231,15 +248,26 @@ async def async_send_batch(
                     chunk_size=chunk_size,
                     api_key=api_key,
                     client=client,
+                    timeout=timeout,
+                    poll_timeout=poll_timeout,
                 )
-                results[idx] = FileResult(filename=fpath.name, response=result)
-                if progress:
-                    progress.file_done(idx, result)
             except Exception as exc:
-                results[idx] = FileResult(filename=fpath.name, error=str(exc))
+                results[idx] = FileResult(filename=fpath.name, error=exc)
                 if progress:
+                    # Progress listeners expect file_started before file_error.
+                    if not started:
+                        progress.file_started(idx, fpath, None)
                     progress.file_error(idx, exc)
                 logger.error("Failed to send %s: %s", fpath, exc)
+            else:
+                results[idx] = FileResult(filename=fpath.name, response=result)
+                # A raising callback must not turn a finished upload into a
+                # failure, or abort the rest of the batch.
+                if progress:
+                    try:
+                        progress.file_done(idx, result)
+                    except Exception:
+                        logger.exception("file_done failed for %s", fpath)
 
     await asyncio.gather(*[_upload_one(i, s) for i, s in enumerate(sources)])
 
@@ -250,7 +278,8 @@ def send_file(
     source: Path | MZMLFile | MSZFile | MSZXFile,
     base_url: str,
     progress_callback: Callable[[int], None] | None = None,
-    timeout: float = 3600.0,
+    timeout: httpx.Timeout | None = None,
+    poll_timeout: float | None = 3600.0,
     chunk_size: int = 1_048_576,
     api_key: str | None = None,
     client: httpx.AsyncClient | None = None,
@@ -260,7 +289,7 @@ def send_file(
     Accepts a file path, or an already-opened MZMLFile / MSZFile / MSZXFile
     from mscompress.  Returns the final transfer status from the server.
 
-    This is a synchronous wrapper around :func:`async_send_file`.
+    This is a synchronous wrapper around `async_send_file`.
     """
     return asyncio.run(
         async_send_file(
@@ -268,6 +297,7 @@ def send_file(
             base_url,
             progress_callback=progress_callback,
             timeout=timeout,
+            poll_timeout=poll_timeout,
             chunk_size=chunk_size,
             api_key=api_key,
             client=client,
@@ -283,10 +313,15 @@ def send_batch(
     progress: BatchProgressCallback | None = None,
     api_key: str | None = None,
     client: httpx.AsyncClient | None = None,
-) -> list[FileResult]:
+    timeout: httpx.Timeout | None = None,
+    poll_timeout: float | None = 3600.0,
+) -> list[FileResult[UploadResponse]]:
     """Send multiple files with configurable parallelism.
 
-    This is a synchronous wrapper around :func:`async_send_batch`.
+    *timeout* and *poll_timeout* are passed to `async_send_file` for each
+    file.
+
+    This is a synchronous wrapper around `async_send_batch`.
     """
     return asyncio.run(
         async_send_batch(
@@ -297,5 +332,7 @@ def send_batch(
             progress=progress,
             api_key=api_key,
             client=client,
+            timeout=timeout,
+            poll_timeout=poll_timeout,
         )
     )

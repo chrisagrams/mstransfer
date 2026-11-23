@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 import socket
 import sys
 from pathlib import Path
@@ -9,16 +10,25 @@ from typing import TYPE_CHECKING
 
 import httpx
 import uvicorn
+from pydantic import ValidationError
 from rich.live import Live
+from rich.markup import escape
 from rich.table import Table
 
-from mstransfer.client.downloader import DownloadRequest, async_download_batch
-from mstransfer.client.sender import FileResult, async_send_batch
+from mstransfer import __version__
+from mstransfer.client.downloader import (
+    DownloadRequest,
+    DownloadResult,
+    async_download_batch,
+)
+from mstransfer.client.sender import async_send_batch
 from mstransfer.client.utils import resolve_inputs
 from mstransfer.server.auth import APIKeyAuthProvider
 
 if TYPE_CHECKING:
     from rich.progress import TaskID
+
+    from mstransfer.client.results import FileResult
 
 from mstransfer.log import (
     console,
@@ -27,7 +37,7 @@ from mstransfer.log import (
     setup_logging,
 )
 from mstransfer.server.app import create_app
-from mstransfer.server.models import TransferState, UploadResponse
+from mstransfer.server.models import ErrorResponse, TransferState, UploadResponse
 
 
 def parse_target(target: str) -> str:
@@ -56,11 +66,33 @@ def parse_target(target: str) -> str:
     return f"http://{target}:{default_port}"
 
 
+def describe_error(exc: Exception) -> str:
+    """Describe a per-file failure, preferring the server's `detail`.
+
+    httpx's own text for a status error wraps the URL and links to MDN, which
+    pushes the server's actual reason off screen.
+    """
+    if not isinstance(exc, httpx.HTTPStatusError):
+        return str(exc)
+    resp = exc.response
+    status = f"{resp.status_code} {resp.reason_phrase}".strip()
+    try:
+        body = ErrorResponse.model_validate_json(resp.content)
+    except (ValidationError, httpx.ResponseNotRead):
+        return status
+    return f"{status}: {body.detail}"
+
+
 def cmd_serve(args: argparse.Namespace) -> None:
     setup_logging()
 
-    # Fail fast if the port is already in use.
+    # Fail fast if the port is already in use. SO_REUSEADDR matches uvicorn's
+    # listener so TIME-WAIT connections left by a previous server don't block
+    # a restart. On Windows it would allow binding a port another process is
+    # listening on, so leave it off there.
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        if sys.platform != "win32":
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
             sock.bind((args.host, args.port))
         except OSError:
@@ -157,7 +189,7 @@ def cmd_upload(args: argparse.Namespace) -> None:
 
     display = UploadProgressDisplay(len(file_paths))
 
-    async def _run() -> list[FileResult]:
+    async def _run() -> list[FileResult[UploadResponse]]:
         async with httpx.AsyncClient(
             timeout=httpx.Timeout(3600.0, connect=10.0),
         ) as client:
@@ -171,8 +203,15 @@ def cmd_upload(args: argparse.Namespace) -> None:
                 client=client,
             )
 
-    with Live(display.table, console=console, refresh_per_second=10):
-        results = asyncio.run(_run())
+    try:
+        with Live(display.table, console=console, refresh_per_second=10):
+            results = asyncio.run(_run())
+    except KeyboardInterrupt:
+        # Live ends its last frame with a newline only on a terminal.
+        if not console.is_terminal:
+            console.line()
+        console.print("[yellow]Interrupted.")
+        sys.exit(130)
 
     ok = sum(
         1 for r in results if r.response and r.response.state == TransferState.DONE
@@ -183,10 +222,13 @@ def cmd_upload(args: argparse.Namespace) -> None:
         for r in results:
             if r.response and r.response.state == TransferState.DONE:
                 continue
-            err = r.error or (str(r.response.state.value) if r.response else "unknown")
-            console.print(f"  [red]- {r.filename}: {err}")
-    else:
-        console.print(f"\n[green]All {ok} file(s) transferred successfully.")
+            if r.error is not None:
+                err = describe_error(r.error)
+            else:
+                err = r.response.state.value if r.response else "unknown"
+            console.print(f"  [red]- {escape(r.filename)}: {escape(err)}")
+        sys.exit(1)
+    console.print(f"\n[green]All {ok} file(s) transferred successfully.")
 
 
 class DownloadProgressDisplay:
@@ -204,6 +246,9 @@ class DownloadProgressDisplay:
     def on_file_start(self, filename: str, total_bytes: int | None) -> None:
         task_id = self.files.add_task(filename, total=total_bytes)
         self._task_ids[filename] = task_id
+
+    def on_file_total(self, filename: str, total_bytes: int | None) -> None:
+        self.files.update(self._task_ids[filename], total=total_bytes)
 
     def on_file_progress(self, filename: str, bytes_delta: int) -> None:
         self.files.advance(self._task_ids[filename], bytes_delta)
@@ -246,7 +291,7 @@ def cmd_download(args: argparse.Namespace) -> None:
 
     display = DownloadProgressDisplay(len(requests))
 
-    async def _run() -> list[Path]:
+    async def _run() -> list[FileResult[DownloadResult]]:
         async with httpx.AsyncClient(
             timeout=httpx.Timeout(300.0, connect=10.0),
         ) as client:
@@ -258,24 +303,58 @@ def cmd_download(args: argparse.Namespace) -> None:
                 progress=display,
                 skip_existing=args.skip_existing,
                 force=args.force,
+                resume=not args.no_resume,
+                api_key=args.api_key,
                 client=client,
             )
 
-    with Live(display.table, console=console, refresh_per_second=10):
-        results = asyncio.run(_run())
+    try:
+        with Live(display.table, console=console, refresh_per_second=10):
+            results = asyncio.run(_run())
+            # A skipped file never reports a size, so finish its row as skipped
+            # rather than leave it spinning at 0/? bytes.
+            for r in results:
+                if r.response is not None and r.response.skipped:
+                    display.files.update(
+                        display._task_ids[r.filename],
+                        description=f"[yellow]{escape(r.filename)} (skipped)",
+                        total=0,
+                    )
+    except KeyboardInterrupt:
+        # Without --no-resume, interrupted downloads keep their partials.
+        hint = "" if args.no_resume else " Run the same command again to resume."
+        # Live ends its last frame with a newline only on a terminal.
+        if not console.is_terminal:
+            console.line()
+        console.print(f"[yellow]Interrupted.{hint}")
+        sys.exit(130)
 
-    ok = len(results)
-    fail = len(requests) - ok
-    if fail:
-        console.print(f"\n[green]{ok} succeeded[/], [red]{fail} failed[/]")
+    failed = [(r.filename, r.error) for r in results if r.error is not None]
+    skipped = sum(1 for r in results if r.response is not None and r.response.skipped)
+    downloaded = len(results) - len(failed) - skipped
+    summary = f"[green]{downloaded} downloaded[/]"
+    if skipped:
+        summary += f", [yellow]{skipped} skipped (already exist)[/]"
+    if failed:
+        console.print(f"\n{summary}, [red]{len(failed)} failed[/]")
+        for filename, error in failed:
+            console.print(
+                f"  [red]- {escape(filename)}: {escape(describe_error(error))}"
+            )
+        sys.exit(1)
+    if skipped:
+        console.print(f"\n{summary}")
     else:
-        console.print(f"\n[green]All {ok} file(s) downloaded successfully.")
+        console.print(f"\n[green]All {downloaded} file(s) downloaded successfully.")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="mstransfer",
         description=("Transfer mass spectrometry files (mzML/MSZ) between endpoints"),
+    )
+    parser.add_argument(
+        "-V", "--version", action="version", version=f"%(prog)s {__version__}"
     )
     sub = parser.add_subparsers(dest="command")
 
@@ -296,8 +375,8 @@ def main() -> None:
     )
     lp.add_argument(
         "--api-key",
-        default=None,
-        help="Require this API key for all requests",
+        default=os.environ.get("MS_API_KEY"),
+        help="Require this API key for all requests (default: $MS_API_KEY)",
     )
     lp.set_defaults(func=cmd_serve)
 
@@ -329,8 +408,8 @@ def main() -> None:
     )
     sp.add_argument(
         "--api-key",
-        default=None,
-        help="API key for authenticating with the server",
+        default=os.environ.get("MS_API_KEY"),
+        help="API key for authenticating with the server (default: $MS_API_KEY)",
     )
     sp.set_defaults(func=cmd_upload)
 
@@ -375,6 +454,16 @@ def main() -> None:
         "--force",
         action="store_true",
         help="Re-download even if destination file exists",
+    )
+    dp.add_argument(
+        "--no-resume",
+        action="store_true",
+        help="Start interrupted downloads over instead of resuming them",
+    )
+    dp.add_argument(
+        "--api-key",
+        default=os.environ.get("MS_API_KEY"),
+        help="API key for authenticating with the server (default: $MS_API_KEY)",
     )
     dp.set_defaults(func=cmd_download)
 
