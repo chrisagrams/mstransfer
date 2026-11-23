@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
 
 import httpx
 import uvicorn
+from pydantic import ValidationError
 from rich.live import Live
 from rich.markup import escape
 from rich.table import Table
@@ -36,7 +37,7 @@ from mstransfer.log import (
     setup_logging,
 )
 from mstransfer.server.app import create_app
-from mstransfer.server.models import TransferState, UploadResponse
+from mstransfer.server.models import ErrorResponse, TransferState, UploadResponse
 
 
 def parse_target(target: str) -> str:
@@ -76,12 +77,10 @@ def describe_error(exc: Exception) -> str:
     resp = exc.response
     status = f"{resp.status_code} {resp.reason_phrase}".strip()
     try:
-        detail = resp.json().get("detail")
-    except Exception:  # unread, non-JSON, or not an object
-        detail = None
-    if isinstance(detail, str) and detail:
-        return f"{status}: {detail}"
-    return status
+        body = ErrorResponse.model_validate_json(resp.content)
+    except (ValidationError, httpx.ResponseNotRead):
+        return status
+    return f"{status}: {body.detail}"
 
 
 def cmd_serve(args: argparse.Namespace) -> None:
@@ -313,7 +312,7 @@ def cmd_download(args: argparse.Namespace) -> None:
                 if r.response is not None and r.response.skipped:
                     display.files.update(
                         display._task_ids[r.filename],
-                        description=f"[yellow]{r.filename} (skipped)",
+                        description=f"[yellow]{escape(r.filename)} (skipped)",
                         total=0,
                     )
     except KeyboardInterrupt:

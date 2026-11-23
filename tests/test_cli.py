@@ -226,6 +226,7 @@ class TestDescribeError:
             {"text": "<html>Bad Gateway</html>"},
             {"json": {"error": "no detail key"}},
             {"json": {"detail": [{"msg": "not a string"}]}},
+            {"json": {"detail": ""}},
             {"json": ["not", "an", "object"]},
             {},
         ],
