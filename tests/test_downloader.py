@@ -9,13 +9,16 @@ import io
 import json
 import posixpath
 import shutil
+import sys
 import tarfile
 import threading
 import urllib.parse
+from pathlib import Path
 from unittest.mock import patch
 
 import httpx
 import pytest
+from filelock import FileLock
 from mscompress.mszx import compress_batch
 
 from mstransfer.client import DownloadRequest, DownloadResult, FileResult
@@ -464,21 +467,71 @@ class TestDownloadBatch:
         assert "missing.bin" in errors
 
     def test_skip_existing_in_batch(self, served_files, tmp_path):
-        """skip_existing is forwarded to individual downloads."""
+        """Existing files are skipped and flagged; new ones are downloaded."""
         dest = tmp_path / "small.bin"
         dest.write_bytes(b"pre-existing")
 
         requests = [
             DownloadRequest(url=f"{served_files['base_url']}/small.bin", dest=dest),
+            DownloadRequest(
+                url=f"{served_files['base_url']}/medium.bin",
+                dest=tmp_path / "medium.bin",
+            ),
         ]
-        results = download_batch(requests, skip_existing=True)
-        assert results == [
-            FileResult(
-                filename=dest.name,
-                response=DownloadResult(request=requests[0], path=dest),
-            )
+        completed: list[str] = []
+
+        class Tracker:
+            def on_file_start(self, filename: str, total_bytes: int | None) -> None:
+                pass
+
+            def on_file_total(self, filename: str, total_bytes: int | None) -> None:
+                pass
+
+            def on_file_progress(self, filename: str, bytes_delta: int) -> None:
+                pass
+
+            def on_file_complete(self, filename: str) -> None:
+                completed.append(filename)
+
+            def on_file_error(self, filename: str, error: Exception) -> None:
+                pass
+
+        results = download_batch(requests, skip_existing=True, progress=Tracker())
+        assert [r.response for r in results] == [
+            DownloadResult(request=requests[0], path=dest, skipped=True),
+            DownloadResult(request=requests[1], path=tmp_path / "medium.bin"),
         ]
         assert dest.read_bytes() == b"pre-existing"
+        assert (tmp_path / "medium.bin").read_bytes() == b"x" * 10_000
+        assert sorted(completed) == ["medium.bin", "small.bin"]
+
+    def test_force_in_batch_is_not_skipped(self, served_files, tmp_path):
+        """With force, an existing file is downloaded again, not skipped."""
+        dest = tmp_path / "small.bin"
+        dest.write_bytes(b"pre-existing")
+        requests = [
+            DownloadRequest(url=f"{served_files['base_url']}/small.bin", dest=dest),
+        ]
+        results = download_batch(requests, skip_existing=True, force=True)
+        assert results[0].response == DownloadResult(request=requests[0], path=dest)
+        assert dest.read_bytes() == b"hello world"
+
+    def test_skip_existing_archive_dir_in_batch(self, served_batch_mszx, tmp_path):
+        """An existing .mszx archive directory is reported as skipped."""
+        existing = tmp_path / "gone"
+        existing.mkdir()
+        # gone.mszx isn't served, so any request would fail with a 404.
+        requests = [
+            DownloadRequest(
+                url=f"{served_batch_mszx['base_url']}/gone.mszx",
+                dest=tmp_path / "gone.mszx",
+            ),
+        ]
+        results = download_batch(requests, store_as="msz", skip_existing=True)
+        assert results[0].error is None
+        assert results[0].response == DownloadResult(
+            request=requests[0], path=existing, skipped=True
+        )
 
     def test_raising_on_file_complete_is_not_a_failure(self, served_files, tmp_path):
         """A raising on_file_complete leaves the result a success.
@@ -1594,6 +1647,7 @@ class TestResume:
 
         asyncio.run(_run())
         assert (tmp_path / "f.bin.part").read_bytes() == BODY[:3000]
+        assert (tmp_path / "f.bin.part.json").exists()
 
         server = RangeServer(BODY)
         _fetch(server, dest)
@@ -1837,6 +1891,83 @@ class TestResume:
             "f.bin.part",
             "f.bin.part.json",
         ]
+
+    def test_leftover_lock_file_is_removed(self, tmp_path):
+        """A lock file left behind by an older mstransfer is cleaned up."""
+        dest = tmp_path / "f.bin"
+        (tmp_path / "f.bin.part.lock").touch()
+        _fetch(RangeServer(BODY), dest)
+        assert list(tmp_path.iterdir()) == [dest]
+
+    @pytest.mark.skipif(
+        sys.platform == "win32", reason="filelock tries to remove it after release"
+    )
+    def test_lock_file_is_removed_before_release(self, tmp_path):
+        """The lock file goes while held, so nobody can lock it after release."""
+        lock_exists: list[bool] = []
+        release = FileLock.release
+
+        def checked_release(self, *args, **kwargs):
+            lock_exists.append(Path(self.lock_file).exists())
+            return release(self, *args, **kwargs)
+
+        with patch.object(FileLock, "release", checked_release):
+            _fetch(RangeServer(BODY), tmp_path / "f.bin")
+        assert lock_exists
+        assert not any(lock_exists)
+
+    @pytest.mark.skipif(
+        sys.platform == "win32", reason="filelock tries to remove it after release"
+    )
+    def test_lock_file_unlink_failure_still_releases(self, tmp_path):
+        """Failing to remove the lock file neither fails nor keeps the lock."""
+        released: list[str] = []
+        release, unlink = FileLock.release, Path.unlink
+
+        def tracked_release(self, *args, **kwargs):
+            if not kwargs.get("force"):  # Not the release in FileLock.__del__.
+                released.append(self.lock_file)
+            return release(self, *args, **kwargs)
+
+        def failing_unlink(self, *args, **kwargs):
+            if self.name.endswith(".lock"):
+                raise PermissionError(self)
+            return unlink(self, *args, **kwargs)
+
+        dest = tmp_path / "f.bin"
+        with (
+            patch.object(FileLock, "release", tracked_release),
+            patch.object(Path, "unlink", failing_unlink),
+        ):
+            _fetch(RangeServer(BODY), dest)
+        assert dest.read_bytes() == BODY
+        assert released == [str(tmp_path / "f.bin.part.lock")]
+
+    def test_cleanup_failure_still_releases(self, tmp_path):
+        """A failure removing the partial still releases the lock."""
+        released: list[str] = []
+        release, unlink = FileLock.release, Path.unlink
+
+        def tracked_release(self, *args, **kwargs):
+            if not kwargs.get("force"):  # Not the release in FileLock.__del__.
+                released.append(self.lock_file)
+            return release(self, *args, **kwargs)
+
+        def failing_unlink(self, *args, **kwargs):
+            if self.name.endswith(".part"):
+                raise PermissionError(self)
+            return unlink(self, *args, **kwargs)
+
+        # Without an ETag the partial is not kept, so it is removed.
+        server = RangeServer(BODY, etag=None)
+        server.fail_after = 4000
+        with (
+            patch.object(FileLock, "release", tracked_release),
+            patch.object(Path, "unlink", failing_unlink),
+            pytest.raises(PermissionError),
+        ):
+            _fetch(server, tmp_path / "f.bin")
+        assert released == [str(tmp_path / "f.bin.part.lock")]
 
     def test_resumes_from_mstransfer_server(self, tmp_path):
         """Resume works end to end against the mstransfer server."""

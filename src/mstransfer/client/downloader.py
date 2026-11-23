@@ -61,10 +61,15 @@ class DownloadRequest:
 
 @dataclass
 class DownloadResult:
-    """A completed download: the request and where its output was written."""
+    """A completed download: the request and where its output was written.
+
+    *skipped* is *True* when the output already existed and nothing was
+    downloaded (see *skip_existing*).
+    """
 
     request: DownloadRequest
     path: Path
+    skipped: bool = False
 
 
 class _PartialInfo(BaseModel):
@@ -325,21 +330,27 @@ async def async_download_file(
         # the .part of a cancelled download without an ETag, is dead
         # weight.  Cancellation is covered too, as it is not an Exception.
         try:
-            keep = retain and part_path.stat().st_size > 0
-        except FileNotFoundError:
-            keep = False
-        if not keep:
-            part_path.unlink(missing_ok=True)
-        if lock is not None:
+            try:
+                keep = retain and part_path.stat().st_size > 0
+            except FileNotFoundError:
+                keep = False
             if not keep:
-                meta_path.unlink(missing_ok=True)
-            lock.release()
-            if sys.platform == "win32":
-                # filelock removes its lock file on release elsewhere, but not
-                # here.  Windows cannot delete a file another download holds
-                # open, so this never removes a lock that is in use.
-                with contextlib.suppress(OSError):
-                    Path(lock.lock_file).unlink()
+                part_path.unlink(missing_ok=True)
+                if lock is not None:
+                    meta_path.unlink(missing_ok=True)
+        finally:
+            # Release even if cleanup fails, so the lock is never left held.
+            if lock is not None:
+                # filelock tries to remove the lock file after release on
+                # Windows, but not on Unix, so remove it here while still
+                # holding the lock.  A download that opened the old file
+                # meanwhile then fails to lock it, as filelock rejects a lock
+                # on an unlinked file.  A file left behind is harmless: a later
+                # download removes it.
+                if sys.platform != "win32":
+                    with contextlib.suppress(OSError):
+                        Path(lock.lock_file).unlink(missing_ok=True)
+                lock.release()
 
 
 async def async_download_batch(
@@ -394,7 +405,9 @@ async def async_download_batch(
     list[FileResult[DownloadResult]]
         One result per request, in input order, named after the request's
         *dest*, carrying either a :class:`DownloadResult` or the error.  A
-        multi-member ``.mszx`` yields its archive directory as the path.
+        multi-member ``.mszx`` yields its archive directory as the path.  A
+        file skipped by *skip_existing* has ``skipped`` set and is still
+        reported to *progress* as complete.
     """
     workers = min(parallel, len(files))
     sem = asyncio.Semaphore(workers)
@@ -419,26 +432,33 @@ async def async_download_batch(
                 file_progress = _FileProgressAdapter(filename, progress)
 
             try:
-                result = await async_download_file(
-                    req.url,
-                    req.dest,
-                    store_as=store_as,
-                    chunk_size=chunk_size,
-                    timeout=timeout,
-                    progress_callback=file_progress,
-                    skip_existing=skip_existing,
-                    force=force,
-                    resume=resume,
-                    api_key=api_key,
-                    client=client,
-                )
+                plan = StorePlan.for_download(req.url, req.dest, store_as)
+                existing = plan.existing() if skip_existing and not force else None
+                if existing is not None:
+                    logger.info("Skipping existing output: %s", existing)
+                    result = DownloadResult(request=req, path=existing, skipped=True)
+                else:
+                    path = await async_download_file(
+                        req.url,
+                        req.dest,
+                        store_as=store_as,
+                        chunk_size=chunk_size,
+                        timeout=timeout,
+                        progress_callback=file_progress,
+                        skip_existing=skip_existing,
+                        force=force,
+                        resume=resume,
+                        api_key=api_key,
+                        client=client,
+                    )
+                    result = DownloadResult(request=req, path=path)
             except Exception as exc:
                 results[idx].error = exc
                 if progress:
                     progress.on_file_error(filename, exc)
                 logger.error("Failed to download %s: %s", filename, exc)
             else:
-                results[idx].response = DownloadResult(request=req, path=result)
+                results[idx].response = result
                 # A raising callback must not turn a finished download into
                 # a failure, or abort the rest of the batch.
                 if progress:

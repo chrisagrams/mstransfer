@@ -3,6 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
+import io
+import json
+import re
+import signal
 import socket
 import sys
 from pathlib import Path
@@ -10,6 +15,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
+from rich.console import Console
 
 from mstransfer import __version__
 from mstransfer.cli import (
@@ -464,6 +470,30 @@ class TestCmdUpload:
         assert "developer.mozilla.org" not in out
         assert "Client error" not in out
 
+    @patch("mstransfer.cli.async_send_batch", new_callable=AsyncMock)
+    @patch("mstransfer.cli.httpx.get")
+    @patch("mstransfer.cli.resolve_inputs")
+    def test_ctrl_c_exits_130_without_traceback(
+        self, mock_resolve, mock_get, mock_send_batch, cli_console
+    ):
+        """Ctrl-C cancels the uploads and exits 130 without a resume hint."""
+        mock_resolve.return_value = [Path("/data/a.mzML")]
+        mock_get.return_value = MagicMock(status_code=200)
+        cancelled: list[bool] = []
+        mock_send_batch.side_effect = _interrupted_batch(
+            cancelled, lambda p: p.file_started(0, Path("/data/a.mzML"), None)
+        )
+
+        with pytest.raises(SystemExit) as exc_info:
+            cmd_upload(self._make_args(["/data/a.mzML", "host"]))
+
+        assert exc_info.value.code == 130
+        assert cancelled == [True]
+        # The message follows the progress rows on a line of its own.
+        before, last = _last_lines(cli_console)
+        assert "a.mzML" in before
+        assert last == "Interrupted."
+
 
 # ---------------------------------------------------------------------------
 # UploadProgressDisplay tests
@@ -549,6 +579,38 @@ class TestUploadProgressDisplay:
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture(params=[True, False], ids=["terminal", "pipe"])
+def cli_console(request):
+    """Send CLI output to a terminal or a pipe, returning what was written."""
+    out = io.StringIO()
+    console = Console(file=out, force_terminal=request.param, width=100)
+    with patch("mstransfer.cli.console", console):
+        yield out
+
+
+def _last_lines(out: io.StringIO) -> tuple[str, str]:
+    """The last two lines written, without styling."""
+    text = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]|\r", "", out.getvalue())
+    assert text.endswith("\n")
+    before, last = text[:-1].split("\n")[-2:]
+    return before, last
+
+
+def _interrupted_batch(cancelled: list[bool], start_file):
+    """A batch that starts a file, presses Ctrl-C and records being cancelled."""
+
+    async def _batch(*args, progress, **kwargs):
+        start_file(progress)
+        signal.raise_signal(signal.SIGINT)
+        try:
+            await asyncio.sleep(10)
+        except asyncio.CancelledError:
+            cancelled.append(True)
+            raise
+
+    return _batch
+
+
 def _ok_result(dest):
     req = DownloadRequest(url="http://host/x", dest=dest)
     return FileResult(
@@ -629,7 +691,7 @@ class TestCmdDownload:
             cmd_download(args)
 
         out = capsys.readouterr().out
-        assert "1 succeeded" in out
+        assert "1 downloaded" in out
         assert "1 failed" in out
         assert "b.msz: boom" in out
         assert "a.msz:" not in out
@@ -672,6 +734,90 @@ class TestCmdDownload:
         assert f"- nope.msz: {expected}" in out
         assert "developer.mozilla.org" not in out
         assert "Client error" not in out
+
+    @patch("mstransfer.cli.async_download_batch", new_callable=AsyncMock)
+    def test_skip_existing_counts_skips(self, mock_batch, tmp_path, capsys):
+        """Skipped files are counted and shown as skipped, not as downloaded."""
+        seen = {}
+
+        async def _batch(requests, *, progress, **kwargs):
+            seen["display"] = progress
+            results = []
+            for req in requests:
+                progress.on_file_start(req.dest.name, None)
+                skipped = req.dest.name != "new.msz"
+                if not skipped:
+                    progress.on_file_total(req.dest.name, 10)
+                    progress.on_file_progress(req.dest.name, 10)
+                progress.on_file_complete(req.dest.name)
+                results.append(
+                    FileResult(
+                        filename=req.dest.name,
+                        response=DownloadResult(
+                            request=req, path=req.dest, skipped=skipped
+                        ),
+                    )
+                )
+            return results
+
+        mock_batch.side_effect = _batch
+
+        args = self._make_args(
+            [
+                "http://host/new.msz",
+                "http://host/old1.msz",
+                "http://host/old2.msz",
+            ],
+            output_dir=str(tmp_path),
+            skip_existing=True,
+        )
+        cmd_download(args)  # a skip is not a failure: no SystemExit
+
+        out = capsys.readouterr().out
+        assert "1 downloaded, 2 skipped (already exist)" in out
+        assert "successfully" not in out
+        display = seen["display"]
+        new = display.files.tasks[display._task_ids["new.msz"]]
+        assert new.description == "[green]new.msz"
+        for name in ("old1.msz", "old2.msz"):
+            task = display.files.tasks[display._task_ids[name]]
+            assert task.description == f"[yellow]{name} (skipped)"
+            assert task.finished
+
+    @patch("mstransfer.cli.async_download_batch", new_callable=AsyncMock)
+    def test_skip_with_failure(self, mock_batch, tmp_path, capsys):
+        """Downloaded, skipped and failed files are all counted."""
+
+        async def _batch(requests, *, progress, **kwargs):
+            for name in ("a.msz", "b.msz"):
+                progress.on_file_start(name, None)
+                progress.on_file_complete(name)
+            progress.on_file_start("c.msz", None)
+            progress.on_file_error("c.msz", RuntimeError("boom"))
+            return [
+                _ok_result(requests[0].dest),
+                FileResult(
+                    filename="b.msz",
+                    response=DownloadResult(
+                        request=requests[1], path=requests[1].dest, skipped=True
+                    ),
+                ),
+                FileResult(filename="c.msz", error=RuntimeError("boom")),
+            ]
+
+        mock_batch.side_effect = _batch
+
+        args = self._make_args(
+            ["http://host/a.msz", "http://host/b.msz", "http://host/c.msz"],
+            output_dir=str(tmp_path),
+            skip_existing=True,
+        )
+        with pytest.raises(SystemExit, match="1"):
+            cmd_download(args)
+
+        out = capsys.readouterr().out
+        assert "1 downloaded, 1 skipped (already exist), 1 failed" in out
+        assert "c.msz: boom" in out
 
     @patch("mstransfer.cli.async_download_batch", new_callable=AsyncMock)
     def test_passes_store_as(self, mock_batch, tmp_path):
@@ -731,6 +877,72 @@ class TestCmdDownload:
         cmd_download(args)
 
         assert mock_batch.call_args[1]["api_key"] == "secret"
+
+    @pytest.mark.parametrize(
+        ("no_resume", "hint"),
+        [(False, True), (True, False)],
+    )
+    @patch("mstransfer.cli.async_download_batch", new_callable=AsyncMock)
+    def test_ctrl_c_exits_130_without_traceback(
+        self, mock_batch, tmp_path, cli_console, no_resume, hint
+    ):
+        """Ctrl-C cancels the downloads, exits 130 and says how to resume."""
+        cancelled: list[bool] = []
+        mock_batch.side_effect = _interrupted_batch(
+            cancelled, lambda p: p.on_file_start("file.msz", None)
+        )
+
+        args = self._make_args(
+            ["http://host/file.msz"], output_dir=str(tmp_path), no_resume=no_resume
+        )
+        with pytest.raises(SystemExit) as exc_info:
+            cmd_download(args)
+
+        assert exc_info.value.code == 130
+        assert cancelled == [True]
+        message = "Interrupted." + (
+            " Run the same command again to resume." if hint else ""
+        )
+        # The message follows the progress rows on a line of its own.
+        before, last = _last_lines(cli_console)
+        assert "file.msz" in before
+        assert last == message
+
+    def test_ctrl_c_keeps_resumable_partial(self, tmp_path):
+        """A real Ctrl-C mid-download keeps the .part and its .part.json."""
+        body = bytes(range(256)) * 40
+
+        class Stalls(httpx.AsyncByteStream):
+            async def __aiter__(self):
+                yield body[:3000]
+                signal.raise_signal(signal.SIGINT)
+                await asyncio.Event().wait()
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            headers = {"etag": '"v1"', "content-length": str(len(body))}
+            return httpx.Response(200, headers=headers, stream=Stalls())
+
+        real_client = httpx.AsyncClient
+        args = self._make_args(
+            ["http://host/file.bin"], output_dir=str(tmp_path), chunk_size=1000
+        )
+        with (
+            patch(
+                "mstransfer.cli.httpx.AsyncClient",
+                lambda **kw: real_client(transport=httpx.MockTransport(handler), **kw),
+            ),
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            cmd_download(args)
+
+        assert exc_info.value.code == 130
+        assert (tmp_path / "file.bin.part").read_bytes() == body[:3000]
+        meta = json.loads((tmp_path / "file.bin.part.json").read_text())
+        assert meta == {
+            "url": "http://host/file.bin",
+            "etag": '"v1"',
+            "total": len(body),
+        }
 
 
 # ---------------------------------------------------------------------------
