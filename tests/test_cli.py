@@ -3,6 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
+import io
+import json
+import re
+import signal
 import socket
 import sys
 from pathlib import Path
@@ -10,17 +15,20 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
+from rich.console import Console
 
+from mstransfer import __version__
 from mstransfer.cli import (
     DownloadProgressDisplay,
     UploadProgressDisplay,
     cmd_download,
     cmd_serve,
     cmd_upload,
+    describe_error,
     main,
     parse_target,
 )
-from mstransfer.client.sender import FileResult
+from mstransfer.client import DownloadRequest, DownloadResult, FileResult
 from mstransfer.server.models import (
     TransferState,
     UploadResponse,
@@ -180,20 +188,85 @@ class TestCmdServe:
         )
 
     def test_serve_port_in_use_exits(self):
-        """If the port is already bound, cmd_serve should exit with code 1."""
-        # Bind a port so it's "in use"
+        """If another process is listening on the port, cmd_serve exits 1."""
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.bind(("127.0.0.1", 0))
+            s.listen()
             port = s.getsockname()[1]
 
             args = self._make_args(host="127.0.0.1", port=port)
             with pytest.raises(SystemExit, match="1"):
                 cmd_serve(args)
 
+    @pytest.mark.skipif(
+        sys.platform == "win32", reason="probe skips SO_REUSEADDR on Windows"
+    )
+    @patch("mstransfer.cli.uvicorn.run")
+    @patch("mstransfer.cli.create_app")
+    def test_serve_starts_with_time_wait_connections(self, mock_create_app, mock_run):
+        """TIME-WAIT connections left by a killed server must not block a restart."""
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as srv:
+            srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            srv.bind(("127.0.0.1", 0))
+            srv.listen()
+            port = srv.getsockname()[1]
+            with socket.create_connection(("127.0.0.1", port)) as client:
+                conn, _ = srv.accept()
+                # Server side closes first, so its end goes into TIME-WAIT.
+                conn.close()
+                client.recv(1)
+
+        args = self._make_args(host="127.0.0.1", port=port)
+        cmd_serve(args)
+
+        mock_run.assert_called_once()
+
 
 # ---------------------------------------------------------------------------
 # cmd_upload tests
 # ---------------------------------------------------------------------------
+
+
+def _status_error(status: int, **response_kwargs) -> httpx.HTTPStatusError:
+    """The error ``raise_for_status`` raises for a *status* response."""
+    request = httpx.Request("POST", "http://host:1319/v1/upload")
+    response = httpx.Response(status, request=request, **response_kwargs)
+    try:
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        return exc
+    raise AssertionError(f"{status} is not an error status")
+
+
+class TestDescribeError:
+    def test_server_detail(self):
+        exc = _status_error(409, json={"detail": "run1.msz already exists"})
+        assert describe_error(exc) == "409 Conflict: run1.msz already exists"
+
+    @pytest.mark.parametrize(
+        "response_kwargs",
+        [
+            {"text": "<html>Bad Gateway</html>"},
+            {"json": {"error": "no detail key"}},
+            {"json": {"detail": [{"msg": "not a string"}]}},
+            {"json": {"detail": ""}},
+            {"json": ["not", "an", "object"]},
+            {},
+        ],
+    )
+    def test_falls_back_to_status_line(self, response_kwargs):
+        exc = _status_error(502, **response_kwargs)
+        assert describe_error(exc) == "502 Bad Gateway"
+
+    def test_unread_streamed_body_falls_back(self):
+        """A streamed error whose body was never read still gets a status."""
+        request = httpx.Request("GET", "http://host:1319/v1/files/a.msz")
+        response = httpx.Response(404, request=request, stream=httpx.ByteStream(b"{}"))
+        exc = httpx.HTTPStatusError("404", request=request, response=response)
+        assert describe_error(exc) == "404 Not Found"
+
+    def test_other_errors_use_their_own_text(self):
+        assert describe_error(ConnectionError("Connection reset")) == "Connection reset"
 
 
 class TestCmdUpload:
@@ -314,7 +387,7 @@ class TestCmdUpload:
                     bytes_received=100,
                 ),
             ),
-            FileResult(filename="b.msz", error="Connection reset"),
+            FileResult(filename="b.msz", error=ConnectionError("Connection reset")),
         ]
 
         args = self._make_args(["/data/a.mzML", "/data/b.msz", "host"])
@@ -379,6 +452,71 @@ class TestCmdUpload:
         args = self._make_args(["/data/a.mzML", "host"])
         with pytest.raises(SystemExit, match="1"):
             cmd_upload(args)
+
+    @pytest.mark.parametrize(
+        ("status", "detail", "expected"),
+        [
+            (
+                401,
+                "Invalid or missing API key",
+                "401 Unauthorized: Invalid or missing API key",
+            ),
+            (404, "File not found", "404 Not Found: File not found"),
+            (
+                409,
+                "run1.msz already exists on the server",
+                "409 Conflict: run1.msz already exists on the server",
+            ),
+        ],
+    )
+    @patch("mstransfer.cli.async_send_batch", new_callable=AsyncMock)
+    @patch("mstransfer.cli.httpx.get")
+    @patch("mstransfer.cli.resolve_inputs")
+    def test_http_error_shows_server_detail(
+        self, mock_resolve, mock_get, mock_send_batch, status, detail, expected, capsys
+    ):
+        """Regression test for #99: show the server's reason, not httpx's text."""
+        mock_resolve.return_value = [Path("/data/run1.msz")]
+        mock_get.return_value = MagicMock(status_code=200)
+        mock_send_batch.return_value = [
+            FileResult(
+                filename="run1.msz",
+                error=_status_error(status, json={"detail": detail}),
+            ),
+        ]
+
+        args = self._make_args(["/data/run1.msz", "host"])
+        with pytest.raises(SystemExit, match="1"):
+            cmd_upload(args)
+
+        out = " ".join(capsys.readouterr().out.split())
+        assert f"- run1.msz: {expected}" in out
+        assert "developer.mozilla.org" not in out
+        assert "Client error" not in out
+
+    @patch("mstransfer.cli.async_send_batch", new_callable=AsyncMock)
+    @patch("mstransfer.cli.httpx.get")
+    @patch("mstransfer.cli.resolve_inputs")
+    def test_ctrl_c_exits_130_without_traceback(
+        self, mock_resolve, mock_get, mock_send_batch, cli_console
+    ):
+        """Ctrl-C cancels the uploads and exits 130 without a resume hint."""
+        mock_resolve.return_value = [Path("/data/a.mzML")]
+        mock_get.return_value = MagicMock(status_code=200)
+        cancelled: list[bool] = []
+        mock_send_batch.side_effect = _interrupted_batch(
+            cancelled, lambda p: p.file_started(0, Path("/data/a.mzML"), None)
+        )
+
+        with pytest.raises(SystemExit) as exc_info:
+            cmd_upload(self._make_args(["/data/a.mzML", "host"]))
+
+        assert exc_info.value.code == 130
+        assert cancelled == [True]
+        # The message follows the progress rows on a line of its own.
+        before, last = _last_lines(cli_console)
+        assert "a.mzML" in before
+        assert last == "Interrupted."
 
 
 # ---------------------------------------------------------------------------
@@ -465,6 +603,45 @@ class TestUploadProgressDisplay:
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture(params=[True, False], ids=["terminal", "pipe"])
+def cli_console(request):
+    """Send CLI output to a terminal or a pipe, returning what was written."""
+    out = io.StringIO()
+    console = Console(file=out, force_terminal=request.param, width=100)
+    with patch("mstransfer.cli.console", console):
+        yield out
+
+
+def _last_lines(out: io.StringIO) -> tuple[str, str]:
+    """The last two lines written, without styling."""
+    text = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]|\r", "", out.getvalue())
+    assert text.endswith("\n")
+    before, last = text[:-1].split("\n")[-2:]
+    return before, last
+
+
+def _interrupted_batch(cancelled: list[bool], start_file):
+    """A batch that starts a file, presses Ctrl-C and records being cancelled."""
+
+    async def _batch(*args, progress, **kwargs):
+        start_file(progress)
+        signal.raise_signal(signal.SIGINT)
+        try:
+            await asyncio.sleep(10)
+        except asyncio.CancelledError:
+            cancelled.append(True)
+            raise
+
+    return _batch
+
+
+def _ok_result(dest):
+    req = DownloadRequest(url="http://host/x", dest=dest)
+    return FileResult(
+        filename=dest.name, response=DownloadResult(request=req, path=dest)
+    )
+
+
 class TestCmdDownload:
     def _make_args(self, urls, **overrides):
         defaults = {
@@ -475,6 +652,8 @@ class TestCmdDownload:
             "chunk_size": 1_048_576,
             "skip_existing": False,
             "force": False,
+            "no_resume": False,
+            "api_key": None,
         }
         defaults.update(overrides)
         return argparse.Namespace(**defaults)
@@ -488,7 +667,7 @@ class TestCmdDownload:
     @patch("mstransfer.cli.async_download_batch", new_callable=AsyncMock)
     def test_successful_download(self, mock_batch, tmp_path):
         dest = tmp_path / "file.msz"
-        mock_batch.return_value = [dest]
+        mock_batch.return_value = [_ok_result(dest)]
 
         args = self._make_args(
             ["http://host/file.msz"],
@@ -500,17 +679,31 @@ class TestCmdDownload:
         call_kwargs = mock_batch.call_args[1]
         assert call_kwargs["parallel"] == 4
         assert call_kwargs["store_as"] is None
+        assert call_kwargs["resume"] is True
 
     @patch("mstransfer.cli.async_download_batch", new_callable=AsyncMock)
-    def test_partial_failure(self, mock_batch, tmp_path):
-        """Any failed download makes the command exit non-zero."""
+    def test_no_resume(self, mock_batch, tmp_path):
+        """--no-resume turns resuming off."""
+        mock_batch.return_value = [_ok_result(tmp_path / "file.msz")]
+        args = self._make_args(
+            ["http://host/file.msz"], output_dir=str(tmp_path), no_resume=True
+        )
+        cmd_download(args)
+        assert mock_batch.call_args[1]["resume"] is False
+
+    @patch("mstransfer.cli.async_download_batch", new_callable=AsyncMock)
+    def test_partial_failure(self, mock_batch, tmp_path, capsys):
+        """A failed download exits non-zero and names the file and the error."""
 
         async def _batch(requests, *, progress, **kwargs):
             progress.on_file_start("a.msz", 10)
             progress.on_file_complete("a.msz")
             progress.on_file_start("b.msz", 10)
             progress.on_file_error("b.msz", RuntimeError("boom"))
-            return [tmp_path / "a.msz"]
+            return [
+                _ok_result(requests[0].dest),
+                FileResult(filename="b.msz", error=RuntimeError("boom")),
+            ]
 
         mock_batch.side_effect = _batch
 
@@ -521,9 +714,138 @@ class TestCmdDownload:
         with pytest.raises(SystemExit, match="1"):
             cmd_download(args)
 
+        out = capsys.readouterr().out
+        assert "1 downloaded" in out
+        assert "1 failed" in out
+        assert "b.msz: boom" in out
+        assert "a.msz:" not in out
+
+    @pytest.mark.parametrize(
+        ("status", "detail", "expected"),
+        [
+            (
+                401,
+                "Invalid or missing API key",
+                "401 Unauthorized: Invalid or missing API key",
+            ),
+            (404, "File not found", "404 Not Found: File not found"),
+            (409, "Conflict here", "409 Conflict: Conflict here"),
+            # Server text is printed literally, not read as Rich markup.
+            (
+                400,
+                "Unsupported [bold]x[/bold]",
+                "400 Bad Request: Unsupported [bold]x[/bold]",
+            ),
+        ],
+    )
+    @patch("mstransfer.cli.async_download_batch", new_callable=AsyncMock)
+    def test_http_error_shows_server_detail(
+        self, mock_batch, tmp_path, capsys, status, detail, expected
+    ):
+        """Regression test for #99: show the server's reason, not httpx's text."""
+        mock_batch.return_value = [
+            FileResult(
+                filename="nope.msz",
+                error=_status_error(status, json={"detail": detail}),
+            ),
+        ]
+
+        args = self._make_args(["http://host/nope.msz"], output_dir=str(tmp_path))
+        with pytest.raises(SystemExit, match="1"):
+            cmd_download(args)
+
+        out = " ".join(capsys.readouterr().out.split())
+        assert f"- nope.msz: {expected}" in out
+        assert "developer.mozilla.org" not in out
+        assert "Client error" not in out
+
+    @patch("mstransfer.cli.async_download_batch", new_callable=AsyncMock)
+    def test_skip_existing_counts_skips(self, mock_batch, tmp_path, capsys):
+        """Skipped files are counted and shown as skipped, not as downloaded."""
+        seen = {}
+
+        async def _batch(requests, *, progress, **kwargs):
+            seen["display"] = progress
+            results = []
+            for req in requests:
+                progress.on_file_start(req.dest.name, None)
+                skipped = req.dest.name != "new.msz"
+                if not skipped:
+                    progress.on_file_total(req.dest.name, 10)
+                    progress.on_file_progress(req.dest.name, 10)
+                progress.on_file_complete(req.dest.name)
+                results.append(
+                    FileResult(
+                        filename=req.dest.name,
+                        response=DownloadResult(
+                            request=req, path=req.dest, skipped=skipped
+                        ),
+                    )
+                )
+            return results
+
+        mock_batch.side_effect = _batch
+
+        args = self._make_args(
+            [
+                "http://host/new.msz",
+                "http://host/old1.msz",
+                "http://host/old2.msz",
+            ],
+            output_dir=str(tmp_path),
+            skip_existing=True,
+        )
+        cmd_download(args)  # a skip is not a failure: no SystemExit
+
+        out = capsys.readouterr().out
+        assert "1 downloaded, 2 skipped (already exist)" in out
+        assert "successfully" not in out
+        display = seen["display"]
+        new = display.files.tasks[display._task_ids["new.msz"]]
+        assert new.description == "[green]new.msz"
+        for name in ("old1.msz", "old2.msz"):
+            task = display.files.tasks[display._task_ids[name]]
+            assert task.description == f"[yellow]{name} (skipped)"
+            assert task.finished
+
+    @patch("mstransfer.cli.async_download_batch", new_callable=AsyncMock)
+    def test_skip_with_failure(self, mock_batch, tmp_path, capsys):
+        """Downloaded, skipped and failed files are all counted."""
+
+        async def _batch(requests, *, progress, **kwargs):
+            for name in ("a.msz", "b.msz"):
+                progress.on_file_start(name, None)
+                progress.on_file_complete(name)
+            progress.on_file_start("c.msz", None)
+            progress.on_file_error("c.msz", RuntimeError("boom"))
+            return [
+                _ok_result(requests[0].dest),
+                FileResult(
+                    filename="b.msz",
+                    response=DownloadResult(
+                        request=requests[1], path=requests[1].dest, skipped=True
+                    ),
+                ),
+                FileResult(filename="c.msz", error=RuntimeError("boom")),
+            ]
+
+        mock_batch.side_effect = _batch
+
+        args = self._make_args(
+            ["http://host/a.msz", "http://host/b.msz", "http://host/c.msz"],
+            output_dir=str(tmp_path),
+            skip_existing=True,
+        )
+        with pytest.raises(SystemExit, match="1"):
+            cmd_download(args)
+
+        out = capsys.readouterr().out
+        assert "1 downloaded, 1 skipped (already exist), 1 failed" in out
+        assert "c.msz: boom" in out
+
     @patch("mstransfer.cli.async_download_batch", new_callable=AsyncMock)
     def test_passes_store_as(self, mock_batch, tmp_path):
-        mock_batch.return_value = [tmp_path / "file.mzML"]
+        mock_batch.return_value = [_ok_result(tmp_path / "file.mzML")]
 
         args = self._make_args(
             ["http://host/file.msz"],
@@ -537,7 +859,7 @@ class TestCmdDownload:
 
     @patch("mstransfer.cli.async_download_batch", new_callable=AsyncMock)
     def test_passes_parallel_and_chunk_size(self, mock_batch, tmp_path):
-        mock_batch.return_value = [tmp_path / "file.msz"]
+        mock_batch.return_value = [_ok_result(tmp_path / "file.msz")]
 
         args = self._make_args(
             ["http://host/file.msz"],
@@ -566,6 +888,85 @@ class TestCmdDownload:
         call_kwargs = mock_batch.call_args[1]
         assert call_kwargs["skip_existing"] is True
         assert call_kwargs["force"] is True
+
+    @patch("mstransfer.cli.async_download_batch", new_callable=AsyncMock)
+    def test_passes_api_key(self, mock_batch, tmp_path):
+        mock_batch.return_value = [_ok_result(tmp_path / "file.msz")]
+
+        args = self._make_args(
+            ["http://host/file.msz"],
+            output_dir=str(tmp_path),
+            api_key="secret",
+        )
+        cmd_download(args)
+
+        assert mock_batch.call_args[1]["api_key"] == "secret"
+
+    @pytest.mark.parametrize(
+        ("no_resume", "hint"),
+        [(False, True), (True, False)],
+    )
+    @patch("mstransfer.cli.async_download_batch", new_callable=AsyncMock)
+    def test_ctrl_c_exits_130_without_traceback(
+        self, mock_batch, tmp_path, cli_console, no_resume, hint
+    ):
+        """Ctrl-C cancels the downloads, exits 130 and says how to resume."""
+        cancelled: list[bool] = []
+        mock_batch.side_effect = _interrupted_batch(
+            cancelled, lambda p: p.on_file_start("file.msz", None)
+        )
+
+        args = self._make_args(
+            ["http://host/file.msz"], output_dir=str(tmp_path), no_resume=no_resume
+        )
+        with pytest.raises(SystemExit) as exc_info:
+            cmd_download(args)
+
+        assert exc_info.value.code == 130
+        assert cancelled == [True]
+        message = "Interrupted." + (
+            " Run the same command again to resume." if hint else ""
+        )
+        # The message follows the progress rows on a line of its own.
+        before, last = _last_lines(cli_console)
+        assert "file.msz" in before
+        assert last == message
+
+    def test_ctrl_c_keeps_resumable_partial(self, tmp_path):
+        """A real Ctrl-C mid-download keeps the .part and its .part.json."""
+        body = bytes(range(256)) * 40
+
+        class Stalls(httpx.AsyncByteStream):
+            async def __aiter__(self):
+                yield body[:3000]
+                signal.raise_signal(signal.SIGINT)
+                await asyncio.Event().wait()
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            headers = {"etag": '"v1"', "content-length": str(len(body))}
+            return httpx.Response(200, headers=headers, stream=Stalls())
+
+        real_client = httpx.AsyncClient
+        args = self._make_args(
+            ["http://host/file.bin"], output_dir=str(tmp_path), chunk_size=1000
+        )
+        with (
+            patch(
+                "mstransfer.cli.httpx.AsyncClient",
+                lambda **kw: real_client(transport=httpx.MockTransport(handler), **kw),
+            ),
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            cmd_download(args)
+
+        assert exc_info.value.code == 130
+        assert (tmp_path / "file.bin.part").read_bytes() == body[:3000]
+        meta = json.loads((tmp_path / "file.bin.part.json").read_text())
+        assert meta == {
+            "url": "http://host/file.bin",
+            "etag": '"v1"',
+            "total": len(body),
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -606,15 +1007,6 @@ class TestDownloadProgressDisplay:
 
         task = display.files.tasks[display._task_ids["a.msz"]]
         assert task.description == "[green]a.msz"
-
-    def test_on_file_error_counts_failures(self):
-        display = DownloadProgressDisplay(total_files=2)
-        display.on_file_start("a.msz", total_bytes=None)
-        display.on_file_start("b.msz", total_bytes=None)
-        display.on_file_complete("a.msz")
-        display.on_file_error("b.msz", RuntimeError("boom"))
-
-        assert display.failed == 1
 
     def test_on_file_error_marks_red(self):
         display = DownloadProgressDisplay(total_files=1)
@@ -672,6 +1064,43 @@ class TestMain:
             main()
         mock_cmd_download.assert_called_once()
 
+    @patch("mstransfer.cli.cmd_download")
+    def test_main_download_accepts_api_key(self, mock_cmd_download):
+        argv = ["mstransfer", "download", "http://host/f.msz", "--api-key", "k"]
+        with patch("sys.argv", argv):
+            main()
+        assert mock_cmd_download.call_args[0][0].api_key == "k"
+
+    @pytest.mark.parametrize(
+        ("argv", "cmd"),
+        [
+            (["serve"], "cmd_serve"),
+            (["upload", "file.mzML", "host"], "cmd_upload"),
+            (["download", "http://host/f.msz"], "cmd_download"),
+        ],
+    )
+    @pytest.mark.parametrize(
+        ("env", "flag", "expected"),
+        [
+            ("from-env", [], "from-env"),
+            ("from-env", ["--api-key", "from-flag"], "from-flag"),
+            (None, [], None),
+            ("", [], ""),
+        ],
+    )
+    def test_api_key_from_env(self, monkeypatch, argv, cmd, env, flag, expected):
+        """--api-key falls back to $MS_API_KEY; the flag wins over it."""
+        if env is None:
+            monkeypatch.delenv("MS_API_KEY", raising=False)
+        else:
+            monkeypatch.setenv("MS_API_KEY", env)
+        with (
+            patch(f"mstransfer.cli.{cmd}") as mock_cmd,
+            patch("sys.argv", ["mstransfer", *argv, *flag]),
+        ):
+            main()
+        assert mock_cmd.call_args[0][0].api_key == expected
+
     def test_main_no_command_prints_help(self, capsys):
         with patch("sys.argv", ["mstransfer"]), pytest.raises(SystemExit) as exc_info:
             main()
@@ -679,3 +1108,10 @@ class TestMain:
         captured = capsys.readouterr()
         assert "usage: mstransfer" in captured.out
         assert "{serve,upload,download}" in captured.out
+
+    @pytest.mark.parametrize("flag", ["--version", "-V"])
+    def test_main_version_flag(self, capsys, flag):
+        with patch("sys.argv", ["mstransfer", flag]), pytest.raises(SystemExit) as exc:
+            main()
+        assert exc.value.code == 0
+        assert capsys.readouterr().out == f"mstransfer {__version__}\n"

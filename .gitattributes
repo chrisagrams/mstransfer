@@ -1,0 +1,5 @@
+# Test fixtures must stay byte-identical on every platform; a CRLF checkout
+# on Windows changes the mzML's size and breaks round-trip comparisons.
+*.mzML -text
+*.msz binary
+*.mszx binary

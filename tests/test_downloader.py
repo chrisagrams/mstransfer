@@ -9,23 +9,27 @@ import io
 import json
 import posixpath
 import shutil
+import sys
 import tarfile
 import threading
 import urllib.parse
+from pathlib import Path
 from unittest.mock import patch
 
 import httpx
 import pytest
+from filelock import FileLock
 from mscompress.mszx import compress_batch
 
+from mstransfer.client import DownloadRequest, DownloadResult, FileResult
 from mstransfer.client.downloader import (
-    DownloadRequest,
     _FileProgressAdapter,
     async_download_batch,
     async_download_file,
     download_batch,
     download_file,
 )
+from mstransfer.server.app import create_app
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -125,11 +129,9 @@ class TestDownloadFile:
 
     def test_atomic_write_no_partial_file(self, served_files, tmp_path):
         """The .part file should not exist after a successful download."""
-        dest = tmp_path / "small.bin"
+        dest = tmp_path / "out" / "small.bin"
         download_file(f"{served_files['base_url']}/small.bin", dest)
-        part_path = dest.with_suffix(dest.suffix + ".part")
-        assert not part_path.exists()
-        assert dest.exists()
+        assert list(dest.parent.iterdir()) == [dest]
 
     def test_progress_callback(self, served_files, tmp_path):
         """Progress callback is invoked with byte deltas."""
@@ -203,11 +205,72 @@ class TestDownloadFile:
 
     def test_http_404_raises(self, served_files, tmp_path):
         """HTTP 404 raises an httpx.HTTPStatusError."""
-        dest = tmp_path / "missing.bin"
+        dest = tmp_path / "out" / "missing.bin"
         with pytest.raises(httpx.HTTPStatusError):
             download_file(f"{served_files['base_url']}/nonexistent", dest)
         # No partial file should remain.
-        assert not dest.exists()
+        assert list(dest.parent.iterdir()) == []
+
+    def test_failed_stream_removes_part_file(self, tmp_path):
+        """A body that fails partway leaves no .part file behind."""
+
+        class FailingStream(httpx.AsyncByteStream):
+            async def __aiter__(self):
+                yield b"partial"
+                raise httpx.ReadError("connection lost")
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, stream=FailingStream())
+
+        async def _run() -> None:
+            async with httpx.AsyncClient(
+                transport=httpx.MockTransport(handler)
+            ) as client:
+                await async_download_file(
+                    "http://test/f.bin",
+                    tmp_path / "f.bin",
+                    chunk_size=1,
+                    client=client,
+                )
+
+        with pytest.raises(httpx.ReadError):
+            asyncio.run(_run())
+        assert list(tmp_path.iterdir()) == []
+
+    def test_concurrent_downloads_to_same_dest(self, tmp_path):
+        """Two downloads to one dest don't share a .part file."""
+        fills = iter([b"a", b"b"])
+
+        class SlowStream(httpx.AsyncByteStream):
+            def __init__(self, fill: bytes) -> None:
+                self._fill = fill
+
+            async def __aiter__(self):
+                for _ in range(8):
+                    yield self._fill * 4
+                    await asyncio.sleep(0)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, stream=SlowStream(next(fills)))
+
+        dest = tmp_path / "f.bin"
+
+        async def _run() -> list:
+            async with httpx.AsyncClient(
+                transport=httpx.MockTransport(handler)
+            ) as client:
+                return await asyncio.gather(
+                    *(
+                        async_download_file(
+                            "http://test/f.bin", dest, chunk_size=4, client=client
+                        )
+                        for _ in range(2)
+                    )
+                )
+
+        assert asyncio.run(_run()) == [dest, dest]
+        assert dest.read_bytes() in (b"a" * 32, b"b" * 32)
+        assert list(tmp_path.iterdir()) == [dest]
 
     def test_no_progress_callback(self, served_files, tmp_path):
         """Download works fine without a progress callback."""
@@ -285,8 +348,12 @@ class TestDownloadBatch:
             DownloadRequest(url=f"{served_files['base_url']}/small.bin", dest=dest),
         ]
         results = download_batch(requests)
-        assert len(results) == 1
-        assert results[0] == dest
+        assert results == [
+            FileResult(
+                filename=dest.name,
+                response=DownloadResult(request=requests[0], path=dest),
+            )
+        ]
         assert dest.read_bytes() == b"hello world"
 
     def test_multiple_files(self, served_files, tmp_path):
@@ -302,7 +369,10 @@ class TestDownloadBatch:
             ),
         ]
         results = download_batch(requests, parallel=2)
-        assert len(results) == 2
+        assert [r.response for r in results] == [
+            DownloadResult(request=req, path=req.dest) for req in requests
+        ]
+        assert all(r.error is None for r in results)
         assert (tmp_path / "small.bin").read_bytes() == b"hello world"
         assert (tmp_path / "medium.bin").read_bytes() == b"x" * 10_000
 
@@ -386,23 +456,146 @@ class TestDownloadBatch:
                 errors.append(filename)
 
         results = download_batch(requests, parallel=2, progress=Tracker())
-        # Only the successful download appears in results.
-        assert len(results) == 1
-        assert results[0] == tmp_path / "small.bin"
+        assert [r.filename for r in results] == ["small.bin", "missing.bin"]
+        assert results[0].response == DownloadResult(
+            request=requests[0], path=tmp_path / "small.bin"
+        )
+        assert results[0].error is None
+        assert results[1].response is None
+        assert isinstance(results[1].error, httpx.HTTPStatusError)
         assert (tmp_path / "small.bin").read_bytes() == b"hello world"
         assert "missing.bin" in errors
 
     def test_skip_existing_in_batch(self, served_files, tmp_path):
-        """skip_existing is forwarded to individual downloads."""
+        """Existing files are skipped and flagged; new ones are downloaded."""
         dest = tmp_path / "small.bin"
         dest.write_bytes(b"pre-existing")
 
         requests = [
             DownloadRequest(url=f"{served_files['base_url']}/small.bin", dest=dest),
+            DownloadRequest(
+                url=f"{served_files['base_url']}/medium.bin",
+                dest=tmp_path / "medium.bin",
+            ),
         ]
-        results = download_batch(requests, skip_existing=True)
-        assert len(results) == 1
+        completed: list[str] = []
+
+        class Tracker:
+            def on_file_start(self, filename: str, total_bytes: int | None) -> None:
+                pass
+
+            def on_file_total(self, filename: str, total_bytes: int | None) -> None:
+                pass
+
+            def on_file_progress(self, filename: str, bytes_delta: int) -> None:
+                pass
+
+            def on_file_complete(self, filename: str) -> None:
+                completed.append(filename)
+
+            def on_file_error(self, filename: str, error: Exception) -> None:
+                pass
+
+        results = download_batch(requests, skip_existing=True, progress=Tracker())
+        assert [r.response for r in results] == [
+            DownloadResult(request=requests[0], path=dest, skipped=True),
+            DownloadResult(request=requests[1], path=tmp_path / "medium.bin"),
+        ]
         assert dest.read_bytes() == b"pre-existing"
+        assert (tmp_path / "medium.bin").read_bytes() == b"x" * 10_000
+        assert sorted(completed) == ["medium.bin", "small.bin"]
+
+    def test_force_in_batch_is_not_skipped(self, served_files, tmp_path):
+        """With force, an existing file is downloaded again, not skipped."""
+        dest = tmp_path / "small.bin"
+        dest.write_bytes(b"pre-existing")
+        requests = [
+            DownloadRequest(url=f"{served_files['base_url']}/small.bin", dest=dest),
+        ]
+        results = download_batch(requests, skip_existing=True, force=True)
+        assert results[0].response == DownloadResult(request=requests[0], path=dest)
+        assert dest.read_bytes() == b"hello world"
+
+    def test_skip_existing_archive_dir_in_batch(self, served_batch_mszx, tmp_path):
+        """An existing .mszx archive directory is reported as skipped."""
+        existing = tmp_path / "gone"
+        existing.mkdir()
+        # gone.mszx isn't served, so any request would fail with a 404.
+        requests = [
+            DownloadRequest(
+                url=f"{served_batch_mszx['base_url']}/gone.mszx",
+                dest=tmp_path / "gone.mszx",
+            ),
+        ]
+        results = download_batch(requests, store_as="msz", skip_existing=True)
+        assert results[0].error is None
+        assert results[0].response == DownloadResult(
+            request=requests[0], path=existing, skipped=True
+        )
+
+    def test_raising_on_file_complete_is_not_a_failure(self, served_files, tmp_path):
+        """A raising on_file_complete leaves the result a success.
+
+        Its exception is logged, not reported through on_file_error, and the
+        other downloads in the batch still finish.
+        """
+        errors: list[str] = []
+
+        class Tracker:
+            def on_file_start(self, filename: str, total_bytes: int | None) -> None:
+                pass
+
+            def on_file_total(self, filename: str, total_bytes: int | None) -> None:
+                pass
+
+            def on_file_progress(self, filename: str, bytes_delta: int) -> None:
+                pass
+
+            def on_file_complete(self, filename: str) -> None:
+                raise RuntimeError("callback bug")
+
+            def on_file_error(self, filename: str, error: Exception) -> None:
+                errors.append(filename)
+
+        base = served_files["base_url"]
+        requests = [
+            DownloadRequest(url=f"{base}/small.bin", dest=tmp_path / "small.bin"),
+            DownloadRequest(url=f"{base}/medium.bin", dest=tmp_path / "medium.bin"),
+        ]
+        results = download_batch(requests, parallel=1, progress=Tracker())
+
+        assert [r.response for r in results] == [
+            DownloadResult(request=req, path=req.dest) for req in requests
+        ]
+        assert all(r.error is None for r in results)
+        assert errors == []
+        assert (tmp_path / "small.bin").read_bytes() == b"hello world"
+        assert (tmp_path / "medium.bin").read_bytes() == b"x" * 10_000
+
+    def test_failures_reported_without_progress(self, served_files, tmp_path):
+        """Regression test for #81: each failure stays in its input slot.
+
+        Without a progress callback the result is the only way to learn
+        which request failed and why.
+        """
+        base = served_files["base_url"]
+        requests = [
+            DownloadRequest(url=f"{base}/nonexistent", dest=tmp_path / "a.bin"),
+            DownloadRequest(url=f"{base}/small.bin", dest=tmp_path / "small.bin"),
+            DownloadRequest(url=f"{base}/also-missing", dest=tmp_path / "b.bin"),
+        ]
+        results = download_batch(requests, parallel=1)
+
+        assert [r.filename for r in results] == ["a.bin", "small.bin", "b.bin"]
+        assert [r.response for r in results] == [
+            None,
+            DownloadResult(request=requests[1], path=tmp_path / "small.bin"),
+            None,
+        ]
+        assert results[1].error is None
+        for failed in (results[0], results[2]):
+            assert isinstance(failed.error, httpx.HTTPStatusError)
+            assert failed.error.response.status_code == 404
 
     def test_total_from_get_response_not_head(self, tmp_path):
         """The total comes from the GET response; HEAD is never sent.
@@ -454,6 +647,30 @@ class TestDownloadBatch:
             ("total", len(payload)),
             ("complete", None),
         ]
+
+    @pytest.mark.parametrize(
+        ("api_key", "expected"),
+        [("secret", "Bearer secret"), (None, None)],
+    )
+    def test_api_key_sent_as_bearer(self, tmp_path, api_key, expected):
+        """Regression test for #77: the API key reaches the GET request."""
+        auth_headers: list[str | None] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            auth_headers.append(request.headers.get("authorization"))
+            return httpx.Response(200, content=b"data")
+
+        req = DownloadRequest(url="http://test/f.bin", dest=tmp_path / "f.bin")
+
+        async def _run() -> list:
+            async with httpx.AsyncClient(
+                transport=httpx.MockTransport(handler)
+            ) as client:
+                return await async_download_batch([req], api_key=api_key, client=client)
+
+        [result] = asyncio.run(_run())
+        assert result.response == DownloadResult(request=req, path=req.dest)
+        assert auth_headers == [expected]
 
 
 # ---------------------------------------------------------------------------
@@ -571,9 +788,10 @@ class TestFormatConversion:
             ),
         ]
         results = download_batch(requests, store_as="mzml")
-        assert len(results) == 1
-        assert results[0] == tmp_path / "result.mzML"
-        assert results[0].stat().st_size == test_mzml.stat().st_size
+        assert [r.response for r in results] == [
+            DownloadResult(request=requests[0], path=tmp_path / "result.mzML")
+        ]
+        assert (tmp_path / "result.mzML").stat().st_size == test_mzml.stat().st_size
 
     def test_download_mszx_store_as_mzml(self, served_ms_files, test_mzml, tmp_path):
         """Download .mszx and decompress inner spectra to .mzML."""
@@ -651,11 +869,12 @@ class TestFormatConversion:
             ),
         ]
         results = download_batch(requests, store_as="mzml")
-        assert len(results) == 1
-        assert results[0] == tmp_path / "result.mzML"
+        assert [r.response for r in results] == [
+            DownloadResult(request=requests[0], path=tmp_path / "result.mzML")
+        ]
         # Not silently kept as mszx.
         assert not (tmp_path / "result.mszx").exists()
-        assert results[0].stat().st_size == test_mzml.stat().st_size
+        assert (tmp_path / "result.mzML").stat().st_size == test_mzml.stat().st_size
 
     def test_msz_to_mszx_raises(self, served_ms_files, tmp_path):
         """Converting msz → mszx is out of scope and raises NotImplementedError."""
@@ -666,6 +885,19 @@ class TestFormatConversion:
                 dest,
                 store_as="mszx",
             )
+
+    def test_batch_reports_unsupported_conversion(self, served_ms_files, tmp_path):
+        """Regression test for #81: the batch result carries the conversion error."""
+        requests = [
+            DownloadRequest(
+                url=f"{served_ms_files['base_url']}/test.msz",
+                dest=tmp_path / "result.msz",
+            ),
+        ]
+        [result] = download_batch(requests, store_as="mszx")
+        assert result.filename == "result.msz"
+        assert result.response is None
+        assert isinstance(result.error, NotImplementedError)
 
     def test_mzml_to_mszx_raises(self, served_ms_files, tmp_path):
         """Converting mzml → mszx is out of scope and raises NotImplementedError."""
@@ -716,7 +948,11 @@ def _write_batch_mszx(path, members):
         info.size = len(manifest)
         tar.addfile(info, io.BytesIO(manifest))
         for entry, src in members.items():
-            tar.add(str(src), arcname=entry)
+            info = tar.gettarinfo(str(src), arcname=entry)
+            # gettarinfo turns "\\" into "/" on Windows; keep the entry verbatim.
+            info.name = entry
+            with open(src, "rb") as f:
+                tar.addfile(info, f)
 
 
 @pytest.fixture()
@@ -976,7 +1212,10 @@ class TestBatchMszx:
             DownloadRequest(url=f"{base}/test.mszx", dest=out_dir / "single.mszx"),
         ]
         results = download_batch(requests, store_as="msz", parallel=1)
-        assert results == [out_dir / "batch", out_dir / "single.msz"]
+        assert [r.response for r in results] == [
+            DownloadResult(request=requests[0], path=out_dir / "batch"),
+            DownloadResult(request=requests[1], path=out_dir / "single.msz"),
+        ]
 
     def test_parallel_archives_sharing_member_name(self, served_batch_mszx, tmp_path):
         """Archives with a common member name don't clobber each other."""
@@ -988,10 +1227,20 @@ class TestBatchMszx:
             DownloadRequest(url=f"{base}/batch2.mszx", dest=out_dir / "batch2.mszx"),
         ]
         results = download_batch(requests, store_as="msz", parallel=2)
-        assert results == [out_dir / "batch", out_dir / "batch2"]
-        assert sorted(p.name for p in results[0].iterdir()) == ["a.msz", "b.msz"]
-        assert sorted(p.name for p in results[1].iterdir()) == ["a.msz", "z.msz"]
-        assert sorted(out_dir.iterdir()) == results
+        paths = [out_dir / "batch", out_dir / "batch2"]
+        assert [r.response for r in results] == [
+            DownloadResult(request=req, path=path)
+            for req, path in zip(requests, paths, strict=True)
+        ]
+        assert sorted(p.name for p in (out_dir / "batch").iterdir()) == [
+            "a.msz",
+            "b.msz",
+        ]
+        assert sorted(p.name for p in (out_dir / "batch2").iterdir()) == [
+            "a.msz",
+            "z.msz",
+        ]
+        assert sorted(out_dir.iterdir()) == paths
 
 
 # ---------------------------------------------------------------------------
@@ -1093,6 +1342,74 @@ class TestAsyncDownloadFile:
             await async_download_file(f"{served_files['base_url']}/nonexistent", dest)
         assert not dest.exists()
 
+    async def test_http_error_keeps_server_detail(self, tmp_path):
+        """Regression test for #99: an error's body is read before raising.
+
+        The response is streamed, so without that the body is gone once the
+        stream closes and callers can't show the server's ``detail``.
+        """
+        app = create_app(output_dir=tmp_path / "served")
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app)) as client:
+            with pytest.raises(httpx.HTTPStatusError) as excinfo:
+                await async_download_file(
+                    "http://test/v1/files/nope.msz",
+                    tmp_path / "nope.msz",
+                    client=client,
+                )
+        assert excinfo.value.response.json() == {"detail": "File not found"}
+
+    @pytest.mark.parametrize(
+        ("kwargs", "expected"),
+        [
+            # No timeout keeps the client's own configuration.
+            ({}, {"connect": 5.0, "read": 5.0, "write": 5.0, "pool": 5.0}),
+            # A timeout replaces it, even when client= is passed.
+            (
+                {"timeout": httpx.Timeout(42.0, connect=7.0)},
+                {"connect": 7.0, "read": 42.0, "write": 42.0, "pool": 42.0},
+            ),
+            (
+                {"timeout": httpx.Timeout(None)},
+                {"connect": None, "read": None, "write": None, "pool": None},
+            ),
+        ],
+    )
+    async def test_timeouts_with_client(self, tmp_path, kwargs, expected):
+        """A passed timeout replaces client='s; without one, its own is kept."""
+        seen: list[dict[str, float | None]] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen.append(request.extensions["timeout"])
+            return httpx.Response(200, content=b"data")
+
+        # A client built only for headers keeps httpx's default 5 s timeout.
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler), headers={"X-Auth": "t"}
+        ) as client:
+            await async_download_file(
+                "http://test/f.bin", tmp_path / "f.bin", client=client, **kwargs
+            )
+
+        assert seen == [expected]
+
+    async def test_default_timeouts_without_client(self, tmp_path):
+        """Without client= or timeout, requests use 10 s connect, 300 s otherwise."""
+        seen: list[dict[str, float | None]] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen.append(request.extensions["timeout"])
+            return httpx.Response(200, content=b"data")
+
+        real_client = httpx.AsyncClient
+
+        def make_client(**kwargs: object) -> httpx.AsyncClient:
+            return real_client(transport=httpx.MockTransport(handler), **kwargs)  # type: ignore[arg-type]
+
+        with patch("mstransfer.client.utils.httpx.AsyncClient", make_client):
+            await async_download_file("http://test/f.bin", tmp_path / "f.bin")
+
+        assert seen == [{"connect": 10.0, "read": 300.0, "write": 300.0, "pool": 300.0}]
+
 
 # ---------------------------------------------------------------------------
 # async_download_batch
@@ -1108,8 +1425,12 @@ class TestAsyncDownloadBatch:
             DownloadRequest(url=f"{served_files['base_url']}/small.bin", dest=dest),
         ]
         results = await async_download_batch(requests)
-        assert len(results) == 1
-        assert results[0] == dest
+        assert results == [
+            FileResult(
+                filename=dest.name,
+                response=DownloadResult(request=requests[0], path=dest),
+            )
+        ]
         assert dest.read_bytes() == b"hello world"
 
     async def test_multiple_files(self, served_files, tmp_path):
@@ -1125,7 +1446,10 @@ class TestAsyncDownloadBatch:
             ),
         ]
         results = await async_download_batch(requests, parallel=2)
-        assert len(results) == 2
+        assert [r.response for r in results] == [
+            DownloadResult(request=req, path=req.dest) for req in requests
+        ]
+        assert all(r.error is None for r in results)
         assert (tmp_path / "small.bin").read_bytes() == b"hello world"
         assert (tmp_path / "medium.bin").read_bytes() == b"x" * 10_000
 
@@ -1161,7 +1485,545 @@ class TestAsyncDownloadBatch:
                 errors.append(filename)
 
         results = await async_download_batch(requests, parallel=2, progress=Tracker())
-        assert len(results) == 1
-        assert results[0] == tmp_path / "small.bin"
+        assert [r.filename for r in results] == ["small.bin", "missing.bin"]
+        assert results[0].response == DownloadResult(
+            request=requests[0], path=tmp_path / "small.bin"
+        )
+        assert results[1].response is None
+        assert isinstance(results[1].error, httpx.HTTPStatusError)
         assert (tmp_path / "small.bin").read_bytes() == b"hello world"
         assert "missing.bin" in errors
+
+
+class _Body(httpx.AsyncByteStream):
+    """A response body that drops the connection after *fail_after* bytes."""
+
+    def __init__(self, data: bytes, fail_after: int | None) -> None:
+        self._data = data
+        self._fail_after = fail_after
+
+    async def __aiter__(self):
+        end = len(self._data) if self._fail_after is None else self._fail_after
+        for i in range(0, end, 1000):
+            yield self._data[i : min(i + 1000, end)]
+        if self._fail_after is not None:
+            raise httpx.ReadError("connection lost")
+
+
+class RangeServer:
+    """A mock HTTP server for *body*, with optional byte-range support.
+
+    Set :attr:`fail_after` to cut the next response short.
+    """
+
+    def __init__(
+        self,
+        body: bytes,
+        *,
+        etag: str | None = '"v1"',
+        ranges: bool = True,
+        honor_if_range: bool = True,
+        sized: bool = True,
+    ) -> None:
+        self.body = body
+        self.etag = etag
+        self.ranges = ranges
+        self.honor_if_range = honor_if_range
+        self.sized = sized
+        self.fail_after: int | None = None
+        self.requests: list[httpx.Request] = []
+        self.statuses: list[int] = []
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        self.requests.append(request)
+        headers = {}
+        if self.etag:
+            headers["etag"] = self.etag
+        body, status = self.body, 200
+        range_ = request.headers.get("range")
+        if_range = request.headers.get("if-range")
+        unchanged = if_range is None or if_range == self.etag
+        if range_ and self.ranges and (unchanged or not self.honor_if_range):
+            start = int(range_.removeprefix("bytes=").removesuffix("-"))
+            size = len(self.body)
+            if start >= size:
+                self.statuses.append(416)
+                return httpx.Response(416, headers={"content-range": f"bytes */{size}"})
+            body, status = self.body[start:], 206
+            headers["content-range"] = f"bytes {start}-{size - 1}/{size}"
+        if self.sized:
+            headers["content-length"] = str(len(body))
+        fail_after, self.fail_after = self.fail_after, None
+        self.statuses.append(status)
+        return httpx.Response(status, headers=headers, stream=_Body(body, fail_after))
+
+
+class _Progress:
+    def __init__(self) -> None:
+        self.totals: list[int | None] = []
+        self.received = 0
+
+    def on_total(self, total_bytes: int | None) -> None:
+        self.totals.append(total_bytes)
+
+    def on_progress(self, bytes_delta: int) -> None:
+        self.received += bytes_delta
+
+
+def _fetch(server: RangeServer, dest, url: str = "http://test/f.bin", **kwargs):
+    async def _run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(server)) as client:
+            return await async_download_file(
+                url, dest, chunk_size=1000, client=client, **kwargs
+            )
+
+    return asyncio.run(_run())
+
+
+def _interrupt(server: RangeServer, dest, at: int = 4000, **kwargs) -> None:
+    server.fail_after = at
+    with pytest.raises(httpx.ReadError):
+        _fetch(server, dest, **kwargs)
+
+
+BODY = bytes(range(256)) * 40
+
+
+class TestResume:
+    def test_resumes_from_partial(self, tmp_path):
+        """An interrupted download continues from the bytes it had."""
+        server = RangeServer(BODY)
+        dest = tmp_path / "f.bin"
+        _interrupt(server, dest)
+
+        part = tmp_path / "f.bin.part"
+        assert part.read_bytes() == BODY[:4000]
+        assert json.loads((tmp_path / "f.bin.part.json").read_text()) == {
+            "url": "http://test/f.bin",
+            "etag": '"v1"',
+            "total": len(BODY),
+        }
+
+        progress = _Progress()
+        assert _fetch(server, dest, progress_callback=progress) == dest
+        assert dest.read_bytes() == BODY
+        assert list(tmp_path.iterdir()) == [dest]
+        assert server.requests[-1].headers["range"] == "bytes=4000-"
+        assert server.requests[-1].headers["if-range"] == '"v1"'
+        assert server.statuses[-1] == 206
+        assert progress.totals == [len(BODY)]
+        assert progress.received == len(BODY)
+
+    def test_cancelled_download_keeps_partial(self, tmp_path):
+        """Cancellation keeps a resumable partial too."""
+        started = asyncio.Event()
+
+        class Stalls(httpx.AsyncByteStream):
+            async def __aiter__(self):
+                yield BODY[:3000]
+                started.set()
+                await asyncio.Event().wait()
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            headers = {"etag": '"v1"', "content-length": str(len(BODY))}
+            return httpx.Response(200, headers=headers, stream=Stalls())
+
+        dest = tmp_path / "f.bin"
+
+        async def _run() -> None:
+            async with httpx.AsyncClient(
+                transport=httpx.MockTransport(handler)
+            ) as client:
+                task = asyncio.create_task(
+                    async_download_file(
+                        "http://test/f.bin", dest, chunk_size=1000, client=client
+                    )
+                )
+                await started.wait()
+                await asyncio.sleep(0.05)
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+
+        asyncio.run(_run())
+        assert (tmp_path / "f.bin.part").read_bytes() == BODY[:3000]
+        assert (tmp_path / "f.bin.part.json").exists()
+
+        server = RangeServer(BODY)
+        _fetch(server, dest)
+        assert dest.read_bytes() == BODY
+        assert server.requests[0].headers["range"] == "bytes=3000-"
+
+    def test_server_without_ranges_restarts(self, tmp_path):
+        """A server that ignores Range sends the whole file to replace the partial."""
+        server = RangeServer(BODY, ranges=False)
+        dest = tmp_path / "f.bin"
+        _interrupt(server, dest)
+
+        _fetch(server, dest)
+        assert server.statuses[-1] == 200
+        assert dest.read_bytes() == BODY
+        assert list(tmp_path.iterdir()) == [dest]
+
+    def test_changed_file_restarts(self, tmp_path):
+        """If-Range makes the server send a changed file in full."""
+        server = RangeServer(BODY)
+        dest = tmp_path / "f.bin"
+        _interrupt(server, dest)
+
+        server.body, server.etag = b"new" * 5000, '"v2"'
+        _fetch(server, dest)
+        assert server.statuses[-1] == 200
+        assert dest.read_bytes() == b"new" * 5000
+        assert list(tmp_path.iterdir()) == [dest]
+
+    def test_failed_restart_does_not_mislabel_partial(self, tmp_path):
+        """A restart that fails early leaves no old bytes under the new ETag."""
+        server = RangeServer(BODY)
+        dest = tmp_path / "f.bin"
+        _interrupt(server, dest)
+
+        class Raises(_Progress):
+            def on_total(self, total_bytes: int | None) -> None:
+                raise RuntimeError("boom")
+
+        new = b"new" * 5000
+        server.body, server.etag = new, '"v2"'
+        with pytest.raises(RuntimeError):
+            _fetch(server, dest, progress_callback=Raises())
+
+        _fetch(server, dest)
+        assert dest.read_bytes() == new
+
+    def test_range_of_changed_file_is_rejected(self, tmp_path):
+        """A 206 for a different file version is not appended to the partial."""
+        server = RangeServer(BODY, honor_if_range=False)
+        dest = tmp_path / "f.bin"
+        _interrupt(server, dest)
+
+        server.body, server.etag = b"new" * 5000, '"v2"'
+        _fetch(server, dest)
+        assert server.statuses[-2:] == [206, 200]
+        assert "range" not in server.requests[-1].headers
+        assert dest.read_bytes() == b"new" * 5000
+
+    def test_range_of_resized_file_is_rejected(self, tmp_path):
+        """A 206 whose Content-Range does not continue the partial restarts."""
+        server = RangeServer(BODY, honor_if_range=False)
+        dest = tmp_path / "f.bin"
+        _interrupt(server, dest)
+
+        server.body = BODY + b"more"
+        _fetch(server, dest)
+        assert server.statuses[-2:] == [206, 200]
+        assert dest.read_bytes() == BODY + b"more"
+
+    def test_unsatisfiable_range_restarts(self, tmp_path):
+        """A 416 (the file shrank) restarts the download."""
+        server = RangeServer(BODY, honor_if_range=False)
+        dest = tmp_path / "f.bin"
+        _interrupt(server, dest)
+
+        server.body = BODY[:100]
+        _fetch(server, dest)
+        assert server.statuses[-2:] == [416, 200]
+        assert dest.read_bytes() == BODY[:100]
+        assert list(tmp_path.iterdir()) == [dest]
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [{"etag": None}, {"etag": 'W/"v1"'}, {"sized": False}],
+        ids=["no-etag", "weak-etag", "no-size"],
+    )
+    def test_unverifiable_partial_is_not_kept(self, tmp_path, kwargs):
+        """Without a strong ETag and a size, a failed download keeps nothing."""
+        server = RangeServer(BODY, **kwargs)
+        dest = tmp_path / "f.bin"
+        _interrupt(server, dest)
+        assert list(tmp_path.iterdir()) == []
+
+    @pytest.mark.parametrize(
+        "meta",
+        [
+            "not json",
+            '{"url": "http://test/f.bin", "etag": "\\"v1\\""}',
+            '{"url": "http://test/f.bin", "etag": 1, "total": 10240}',
+            '{"url": "http://test/f.bin", "etag": "\\"v1\\"", "total": 0}',
+        ],
+        ids=["not-json", "missing-total", "non-string-etag", "zero-total"],
+    )
+    def test_invalid_partial_info_restarts(self, tmp_path, meta):
+        """A .part.json that does not validate is ignored, not trusted or fatal."""
+        server = RangeServer(BODY)
+        dest = tmp_path / "f.bin"
+        _interrupt(server, dest)
+        (tmp_path / "f.bin.part.json").write_text(meta)
+
+        _fetch(server, dest)
+        assert "range" not in server.requests[-1].headers
+        assert dest.read_bytes() == BODY
+        assert list(tmp_path.iterdir()) == [dest]
+
+    def test_empty_file(self, tmp_path):
+        """An empty file with an ETag downloads and leaves nothing behind."""
+        server = RangeServer(b"")
+        dest = tmp_path / "f.bin"
+        assert _fetch(server, dest) == dest
+        assert dest.read_bytes() == b""
+        assert list(tmp_path.iterdir()) == [dest]
+
+    def test_resume_false_keeps_nothing(self, tmp_path):
+        """resume=False neither uses nor keeps a partial, and removes an old one."""
+        server = RangeServer(BODY)
+        dest = tmp_path / "f.bin"
+        _interrupt(server, dest, resume=False)
+        assert list(tmp_path.iterdir()) == []
+
+        _interrupt(server, dest)
+        _fetch(server, dest, resume=False)
+        assert "range" not in server.requests[-1].headers
+        assert dest.read_bytes() == BODY
+        assert list(tmp_path.iterdir()) == [dest]
+
+    def test_failed_resume_false_keeps_old_partial(self, tmp_path):
+        """A failed resume=False download leaves an earlier partial resumable."""
+        server = RangeServer(BODY)
+        dest = tmp_path / "f.bin"
+        _interrupt(server, dest)
+        _interrupt(server, dest, at=2000, resume=False)
+        assert (tmp_path / "f.bin.part").read_bytes() == BODY[:4000]
+
+        _fetch(server, dest)
+        assert server.requests[-1].headers["range"] == "bytes=4000-"
+        assert dest.read_bytes() == BODY
+
+    def test_force_discards_partial(self, tmp_path):
+        """force=True starts from zero."""
+        server = RangeServer(BODY)
+        dest = tmp_path / "f.bin"
+        _interrupt(server, dest)
+
+        _fetch(server, dest, force=True)
+        assert "range" not in server.requests[-1].headers
+        assert dest.read_bytes() == BODY
+        assert list(tmp_path.iterdir()) == [dest]
+
+    def test_partial_of_other_url_is_discarded(self, tmp_path):
+        """A partial of another URL to the same dest is not resumed."""
+        server = RangeServer(BODY)
+        dest = tmp_path / "f.bin"
+        _interrupt(server, dest, url="http://test/a/f.bin")
+
+        _fetch(server, dest, url="http://test/b/f.bin")
+        assert "range" not in server.requests[-1].headers
+        assert dest.read_bytes() == BODY
+        assert list(tmp_path.iterdir()) == [dest]
+
+    def test_size_mismatch_raises(self, tmp_path):
+        """A body shorter than announced fails and keeps nothing."""
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            headers = {"etag": '"v1"', "content-length": "20"}
+            return httpx.Response(200, headers=headers, stream=_Body(b"x" * 10, None))
+
+        async def _run() -> None:
+            async with httpx.AsyncClient(
+                transport=httpx.MockTransport(handler)
+            ) as client:
+                await async_download_file(
+                    "http://test/f.bin", tmp_path / "f.bin", client=client
+                )
+
+        with pytest.raises(ValueError, match="expected 20"):
+            asyncio.run(_run())
+        assert list(tmp_path.iterdir()) == []
+
+    def test_unrequested_partial_response_raises(self, tmp_path):
+        """A 206 to a request without a Range is not taken as the whole file."""
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            headers = {
+                "etag": '"v1"',
+                "content-length": "10",
+                "content-range": f"bytes 10-19/{len(BODY)}",
+            }
+            return httpx.Response(206, headers=headers, stream=_Body(BODY[10:20], None))
+
+        async def _run() -> None:
+            async with httpx.AsyncClient(
+                transport=httpx.MockTransport(handler)
+            ) as client:
+                await async_download_file(
+                    "http://test/f.bin", tmp_path / "f.bin", client=client
+                )
+
+        with pytest.raises(ValueError, match="without asking for a range"):
+            asyncio.run(_run())
+        assert list(tmp_path.iterdir()) == []
+
+    @pytest.mark.parametrize("resume", [True, False])
+    def test_concurrent_download_does_not_touch_owned_partial(self, tmp_path, resume):
+        """A second download to a dest whose partial is in use streams elsewhere."""
+        stalled = asyncio.Event()
+
+        class Stalls(httpx.AsyncByteStream):
+            async def __aiter__(self):
+                yield b"a" * 3000
+                stalled.set()
+                await asyncio.Event().wait()
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            headers = {"etag": '"v1"', "content-length": str(len(BODY))}
+            if request.url.path == "/stall":
+                return httpx.Response(200, headers=headers, stream=Stalls())
+            return httpx.Response(200, headers=headers, stream=_Body(BODY, None))
+
+        dest = tmp_path / "f.bin"
+        part = tmp_path / "f.bin.part"
+
+        async def _run() -> None:
+            async with httpx.AsyncClient(
+                transport=httpx.MockTransport(handler)
+            ) as client:
+                owner = asyncio.create_task(
+                    async_download_file(
+                        "http://test/stall", dest, chunk_size=1000, client=client
+                    )
+                )
+                await stalled.wait()
+                await asyncio.sleep(0.05)
+                await async_download_file(
+                    "http://test/f.bin", dest, resume=resume, client=client
+                )
+                assert dest.read_bytes() == BODY
+                owner.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await owner
+
+        asyncio.run(_run())
+        assert part.read_bytes() == b"a" * 3000
+        assert sorted(p.name for p in tmp_path.iterdir()) == [
+            "f.bin",
+            "f.bin.part",
+            "f.bin.part.json",
+        ]
+
+    def test_leftover_lock_file_is_removed(self, tmp_path):
+        """A lock file left behind by an older mstransfer is cleaned up."""
+        dest = tmp_path / "f.bin"
+        (tmp_path / "f.bin.part.lock").touch()
+        _fetch(RangeServer(BODY), dest)
+        assert list(tmp_path.iterdir()) == [dest]
+
+    @pytest.mark.skipif(
+        sys.platform == "win32", reason="filelock tries to remove it after release"
+    )
+    def test_lock_file_is_removed_before_release(self, tmp_path):
+        """The lock file goes while held, so nobody can lock it after release."""
+        lock_exists: list[bool] = []
+        release = FileLock.release
+
+        def checked_release(self, *args, **kwargs):
+            lock_exists.append(Path(self.lock_file).exists())
+            return release(self, *args, **kwargs)
+
+        with patch.object(FileLock, "release", checked_release):
+            _fetch(RangeServer(BODY), tmp_path / "f.bin")
+        assert lock_exists
+        assert not any(lock_exists)
+
+    @pytest.mark.skipif(
+        sys.platform == "win32", reason="filelock tries to remove it after release"
+    )
+    def test_lock_file_unlink_failure_still_releases(self, tmp_path):
+        """Failing to remove the lock file neither fails nor keeps the lock."""
+        released: list[str] = []
+        release, unlink = FileLock.release, Path.unlink
+
+        def tracked_release(self, *args, **kwargs):
+            if not kwargs.get("force"):  # Not the release in FileLock.__del__.
+                released.append(self.lock_file)
+            return release(self, *args, **kwargs)
+
+        def failing_unlink(self, *args, **kwargs):
+            if self.name.endswith(".lock"):
+                raise PermissionError(self)
+            return unlink(self, *args, **kwargs)
+
+        dest = tmp_path / "f.bin"
+        with (
+            patch.object(FileLock, "release", tracked_release),
+            patch.object(Path, "unlink", failing_unlink),
+        ):
+            _fetch(RangeServer(BODY), dest)
+        assert dest.read_bytes() == BODY
+        assert released == [str(tmp_path / "f.bin.part.lock")]
+
+    def test_cleanup_failure_still_releases(self, tmp_path):
+        """A failure removing the partial still releases the lock."""
+        released: list[str] = []
+        release, unlink = FileLock.release, Path.unlink
+
+        def tracked_release(self, *args, **kwargs):
+            if not kwargs.get("force"):  # Not the release in FileLock.__del__.
+                released.append(self.lock_file)
+            return release(self, *args, **kwargs)
+
+        def failing_unlink(self, *args, **kwargs):
+            if self.name.endswith(".part"):
+                raise PermissionError(self)
+            return unlink(self, *args, **kwargs)
+
+        # Without an ETag the partial is not kept, so it is removed.
+        server = RangeServer(BODY, etag=None)
+        server.fail_after = 4000
+        with (
+            patch.object(FileLock, "release", tracked_release),
+            patch.object(Path, "unlink", failing_unlink),
+            pytest.raises(PermissionError),
+        ):
+            _fetch(server, tmp_path / "f.bin")
+        assert released == [str(tmp_path / "f.bin.part.lock")]
+
+    def test_resumes_from_mstransfer_server(self, tmp_path):
+        """Resume works end to end against the mstransfer server."""
+        served = tmp_path / "served"
+        served.mkdir()
+        (served / "run.msz").write_bytes(BODY)
+        app = httpx.ASGITransport(app=create_app(output_dir=served))
+        cut = [4000]
+        requests: list[httpx.Request] = []
+        statuses: list[int] = []
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            resp = await app.handle_async_request(request)
+            statuses.append(resp.status_code)
+            body = await resp.aread()
+            fail_after = cut.pop() if cut else None
+            return httpx.Response(
+                resp.status_code, headers=resp.headers, stream=_Body(body, fail_after)
+            )
+
+        dest = tmp_path / "out" / "run.msz"
+
+        async def _run() -> None:
+            async with httpx.AsyncClient(
+                transport=httpx.MockTransport(handler)
+            ) as client:
+                with pytest.raises(httpx.ReadError):
+                    await async_download_file(
+                        "http://test/v1/files/run.msz",
+                        dest,
+                        chunk_size=1000,
+                        client=client,
+                    )
+                await async_download_file(
+                    "http://test/v1/files/run.msz", dest, client=client
+                )
+
+        asyncio.run(_run())
+        assert dest.read_bytes() == BODY
+        assert requests[-1].headers["range"] == "bytes=4000-"
+        assert statuses == [200, 206]
+        assert list(dest.parent.iterdir()) == [dest]

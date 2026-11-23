@@ -330,7 +330,7 @@ class StorePlan:
         """
         conversion = self.conversion
         if conversion is None:
-            part.rename(self.final_dest)
+            part.replace(self.final_dest)
             return self.final_dest
 
         # Give the temp file the correct source extension so mscompress can

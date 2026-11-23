@@ -1,24 +1,28 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
+import sys
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Protocol, runtime_checkable
+from pathlib import Path
+from typing import Protocol, runtime_checkable
 
 import aiofiles
 import httpx
+from filelock import BaseFileLock, FileLock, Timeout
+from pydantic import BaseModel, Field, ValidationError
 
+from mstransfer.client.results import FileResult
 from mstransfer.client.utils import ThrottledCallback, optional_client
 from mstransfer.store import DownloadFormat, StorePlan
-
-if TYPE_CHECKING:
-    from pathlib import Path
 
 __all__ = [
     "BatchDownloadProgress",
     "DownloadFormat",
     "DownloadProgressCallback",
     "DownloadRequest",
+    "DownloadResult",
     "async_download_batch",
     "async_download_file",
     "download_batch",
@@ -55,23 +59,58 @@ class DownloadRequest:
     dest: Path
 
 
+@dataclass
+class DownloadResult:
+    """A completed download: the request and where its output was written.
+
+    *skipped* is *True* when the output already existed and nothing was
+    downloaded (see *skip_existing*).
+    """
+
+    request: DownloadRequest
+    path: Path
+    skipped: bool = False
+
+
+class _PartialInfo(BaseModel):
+    """What a resumable .part file holds: the start of *url*'s *total*-byte body.
+
+    *etag* is the strong `ETag` the body was sent with, so a resumed range
+    can be checked against it.
+    """
+
+    url: str
+    etag: str
+    total: int = Field(gt=0)
+
+
 async def async_download_file(
     url: str,
     dest: Path,
     *,
     store_as: DownloadFormat | None = None,
     chunk_size: int = 1_048_576,
-    connect_timeout: float = 10.0,
-    read_timeout: float = 300.0,
+    timeout: httpx.Timeout | None = None,
     progress_callback: DownloadProgressCallback | None = None,
     skip_existing: bool = False,
     force: bool = False,
+    resume: bool = True,
+    api_key: str | None = None,
     client: httpx.AsyncClient | None = None,
 ) -> Path:
     """Download a single file from *url* to *dest* (async).
 
     The file is streamed to a temporary `.part` file first, then atomically
     renamed (or converted) to the final destination on success.
+
+    With *resume*, an interrupted download keeps its partial `.part` file
+    (and a `.part.json` describing it) next to *dest*, and a later call
+    continues from the bytes already received.  A partial is only kept when
+    the server sent a strong `ETag` and the body size, and it is only
+    resumed with an `If-Range` request carrying that `ETag`.  If the
+    server does not support ranges, or the file changed, the download
+    restarts from zero.  The finished file must have exactly the expected
+    size.
 
     Args:
         url: The URL to download from.
@@ -89,18 +128,27 @@ async def async_download_file(
             appears only once every member is written, and replaces any
             existing directory of that name.
         chunk_size: Number of bytes per read chunk (default 1 MiB).
-        connect_timeout: Timeout in seconds for establishing the connection.
-        read_timeout: Timeout in seconds for reading the response body.
+        timeout: Timeouts for the request, replacing *client*'s; pass
+            `httpx.Timeout(None)` for no limit.  If *None*, *client*'s
+            timeouts are used (10 s connect, 300 s otherwise, without
+            *client*).
         progress_callback: Optional callback.  `on_total` is invoked once
-            the server responds, with the body size from `Content-Length`
-            (or *None* if unknown); `on_progress` is invoked with byte
-            deltas per chunk.
+            the server responds, with the file size (or *None* if unknown);
+            `on_progress` is invoked with byte deltas per chunk.  A resumed
+            download first reports the bytes it already had as one delta.
         skip_existing: If *True* and the final destination already exists,
             skip the download.  For an `.mszx` stored as `"msz"` or
             `"mzml"`, an existing archive directory (see *store_as*) also
             counts.
         force: If *True*, re-download even if the destination already exists
-            (overrides *skip_existing*).
+            (overrides *skip_existing*), discarding any partial download.
+        resume: If *True* (the default), resume a partial download of *url*
+            to *dest* and keep this one's partial if it is interrupted.  Only
+            one download to *dest* at a time can do so; a concurrent one uses
+            a private `.part` file that is never resumed.  If *False*, start
+            from zero and keep nothing on failure; on success, remove the
+            partial an earlier download left, unless one is using it.
+        api_key: Optional API key, sent as `Authorization: Bearer <key>`.
         client: Optional `httpx.AsyncClient` to reuse; a temporary one is
             created and closed otherwise.
 
@@ -112,7 +160,9 @@ async def async_download_file(
     Raises:
         NotImplementedError: The source cannot be converted to *store_as*.
         ValueError: Two members of a multi-member `.mszx` map to the same
-            output name; raised before anything is written.
+            output name (raised before anything is written), the downloaded
+            size does not match the size the server announced, or the server
+            sent part of the file when it was not asked to.
     """
     plan = StorePlan.for_download(url, dest, store_as)
 
@@ -124,38 +174,184 @@ async def async_download_file(
     # Ensure the parent directory exists.
     plan.final_dest.parent.mkdir(parents=True, exist_ok=True)
 
-    # Write to a temp .part file to avoid partial downloads.
-    part_path = plan.part_path
+    # A resumable download streams to plan.part_path, described by a metadata
+    # file, while it holds an exclusive lock, so only one download to *dest* at
+    # a time owns them.  Any other download writes to a unique .part file that
+    # is never resumed, so concurrent downloads to one dest never share it.
+    part_path = plan.unique_part_path()
+    meta_path = plan.part_path.with_name(plan.part_path.name + ".json")
+    lock_path = plan.part_path.with_name(plan.part_path.name + ".lock")
+    lock: BaseFileLock | None = None
+    if resume:
+        candidate = FileLock(lock_path, timeout=0)
+        try:
+            candidate.acquire()
+        except Timeout:
+            pass
+        else:
+            lock = candidate
+            part_path = plan.part_path
 
-    timeout = httpx.Timeout(read_timeout, connect=connect_timeout)
+    # What a partial from an earlier attempt claims to be: the bytes of a
+    # *total*-byte body of *url*, as identified by *etag*.
+    offset = 0
+    etag: str | None = None
+    total: int | None = None
+    expected_range = ""
+    if lock is not None and not force:
+        info: _PartialInfo | None
+        try:
+            info = _PartialInfo.model_validate_json(meta_path.read_text())
+            offset = part_path.stat().st_size
+        except (OSError, ValidationError):
+            info = None
+        if info is not None and info.url == url and 0 < offset < info.total:
+            etag, total = info.etag, info.total
+            expected_range = f"bytes {offset}-{total - 1}/{total}"
+        else:
+            offset = 0
+
+    # Whether the .part file is worth keeping if this attempt fails.
+    retain = offset > 0
+
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
 
     # Throttle progress callbacks to reduce overhead (default: every 8 MiB).
     throttled = (
         ThrottledCallback(progress_callback.on_progress) if progress_callback else None
     )
 
-    async with (
-        optional_client(client, timeout=timeout) as c,
-        c.stream("GET", url) as resp,
-    ):
-        resp.raise_for_status()
+    try:
+        async with optional_client(
+            client, timeout=httpx.Timeout(300.0, connect=10.0)
+        ) as c:
+            while True:
+                request_headers = dict(headers)
+                if offset:
+                    request_headers["Range"] = f"bytes={offset}-"
+                    request_headers["If-Range"] = str(etag)
+                async with c.stream(
+                    "GET",
+                    url,
+                    headers=request_headers,
+                    timeout=httpx.USE_CLIENT_DEFAULT if timeout is None else timeout,
+                ) as resp:
+                    # Content-Length counts encoded bytes, but the body is read
+                    # decoded, so neither its size nor byte ranges can be used.
+                    encoded = "content-encoding" in resp.headers
+                    resp_etag = resp.headers.get("etag")
+                    if resp_etag and resp_etag.startswith("W/"):
+                        resp_etag = None  # If-Range needs a strong ETag.
 
-        if progress_callback:
-            # Content-Length counts encoded bytes, but the body is read decoded.
-            cl = resp.headers.get("content-length")
-            encoded = "content-encoding" in resp.headers
-            progress_callback.on_total(int(cl) if cl and not encoded else None)
+                    if offset and resp.status_code == 416:
+                        # The server no longer has our range: start over.
+                        logger.info("Range rejected for %s, restarting", url)
+                        offset, retain = 0, False
+                        continue
+                    if resp.is_error:
+                        # Keep the body so callers can show the server's reason.
+                        await resp.aread()
+                    resp.raise_for_status()
 
-        async with aiofiles.open(part_path, "wb") as f:
-            async for chunk in resp.aiter_bytes(chunk_size=chunk_size):
-                await f.write(chunk)
-                if throttled:
-                    throttled(len(chunk))
+                    if offset and resp.status_code == 206:
+                        # The range must continue our partial of the same file.
+                        if (
+                            encoded
+                            or resp_etag != etag
+                            or resp.headers.get("content-range") != expected_range
+                        ):
+                            logger.info("Partial of %s is stale, restarting", url)
+                            offset, retain = 0, False
+                            continue
+                        logger.info("Resuming %s from byte %d", url, offset)
+                    else:
+                        if resp.status_code == 206 and not offset:
+                            raise ValueError(
+                                f"Got part of {url} without asking for a range"
+                            )
+                        # A full body, either asked for or because the server
+                        # ignored the range or the file changed.
+                        if offset:
+                            logger.info("Cannot resume %s, restarting", url)
+                        offset = 0
+                        # Drop any old bytes before the metadata describes the
+                        # new body, so a failure in between cannot leave them
+                        # labelled as its start.
+                        part_path.unlink(missing_ok=True)
+                        cl = resp.headers.get("content-length")
+                        total = int(cl) if cl and not encoded else None
+                        etag = resp_etag
+                        # An empty body has nothing to resume.
+                        retain = False
+                        if lock is not None and etag is not None and total:
+                            meta_path.write_text(
+                                _PartialInfo(
+                                    url=url, etag=etag, total=total
+                                ).model_dump_json()
+                            )
+                            retain = True
 
-        if throttled:
-            throttled.flush()
+                    if progress_callback:
+                        progress_callback.on_total(total)
+                        if offset:
+                            progress_callback.on_progress(offset)
 
-    return await plan.finalize(part_path)
+                    size = offset
+                    async with aiofiles.open(part_path, "ab" if offset else "wb") as f:
+                        async for chunk in resp.aiter_bytes(chunk_size=chunk_size):
+                            await f.write(chunk)
+                            size += len(chunk)
+                            if throttled:
+                                throttled(len(chunk))
+
+                    if throttled:
+                        throttled.flush()
+                break
+
+        if total is not None and size != total:
+            retain = False
+            raise ValueError(f"Downloaded {size} bytes of {url}, but expected {total}")
+
+        result = await plan.finalize(part_path)
+        if not resume:
+            # A partial left by an earlier resumable attempt is dead weight now
+            # that the output exists.  Take its lock so a download still using
+            # it keeps it; the finally block removes its metadata and the lock.
+            candidate = FileLock(lock_path, timeout=0)
+            try:
+                candidate.acquire()
+            except Timeout:
+                pass
+            else:
+                lock = candidate
+                plan.part_path.unlink(missing_ok=True)
+        return result
+    finally:
+        # Keep a resumable partial for a later attempt.  Anything else, like
+        # the .part of a cancelled download without an ETag, is dead
+        # weight.  Cancellation is covered too, as it is not an Exception.
+        try:
+            try:
+                keep = retain and part_path.stat().st_size > 0
+            except FileNotFoundError:
+                keep = False
+            if not keep:
+                part_path.unlink(missing_ok=True)
+                if lock is not None:
+                    meta_path.unlink(missing_ok=True)
+        finally:
+            # Release even if cleanup fails, so the lock is never left held.
+            if lock is not None:
+                # filelock tries to remove the lock file after release on
+                # Windows, but not on Unix, so remove it here while still
+                # holding the lock.  A download that opened the old file
+                # meanwhile then fails to lock it, as filelock rejects a lock
+                # on an unlinked file.  A file left behind is harmless: a later
+                # download removes it.
+                if sys.platform != "win32":
+                    with contextlib.suppress(OSError):
+                        Path(lock.lock_file).unlink(missing_ok=True)
+                lock.release()
 
 
 async def async_download_batch(
@@ -164,13 +360,14 @@ async def async_download_batch(
     store_as: DownloadFormat | None = None,
     parallel: int = 4,
     chunk_size: int = 1_048_576,
-    connect_timeout: float = 10.0,
-    read_timeout: float = 300.0,
+    timeout: httpx.Timeout | None = None,
     progress: BatchDownloadProgress | None = None,
     skip_existing: bool = False,
     force: bool = False,
+    resume: bool = True,
+    api_key: str | None = None,
     client: httpx.AsyncClient | None = None,
-) -> list[Path]:
+) -> list[FileResult[DownloadResult]]:
     """Download multiple files in parallel (async).
 
     Args:
@@ -181,23 +378,33 @@ async def async_download_batch(
         parallel: Maximum number of concurrent downloads (capped to file
             count).
         chunk_size: Number of bytes per read chunk.
-        connect_timeout: Timeout in seconds for establishing each connection.
-        read_timeout: Timeout in seconds for reading each response body.
+        timeout: Timeouts for each request, replacing *client*'s; pass
+            `httpx.Timeout(None)` for no limit.  If *None*, *client*'s
+            timeouts are used (10 s connect, 300 s otherwise, without
+            *client*).
         progress: Optional batch progress callback.
         skip_existing: If *True*, skip files whose destination already exists.
         force: If *True*, re-download even if destination exists.
+        resume: If *True* (the default), resume partial downloads and keep
+            resumable partials of failed ones (see `async_download_file`).
+        api_key: Optional API key, sent as `Authorization: Bearer <key>`.
         client: Optional `httpx.AsyncClient` shared by every download; a
             temporary one is created per request otherwise.
 
     Returns:
-        List of final destination paths (in input order, errors excluded).
-        A multi-member `.mszx` contributes its archive directory.
+        One result per request, in input order, named after the request's
+        *dest*, carrying either a `DownloadResult` or the error.  A
+        multi-member `.mszx` yields its archive directory as the path.  A
+        file skipped by *skip_existing* has `skipped` set and is still
+        reported to *progress* as complete.
     """
     workers = min(parallel, len(files))
     sem = asyncio.Semaphore(workers)
 
     # Pre-allocate results list indexed by position for deterministic ordering.
-    results: list[Path | None] = [None] * len(files)
+    results: list[FileResult[DownloadResult]] = [
+        FileResult(filename=req.dest.name) for req in files
+    ]
 
     async def _download_one(idx: int, req: DownloadRequest) -> None:
         filename = req.dest.name
@@ -214,29 +421,44 @@ async def async_download_batch(
                 file_progress = _FileProgressAdapter(filename, progress)
 
             try:
-                result = await async_download_file(
-                    req.url,
-                    req.dest,
-                    store_as=store_as,
-                    chunk_size=chunk_size,
-                    connect_timeout=connect_timeout,
-                    read_timeout=read_timeout,
-                    progress_callback=file_progress,
-                    skip_existing=skip_existing,
-                    force=force,
-                    client=client,
-                )
-                results[idx] = result
-                if progress:
-                    progress.on_file_complete(filename)
+                plan = StorePlan.for_download(req.url, req.dest, store_as)
+                existing = plan.existing() if skip_existing and not force else None
+                if existing is not None:
+                    logger.info("Skipping existing output: %s", existing)
+                    result = DownloadResult(request=req, path=existing, skipped=True)
+                else:
+                    path = await async_download_file(
+                        req.url,
+                        req.dest,
+                        store_as=store_as,
+                        chunk_size=chunk_size,
+                        timeout=timeout,
+                        progress_callback=file_progress,
+                        skip_existing=skip_existing,
+                        force=force,
+                        resume=resume,
+                        api_key=api_key,
+                        client=client,
+                    )
+                    result = DownloadResult(request=req, path=path)
             except Exception as exc:
+                results[idx].error = exc
                 if progress:
                     progress.on_file_error(filename, exc)
                 logger.error("Failed to download %s: %s", filename, exc)
+            else:
+                results[idx].response = result
+                # A raising callback must not turn a finished download into
+                # a failure, or abort the rest of the batch.
+                if progress:
+                    try:
+                        progress.on_file_complete(filename)
+                    except Exception:
+                        logger.exception("on_file_complete failed for %s", filename)
 
     await asyncio.gather(*[_download_one(i, req) for i, req in enumerate(files)])
 
-    return [r for r in results if r is not None]
+    return results
 
 
 def download_file(
@@ -245,11 +467,12 @@ def download_file(
     *,
     store_as: DownloadFormat | None = None,
     chunk_size: int = 1_048_576,
-    connect_timeout: float = 10.0,
-    read_timeout: float = 300.0,
+    timeout: httpx.Timeout | None = None,
     progress_callback: DownloadProgressCallback | None = None,
     skip_existing: bool = False,
     force: bool = False,
+    resume: bool = True,
+    api_key: str | None = None,
     client: httpx.AsyncClient | None = None,
 ) -> Path:
     """Download a single file from *url* to *dest*.
@@ -262,11 +485,12 @@ def download_file(
             dest,
             store_as=store_as,
             chunk_size=chunk_size,
-            connect_timeout=connect_timeout,
-            read_timeout=read_timeout,
+            timeout=timeout,
             progress_callback=progress_callback,
             skip_existing=skip_existing,
             force=force,
+            resume=resume,
+            api_key=api_key,
             client=client,
         )
     )
@@ -278,13 +502,14 @@ def download_batch(
     store_as: DownloadFormat | None = None,
     parallel: int = 4,
     chunk_size: int = 1_048_576,
-    connect_timeout: float = 10.0,
-    read_timeout: float = 300.0,
+    timeout: httpx.Timeout | None = None,
     progress: BatchDownloadProgress | None = None,
     skip_existing: bool = False,
     force: bool = False,
+    resume: bool = True,
+    api_key: str | None = None,
     client: httpx.AsyncClient | None = None,
-) -> list[Path]:
+) -> list[FileResult[DownloadResult]]:
     """Download multiple files in parallel.
 
     This is a synchronous wrapper around `async_download_batch`.
@@ -295,11 +520,12 @@ def download_batch(
             store_as=store_as,
             parallel=parallel,
             chunk_size=chunk_size,
-            connect_timeout=connect_timeout,
-            read_timeout=read_timeout,
+            timeout=timeout,
             progress=progress,
             skip_existing=skip_existing,
             force=force,
+            resume=resume,
+            api_key=api_key,
             client=client,
         )
     )

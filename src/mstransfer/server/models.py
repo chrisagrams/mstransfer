@@ -48,6 +48,15 @@ class UploadResponse(BaseModel):
     bytes_received: int
 
 
+class ErrorResponse(BaseModel):
+    """Body of the errors the routes raise via ``HTTPException``.
+
+    FastAPI's own 422 validation errors use a list ``detail`` instead.
+    """
+
+    detail: str = Field(min_length=1)
+
+
 class FileInfo(BaseModel):
     """Metadata for a single stored file.
 

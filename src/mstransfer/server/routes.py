@@ -6,10 +6,11 @@ from typing import TYPE_CHECKING, Any
 import aiofiles
 import aiofiles.os
 from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse
 
 from mstransfer import __version__
 from mstransfer.server.models import (
+    ErrorResponse,
     FileListResponse,
     HealthResponse,
     TransferRecord,
@@ -19,8 +20,7 @@ from mstransfer.server.models import (
 from mstransfer.store import MSFormat, StorePlan
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator, Callable
-    from pathlib import Path
+    from collections.abc import Callable
 
     from mstransfer.server.state import AppState
 
@@ -59,6 +59,8 @@ def make_router(
 
     router = APIRouter()
     protected: list[Any] = [Depends(auth_dep)] if auth_dep else []
+    error: dict[str, Any] = {"model": ErrorResponse}
+    auth_errors: dict[int | str, dict[str, Any]] = {401: error} if auth_dep else {}
 
     @router.get("/health", response_model=HealthResponse)
     async def health(state: AppState = state_dep) -> HealthResponse:
@@ -73,6 +75,7 @@ def make_router(
         "/transfer/{transfer_id}/status",
         response_model=TransferRecord,
         dependencies=protected,
+        responses={**auth_errors, 404: error},
     )
     async def transfer_status(
         transfer_id: str, state: AppState = state_dep
@@ -86,7 +89,12 @@ def make_router(
             raise HTTPException(status_code=404, detail="Transfer not found")
         return record
 
-    @router.post("/upload", response_model=UploadResponse, dependencies=protected)
+    @router.post(
+        "/upload",
+        response_model=UploadResponse,
+        dependencies=protected,
+        responses={**auth_errors, 400: error, 409: error, 500: error},
+    )
     async def upload(request: Request, state: AppState = state_dep) -> UploadResponse:
         """Receive a file streamed in the request body.
 
@@ -229,7 +237,7 @@ def make_router(
         finally:
             state.outputs.release(dest)
 
-    @router.get("/files", dependencies=protected)
+    @router.get("/files", dependencies=protected, responses=auth_errors)
     async def list_files(state: AppState = state_dep) -> FileListResponse:
         """List all files available for download.
 
@@ -241,11 +249,18 @@ def make_router(
         files = await state.files.list_files()
         return FileListResponse(files=files)
 
-    @router.get("/files/{filename}", dependencies=protected)
-    async def download_file(
-        filename: str, state: AppState = state_dep
-    ) -> StreamingResponse:
-        """Download a single file by name."""
+    @router.get(
+        "/files/{filename}",
+        dependencies=protected,
+        responses={**auth_errors, 404: error},
+    )
+    async def download_file(filename: str, state: AppState = state_dep) -> FileResponse:
+        """Download a single file by name.
+
+        Supports byte ``Range`` requests (``206``/``416``) and ``If-Range``,
+        and sends ``ETag`` and ``Last-Modified`` validators, so an
+        interrupted download can be resumed.
+        """
         path = await state.files.get_file(filename)
         if path is None:
             raise HTTPException(status_code=404, detail="File not found")
@@ -257,25 +272,8 @@ def make_router(
             else "application/octet-stream"
         )
 
-        return StreamingResponse(
-            _stream_file(path),
-            media_type=content_type,
-            headers={
-                "Content-Length": str(stat.st_size),
-                "Content-Disposition": f'attachment; filename="{path.name}"',
-            },
+        return FileResponse(
+            path, media_type=content_type, filename=path.name, stat_result=stat
         )
 
     return router
-
-
-async def _stream_file(
-    path: Path, chunk_size: int = 1_048_576
-) -> AsyncGenerator[bytes, None]:
-    """Async generator that reads a file in chunks."""
-    async with aiofiles.open(path, "rb") as f:
-        while True:
-            chunk = await f.read(chunk_size)
-            if not chunk:
-                break
-            yield chunk

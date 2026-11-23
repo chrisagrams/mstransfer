@@ -741,6 +741,66 @@ async def test_download_msz(msz_client, test_msz):
 
 
 @pytest.mark.asyncio
+async def test_download_range(msz_client, test_msz):
+    """A Range request gets a 206 with that slice and the file's validators."""
+    payload = test_msz.read_bytes()
+    await msz_client.post(
+        "/v1/upload",
+        content=payload,
+        headers={"X-Transfer-ID": "dl-range", "X-Original-Filename": "test.msz"},
+    )
+
+    full = await msz_client.get("/v1/files/test.msz")
+    assert full.headers["accept-ranges"] == "bytes"
+    etag = full.headers["etag"]
+    assert not etag.startswith("W/")
+    assert "last-modified" in full.headers
+
+    resp = await msz_client.get(
+        "/v1/files/test.msz", headers={"Range": "bytes=10-", "If-Range": etag}
+    )
+    assert resp.status_code == 206
+    assert resp.content == payload[10:]
+    assert (
+        resp.headers["content-range"] == f"bytes 10-{len(payload) - 1}/{len(payload)}"
+    )
+    assert resp.headers["etag"] == etag
+
+
+@pytest.mark.asyncio
+async def test_download_range_if_range_mismatch(msz_client, test_msz):
+    """A stale If-Range validator gets the whole file."""
+    payload = test_msz.read_bytes()
+    await msz_client.post(
+        "/v1/upload",
+        content=payload,
+        headers={"X-Transfer-ID": "dl-if-range", "X-Original-Filename": "test.msz"},
+    )
+
+    resp = await msz_client.get(
+        "/v1/files/test.msz", headers={"Range": "bytes=10-", "If-Range": '"stale"'}
+    )
+    assert resp.status_code == 200
+    assert resp.content == payload
+
+
+@pytest.mark.asyncio
+async def test_download_range_not_satisfiable(msz_client, test_msz):
+    """A range past the end of the file gets a 416."""
+    payload = test_msz.read_bytes()
+    await msz_client.post(
+        "/v1/upload",
+        content=payload,
+        headers={"X-Transfer-ID": "dl-416", "X-Original-Filename": "test.msz"},
+    )
+
+    resp = await msz_client.get(
+        "/v1/files/test.msz", headers={"Range": f"bytes={len(payload)}-"}
+    )
+    assert resp.status_code == 416
+
+
+@pytest.mark.asyncio
 async def test_download_mzml(mzml_client, test_msz, test_mzml):
     """Download from an mzml-mode server returns the decompressed file."""
     payload = test_msz.read_bytes()
