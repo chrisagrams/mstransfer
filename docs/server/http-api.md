@@ -7,6 +7,14 @@ credentials.
 FastAPI also serves interactive docs at `/docs` and the OpenAPI schema at
 `/openapi.json`.
 
+Errors the routes raise have a JSON body with a human-readable reason:
+
+```json
+{"detail": "run1.msz already exists on the server"}
+```
+
+FastAPI's own 422 validation errors use a list `detail` instead.
+
 ## `GET /v1/health`
 
 Server status. Never requires auth.
@@ -23,7 +31,7 @@ Upload one file as a streamed request body of MSZ bytes.
 |--------|----------|-------------|
 | `X-Transfer-ID` | yes | Client-chosen unique ID (the client uses a UUID4) |
 | `X-Original-Filename` | yes | Original file name; its stem names the stored file |
-| `X-Source-Format` | no | `mzML`, `msz`, or `mszx` (sent by the client, informational) |
+| `X-Source-Format` | no | `mzML`, `msz`, or `mszx`; inferred from `X-Original-Filename` when absent |
 | `Content-Type` | no | `application/octet-stream` |
 
 The body is written to `<output-dir>/<stem>.msz`. With `store-as mzml`, it is
@@ -49,7 +57,7 @@ already exists, or another in-flight upload is writing it, the server responds
 | Status | Meaning |
 |--------|---------|
 | 200 | Stored. `state` is `done`, or `error` if decompression failed |
-| 400 | Missing `X-Transfer-ID` or `X-Original-Filename` |
+| 400 | Missing `X-Transfer-ID` or `X-Original-Filename`, or unsupported `X-Source-Format` |
 | 401 | Auth failed |
 | 409 | The output file already exists, or another transfer is writing it |
 | 500 | Reading the body or writing the file failed |
@@ -97,3 +105,8 @@ Stream one file. `Content-Type` is `application/xml` for mzML and
 `Content-Disposition: attachment` header. Returns 404 if the provider does not
 resolve the name. The default provider rejects names containing `/`, `\`, or
 `..`.
+
+The response carries `ETag` and `Last-Modified` validators and supports byte
+`Range` requests (`206 Partial Content`, or `416` for an unsatisfiable range),
+including `If-Range`, which is how the client
+[resumes](../guides/downloading.md#resuming) interrupted downloads.

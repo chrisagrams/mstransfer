@@ -1,6 +1,7 @@
 # Installation
 
-mstransfer requires Python 3.10 or newer.
+mstransfer requires Python 3.10 or newer and runs on Linux, macOS, and
+Windows.
 
 ## As a CLI tool
 
@@ -43,5 +44,6 @@ The repository ships a `Dockerfile` that runs `mstransfer serve`. See
 ## Verify
 
 ```bash
+mstransfer --version
 mstransfer --help
 ```

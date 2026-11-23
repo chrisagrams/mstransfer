@@ -42,15 +42,26 @@ if result.state is TransferState.DONE:
 
 HTTP errors raise `httpx.HTTPStatusError`, including the
 [409 Conflict](../server/http-api.md#post-v1upload) the server returns when
-the file's output already exists there. If polling sees no progress for
-`timeout` seconds (default 3600), it raises `TimeoutError`.
+the file's output already exists there. The server's reason is in the
+response body as `{"detail": "..."}`.
+
+Two timeouts apply:
+
+- `timeout=` takes an `httpx.Timeout` for the upload request, replacing the
+  client's. Without it, the client's timeouts are used (10 s connect, 3600 s
+  otherwise, when the function creates its own client).
+  `httpx.Timeout(None)` disables them.
+- `poll_timeout=` is how many seconds polling may go without server-side
+  progress (default 3600) before raising `TimeoutError`. `None` waits forever.
 
 ## Many files
 
 `send_batch` uploads with bounded parallelism and never raises for a single
-failed file. Instead, each input gets a
-[`FileResult`](../reference/client.md#mstransfer.client.sender.FileResult)
-in input order:
+failed file, including one that is missing or unreadable. Instead, each input
+gets a
+[`FileResult`](../reference/client.md#mstransfer.client.results.FileResult)
+in input order, holding either the final `UploadResponse` in `response` or the
+exception in `error`:
 
 ```python
 from mstransfer.client import resolve_inputs, send_batch
@@ -59,7 +70,7 @@ paths = resolve_inputs(["/data/batch", "/data/extra.msz"], recursive=True)
 results = send_batch(paths, server, parallel=4)
 
 for r in results:
-    if r.error:
+    if r.error is not None:
         print(f"{r.filename} failed: {r.error}")
 ```
 
@@ -70,7 +81,7 @@ for r in results:
 ## Authentication
 
 Pass `api_key=` to send `Authorization: Bearer <key>` on the upload and
-status requests:
+status requests (the batch functions take it too):
 
 ```python
 send_file(Path("experiment.mzML"), server, api_key="s3cret")

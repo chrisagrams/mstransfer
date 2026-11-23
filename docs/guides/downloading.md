@@ -16,9 +16,29 @@ path = download_file(
 )
 ```
 
-The body streams into `<dest>.part` and is renamed to the destination only
-once complete, so an interrupted download never leaves a truncated file in
-place. Missing parent directories are created.
+The body streams into a `.part` file next to the destination and is renamed
+into place only once complete and exactly the size the server announced, so
+an interrupted download never leaves a truncated file at the destination.
+Missing parent directories are created.
+
+## Resuming
+
+By default (`resume=True`), an interrupted download keeps its `.part` file,
+plus a `.part.json` describing it, and the next call for the same URL and
+destination continues from where it stopped with a `Range` request. A partial
+is kept only when the server sent a strong `ETag` and the body size, and it is
+resumed with `If-Range` carrying that `ETag`, so a file that changed on the
+server is downloaded again from the start. A server that ignores ranges also
+just sends the whole file again.
+
+Only one download to a destination at a time owns the resumable partial; it
+holds a lock on it. Any concurrent download to the same destination writes to
+its own private `.part` file, which is never resumed.
+
+- `resume=False` starts from zero and keeps nothing on failure. On success it
+  also removes a partial an earlier download left, unless another download is
+  using it.
+- `force=True` discards any partial before downloading.
 
 ## Converting on download
 
@@ -67,38 +87,47 @@ directory path.
   multi-member `.mszx`, its directory) already exists.
 - `force=True` always downloads, overriding `skip_existing`.
 
+## Timeouts
+
+Without `client=`, requests use a 10 s connect timeout and 300 s otherwise.
+`timeout=` takes an `httpx.Timeout` that replaces those (or a passed client's)
+for the download; `httpx.Timeout(None)` disables them.
+
 ## Many files
 
 ```python
 from pathlib import Path
 
-from mstransfer.client import download_batch
-from mstransfer.client.downloader import DownloadRequest
+from mstransfer.client import DownloadRequest, download_batch
 
 base = "http://remote-host:1319/v1/files"
 requests = [
     DownloadRequest(url=f"{base}/{name}", dest=Path("downloads") / name)
     for name in ("a.msz", "b.msz")
 ]
-paths = download_batch(requests, store_as="mzml", parallel=4)
+results = download_batch(requests, store_as="mzml", parallel=4)
+
+for r in results:
+    if r.error is not None:
+        print(f"{r.filename} failed: {r.error}")
+    elif r.response.skipped:
+        print(f"{r.filename} already exists at {r.response.path}")
+    else:
+        print(f"{r.filename} saved to {r.response.path}")
 ```
 
-Failed downloads are logged and left out of the returned list rather than
-raised.
+`download_batch` never raises for a single failed file. It returns one
+[`FileResult`](../reference/client.md#mstransfer.client.results.FileResult)
+per request, in input order and named after the request's `dest`. Each holds
+either a
+[`DownloadResult`](../reference/client.md#mstransfer.client.downloader.DownloadResult)
+(`request`, the final `path`, and `skipped`) in `response`, or the exception in
+`error`. A multi-member `.mszx` yields its archive directory as the path.
 
 ## Authentication
 
-The download functions do not take an `api_key`. To reach a server that
-requires one, pass a client with the header set:
+Pass `api_key=` to send `Authorization: Bearer <key>`:
 
 ```python
-import httpx
-
-from mstransfer.client import async_download_file
-
-
-async def main() -> None:
-    headers = {"Authorization": "Bearer s3cret"}
-    async with httpx.AsyncClient(headers=headers) as client:
-        await async_download_file(url, dest, client=client)
+download_file(url, dest, api_key="s3cret")
 ```

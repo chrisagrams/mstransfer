@@ -10,7 +10,11 @@ From the CLI:
 ```bash
 mstransfer serve --api-key s3cret
 mstransfer upload data/ remote-host:1319 --api-key s3cret
+mstransfer download http://remote-host:1319/v1/files/run1.msz --api-key s3cret
 ```
+
+Each command falls back to the `MS_API_KEY` environment variable when
+`--api-key` isn't given; see [CLI](../cli/index.md#api-key).
 
 From Python:
 
@@ -22,12 +26,9 @@ app = create_app(auth=APIKeyAuthProvider("s3cret"))
 
 `APIKeyAuthProvider` accepts the key as `Authorization: Bearer <key>` or as an
 `?api_key=<key>` query parameter, compares it in constant time, and returns
-401 otherwise.
-
-!!! note
-    `mstransfer download` has no `--api-key` flag. From Python, pass an
-    `httpx.AsyncClient` with the header set; see
-    [Downloading files](../guides/downloading.md#authentication).
+401 otherwise. Keys may contain non-ASCII characters; they are compared as
+UTF-8 bytes. The Python client's upload and download functions take an
+`api_key=` argument that sends the header.
 
 ## Custom providers
 

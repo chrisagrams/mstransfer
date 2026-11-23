@@ -47,10 +47,12 @@ compressed size is not known until the upload ends.
 [`DownloadProgressCallback`](../reference/client.md#mstransfer.client.downloader.DownloadProgressCallback),
 an object with two methods:
 
-- `on_total(total_bytes)`: called once when the server responds, with the
-  body size from `Content-Length`, or `None` if the server didn't send one or
-  the response is content-encoded.
-- `on_progress(bytes_delta)`: called per chunk.
+- `on_total(total_bytes)`: called when the server responds, with the file
+  size, or `None` if the server didn't send `Content-Length` or the response
+  is content-encoded.
+- `on_progress(bytes_delta)`: called per chunk. A
+  [resumed](downloading.md#resuming) download first reports the bytes it
+  already had as one delta, so the bar starts where it left off.
 
 ```python
 class Printer:
@@ -69,7 +71,9 @@ with `on_file_start`, `on_file_total`, `on_file_progress`, `on_file_complete`,
 and `on_file_error`, each keyed by the destination file name.
 `on_file_start` always receives `total_bytes=None`, because the size isn't
 known until the `GET` response arrives; `on_file_total` then reports it, with
-the same rules as `on_total`.
+the same rules as `on_total`. A file skipped by `skip_existing` gets
+`on_file_start` and `on_file_complete` with no total in between. An exception
+raised by `on_file_complete` is logged and doesn't fail the download.
 
 The CLI's Rich progress bars are implementations of these protocols; see
 `UploadProgressDisplay` and `DownloadProgressDisplay` in `mstransfer/cli.py`.
