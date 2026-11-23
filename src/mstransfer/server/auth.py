@@ -35,7 +35,7 @@ class NoAuthProvider:
 
 
 class APIKeyAuthProvider:
-    """Validates ``Authorization: Bearer <key>`` or ``?api_key=`` query param."""
+    """Validates `Authorization: Bearer <key>` or `?api_key=` query param."""
 
     def __init__(self, api_key: str) -> None:
         # compare_digest only accepts ASCII str, so compare UTF-8 bytes instead.

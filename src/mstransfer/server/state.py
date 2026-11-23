@@ -56,7 +56,7 @@ class OutputClaims:
         return True
 
     def release(self, path: Path) -> None:
-        """Give up a reservation made with :meth:`claim`."""
+        """Give up a reservation made with `claim`."""
         self._claimed.discard(str(path).casefold())
 
 

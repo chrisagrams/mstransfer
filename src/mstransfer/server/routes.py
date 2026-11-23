@@ -39,18 +39,14 @@ def make_router(
 ) -> APIRouter:
     """Create the API router, optionally protecting routes with *auth_dep*.
 
-    Parameters
-    ----------
-    auth_dep:
-        Optional FastAPI dependency for authentication.
-    state:
-        Optional :class:`AppState` instance.  When provided the router
-        uses it directly (via a closure) instead of reading
-        ``request.app.state``.  This allows the router to be included
-        in a parent app with ``app.include_router(...)`` without
-        requiring the parent to set up ``app.state``.
+    Args:
+        auth_dep: Optional FastAPI dependency for authentication.
+        state: Optional `AppState` instance.  When provided the router uses
+            it directly (via a closure) instead of reading
+            `request.app.state`.  This allows the router to be included in
+            a parent app with `app.include_router(...)` without requiring
+            the parent to set up `app.state`.
     """
-
     if state is not None:
         _fixed = state
 
@@ -68,10 +64,7 @@ def make_router(
 
     @router.get("/health", response_model=HealthResponse)
     async def health(state: AppState = state_dep) -> HealthResponse:
-        """
-        Simple health check endpoint that returns the server status, version,
-          and storage configuration.
-        """
+        """Return the server status, version, and storage configuration."""
         return HealthResponse(
             status="ok",
             version=__version__,
@@ -87,9 +80,7 @@ def make_router(
     async def transfer_status(
         transfer_id: str, state: AppState = state_dep
     ) -> TransferRecord:
-        """
-        Endpoint to check the status of an ongoing or completed transfer by its ID.
-        """
+        """Return the status of an ongoing or completed transfer by its ID."""
         # Get the corresponding transfer record from the registry.
         record = state.transfers.get(transfer_id)
 
@@ -105,24 +96,24 @@ def make_router(
         responses={**auth_errors, 400: error, 409: error, 500: error},
     )
     async def upload(request: Request, state: AppState = state_dep) -> UploadResponse:
-        """
-        Endpoint to handle file uploads. Expects the file content in the request body
-        and requires the following headers:
+        """Receive a file streamed in the request body.
 
-            - X-Transfer-ID: A unique identifier for the transfer.
-            - X-Original-Filename: The original filename of the uploaded file.
+        Requires the following headers:
+
+        - `X-Transfer-ID`: A unique identifier for the transfer.
+        - `X-Original-Filename`: The original filename of the uploaded file.
 
         and optionally:
 
-            - X-Source-Format: ``mzML``, ``msz`` or ``mszx``.  Inferred from
-              the filename extension when absent.
+        - `X-Source-Format`: `mzML`, `msz` or `mszx`. Inferred from the
+          filename extension when absent.
 
         Responds 409 Conflict, before reading the request body, if the output
         file already exists or another transfer is writing it.
 
-        The server will stream the incoming data to a file, update the transfer registry
-        with the progress, and optionally decompress if configured to do so.  MSZX
-        archives are always stored as-is, regardless of ``store_as``.
+        The server will stream the incoming data to a file, update the transfer
+        registry with the progress, and optionally decompress if configured to
+        do so. MSZX archives are always stored as-is, regardless of `store_as`.
         """
         # Get the transfer ID, raise if missing.
         transfer_id = request.headers.get("X-Transfer-ID")
@@ -250,10 +241,10 @@ def make_router(
     async def list_files(state: AppState = state_dep) -> FileListResponse:
         """List all files available for download.
 
-        Note: ``response_model`` is intentionally omitted so that
-        custom :class:`~mstransfer.server.models.FileInfo` subclass
-        fields (added by a custom :class:`FileProvider`) are preserved
-        in the response via ``SerializeAsAny``.
+        Note: `response_model` is intentionally omitted so that
+        custom `FileInfo` subclass
+        fields (added by a custom `FileProvider`) are preserved
+        in the response via `SerializeAsAny`.
         """
         files = await state.files.list_files()
         return FileListResponse(files=files)
@@ -266,8 +257,8 @@ def make_router(
     async def download_file(filename: str, state: AppState = state_dep) -> FileResponse:
         """Download a single file by name.
 
-        Supports byte ``Range`` requests (``206``/``416``) and ``If-Range``,
-        and sends ``ETag`` and ``Last-Modified`` validators, so an
+        Supports byte `Range` requests (`206`/`416`) and `If-Range`,
+        and sends `ETag` and `Last-Modified` validators, so an
         interrupted download can be resumed.
         """
         path = await state.files.get_file(filename)

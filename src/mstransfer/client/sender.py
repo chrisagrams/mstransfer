@@ -57,14 +57,13 @@ async def async_send_file(
     from mscompress.  Returns the final transfer status from the server.
 
     *timeout* replaces *client*'s timeouts for the upload request; pass
-    ``httpx.Timeout(None)`` for no limit.  If *None*, *client*'s timeouts
+    `httpx.Timeout(None)` for no limit.  If *None*, *client*'s timeouts
     are used (10 s connect, 3600 s otherwise, without *client*).
 
     *poll_timeout* is how long to wait without server-side progress while
     polling for completion, in seconds, or *None* to wait forever.  Status
     polls use *client*'s timeout, or 10 s without *client*.
     """
-
     # Generate a unique transfer ID.
     transfer_id = str(uuid.uuid4())
 
@@ -143,7 +142,6 @@ async def _async_poll_status(
 
     *timeout* is how long to wait without progress; *None* waits forever.
     """
-
     # Configure a deadline for the polling operation (None polls forever).
     deadline = None if timeout is None else time.monotonic() + timeout
 
@@ -192,10 +190,10 @@ async def async_send_batch(
 ) -> list[FileResult[UploadResponse]]:
     """Send multiple files with configurable parallelism (async).
 
-    Returns one :class:`FileResult` per source, in input order, carrying
+    Returns one `FileResult` per source, in input order, carrying
     the final transfer status or the error.
 
-    *timeout* and *poll_timeout* are passed to :func:`async_send_file` for
+    *timeout* and *poll_timeout* are passed to `async_send_file` for
     each file.
     """
     workers = min(parallel, len(sources))
@@ -291,7 +289,7 @@ def send_file(
     Accepts a file path, or an already-opened MZMLFile / MSZFile / MSZXFile
     from mscompress.  Returns the final transfer status from the server.
 
-    This is a synchronous wrapper around :func:`async_send_file`.
+    This is a synchronous wrapper around `async_send_file`.
     """
     return asyncio.run(
         async_send_file(
@@ -320,10 +318,10 @@ def send_batch(
 ) -> list[FileResult[UploadResponse]]:
     """Send multiple files with configurable parallelism.
 
-    *timeout* and *poll_timeout* are passed to :func:`async_send_file` for
-    each file.
+    *timeout* and *poll_timeout* are passed to `async_send_file` for each
+    file.
 
-    This is a synchronous wrapper around :func:`async_send_batch`.
+    This is a synchronous wrapper around `async_send_batch`.
     """
     return asyncio.run(
         async_send_batch(

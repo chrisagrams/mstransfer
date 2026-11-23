@@ -75,7 +75,7 @@ class DownloadResult:
 class _PartialInfo(BaseModel):
     """What a resumable .part file holds: the start of *url*'s *total*-byte body.
 
-    *etag* is the strong ``ETag`` the body was sent with, so a resumed range
+    *etag* is the strong `ETag` the body was sent with, so a resumed range
     can be checked against it.
     """
 
@@ -100,81 +100,69 @@ async def async_download_file(
 ) -> Path:
     """Download a single file from *url* to *dest* (async).
 
-    The file is streamed to a temporary ``.part`` file first, then atomically
+    The file is streamed to a temporary `.part` file first, then atomically
     renamed (or converted) to the final destination on success.
 
-    With *resume*, an interrupted download keeps its partial ``.part`` file
-    (and a ``.part.json`` describing it) next to *dest*, and a later call
+    With *resume*, an interrupted download keeps its partial `.part` file
+    (and a `.part.json` describing it) next to *dest*, and a later call
     continues from the bytes already received.  A partial is only kept when
-    the server sent a strong ``ETag`` and the body size, and it is only
-    resumed with an ``If-Range`` request carrying that ``ETag``.  If the
+    the server sent a strong `ETag` and the body size, and it is only
+    resumed with an `If-Range` request carrying that `ETag`.  If the
     server does not support ranges, or the file changed, the download
-    restarts from zero.  The finished file must have
-    exactly the expected size.
+    restarts from zero.  The finished file must have exactly the expected
+    size.
 
-    Parameters
-    ----------
-    url:
-        The URL to download from.
-    dest:
-        The local path where the file should be saved.  If *store_as*
-        requires a format conversion, the extension will be adjusted
-        automatically.
-    store_as:
-        Desired output format — ``"msz"``, ``"mzml"``, ``"mszx"``, or
-        *None* to keep the file as-is.  When set, the downloaded file
-        is converted after download using **mscompress**.  Conversion
-        *to* ``"mszx"`` is only supported when the source is already
-        ``.mszx`` (no-op); other combos raise :class:`NotImplementedError`.
-        When a multi-member (batch) ``.mszx`` is stored as ``"msz"`` or
-        ``"mzml"``, its members are written to a directory named after
-        the archive, ``dest.parent/<dest stem>/<entry stem>.<ext>``.  The
-        directory appears only once every member is written, and replaces
-        any existing directory of that name.  Members whose names collide
-        raise :class:`ValueError` before anything is written.
-    chunk_size:
-        Number of bytes per read chunk (default 1 MiB).
-    timeout:
-        Timeouts for the request, replacing *client*'s; pass
-        ``httpx.Timeout(None)`` for no limit.  If *None*, *client*'s
-        timeouts are used (10 s connect, 300 s otherwise, without
-        *client*).
-    progress_callback:
-        Optional callback.  ``on_total`` is invoked once the server
-        responds, with the file size (or *None* if unknown); ``on_progress``
-        is invoked with byte deltas per chunk.  A resumed download first
-        reports the bytes it already had as one delta.
-    skip_existing:
-        If *True* and the final destination already exists, skip the
-        download.  For an ``.mszx`` stored as ``"msz"`` or ``"mzml"``, an
-        existing archive directory (see *store_as*) also counts.
-    force:
-        If *True*, re-download even if the destination already exists
-        (overrides *skip_existing*), discarding any partial download.
-    resume:
-        If *True* (the default), resume a partial download of *url* to
-        *dest* and keep this one's partial if it is interrupted.  Only one
-        download to *dest* at a time can do so; a concurrent one uses a
-        private ``.part`` file that is never resumed.  If *False*,
-        start from zero and keep nothing on failure; on success, remove
-        the partial an earlier download left, unless one is using it.
-    api_key:
-        Optional API key, sent as ``Authorization: Bearer <key>``.
-    client:
-        Optional :class:`httpx.AsyncClient` to reuse.
+    Args:
+        url: The URL to download from.
+        dest: The local path where the file should be saved.  If *store_as*
+            requires a format conversion, the extension will be adjusted
+            automatically.
+        store_as: Desired output format — `"msz"`, `"mzml"`, `"mszx"`, or
+            *None* to keep the file as-is.  When set, the downloaded file
+            is converted after download using **mscompress**.  Conversion
+            *to* `"mszx"` is only supported when the source is already
+            `.mszx` (no-op).  When a multi-member (batch) `.mszx` is
+            stored as `"msz"` or `"mzml"`, its members are written to a
+            directory named after the archive,
+            `dest.parent/<dest stem>/<entry stem>.<ext>`.  The directory
+            appears only once every member is written, and replaces any
+            existing directory of that name.
+        chunk_size: Number of bytes per read chunk (default 1 MiB).
+        timeout: Timeouts for the request, replacing *client*'s; pass
+            `httpx.Timeout(None)` for no limit.  If *None*, *client*'s
+            timeouts are used (10 s connect, 300 s otherwise, without
+            *client*).
+        progress_callback: Optional callback.  `on_total` is invoked once
+            the server responds, with the file size (or *None* if unknown);
+            `on_progress` is invoked with byte deltas per chunk.  A resumed
+            download first reports the bytes it already had as one delta.
+        skip_existing: If *True* and the final destination already exists,
+            skip the download.  For an `.mszx` stored as `"msz"` or
+            `"mzml"`, an existing archive directory (see *store_as*) also
+            counts.
+        force: If *True*, re-download even if the destination already exists
+            (overrides *skip_existing*), discarding any partial download.
+        resume: If *True* (the default), resume a partial download of *url*
+            to *dest* and keep this one's partial if it is interrupted.  Only
+            one download to *dest* at a time can do so; a concurrent one uses
+            a private `.part` file that is never resumed.  If *False*, start
+            from zero and keep nothing on failure; on success, remove the
+            partial an earlier download left, unless one is using it.
+        api_key: Optional API key, sent as `Authorization: Bearer <key>`.
+        client: Optional `httpx.AsyncClient` to reuse; a temporary one is
+            created and closed otherwise.
 
-    Returns
-    -------
-    Path
-        The final destination path (may differ from *dest* if the
-        extension was adjusted for format conversion), or the archive
-        directory for a multi-member ``.mszx``.
+    Returns:
+        The final destination path (may differ from *dest* if the extension
+        was adjusted for format conversion), or the archive directory for a
+        multi-member `.mszx`.
 
-    Raises
-    ------
-    ValueError
-        If the downloaded size does not match the size the server announced,
-        or the server sent part of the file when it was not asked to.
+    Raises:
+        NotImplementedError: The source cannot be converted to *store_as*.
+        ValueError: Two members of a multi-member `.mszx` map to the same
+            output name (raised before anything is written), the downloaded
+            size does not match the size the server announced, or the server
+            sent part of the file when it was not asked to.
     """
     plan = StorePlan.for_download(url, dest, store_as)
 
@@ -382,44 +370,32 @@ async def async_download_batch(
 ) -> list[FileResult[DownloadResult]]:
     """Download multiple files in parallel (async).
 
-    Parameters
-    ----------
-    files:
-        List of :class:`DownloadRequest` objects (url + dest pairs).
-    store_as:
-        Desired output format — ``"msz"``, ``"mzml"``, ``"mszx"``, or
-        *None* to keep files as-is.  Forwarded to each
-        :func:`async_download_file` call.
-    parallel:
-        Maximum number of concurrent downloads (capped to file count).
-    chunk_size:
-        Number of bytes per read chunk.
-    timeout:
-        Timeouts for each request, replacing *client*'s; pass
-        ``httpx.Timeout(None)`` for no limit.  If *None*, *client*'s
-        timeouts are used (10 s connect, 300 s otherwise, without
-        *client*).
-    progress:
-        Optional batch progress callback.
-    skip_existing:
-        If *True*, skip files whose destination already exists.
-    force:
-        If *True*, re-download even if destination exists.
-    resume:
-        If *True* (the default), resume partial downloads and keep
-        resumable partials of failed ones (see :func:`async_download_file`).
-    api_key:
-        Optional API key, sent as ``Authorization: Bearer <key>``.
-    client:
-        Optional :class:`httpx.AsyncClient` shared by all downloads.
+    Args:
+        files: List of `DownloadRequest` objects (url + dest pairs).
+        store_as: Desired output format — `"msz"`, `"mzml"`, `"mszx"`, or
+            *None* to keep files as-is.  Forwarded to each
+            `async_download_file` call.
+        parallel: Maximum number of concurrent downloads (capped to file
+            count).
+        chunk_size: Number of bytes per read chunk.
+        timeout: Timeouts for each request, replacing *client*'s; pass
+            `httpx.Timeout(None)` for no limit.  If *None*, *client*'s
+            timeouts are used (10 s connect, 300 s otherwise, without
+            *client*).
+        progress: Optional batch progress callback.
+        skip_existing: If *True*, skip files whose destination already exists.
+        force: If *True*, re-download even if destination exists.
+        resume: If *True* (the default), resume partial downloads and keep
+            resumable partials of failed ones (see `async_download_file`).
+        api_key: Optional API key, sent as `Authorization: Bearer <key>`.
+        client: Optional `httpx.AsyncClient` shared by every download; a
+            temporary one is created per request otherwise.
 
-    Returns
-    -------
-    list[FileResult[DownloadResult]]
+    Returns:
         One result per request, in input order, named after the request's
-        *dest*, carrying either a :class:`DownloadResult` or the error.  A
-        multi-member ``.mszx`` yields its archive directory as the path.  A
-        file skipped by *skip_existing* has ``skipped`` set and is still
+        *dest*, carrying either a `DownloadResult` or the error.  A
+        multi-member `.mszx` yields its archive directory as the path.  A
+        file skipped by *skip_existing* has `skipped` set and is still
         reported to *progress* as complete.
     """
     workers = min(parallel, len(files))
@@ -501,7 +477,7 @@ def download_file(
 ) -> Path:
     """Download a single file from *url* to *dest*.
 
-    This is a synchronous wrapper around :func:`async_download_file`.
+    This is a synchronous wrapper around `async_download_file`.
     """
     return asyncio.run(
         async_download_file(
@@ -536,7 +512,7 @@ def download_batch(
 ) -> list[FileResult[DownloadResult]]:
     """Download multiple files in parallel.
 
-    This is a synchronous wrapper around :func:`async_download_batch`.
+    This is a synchronous wrapper around `async_download_batch`.
     """
     return asyncio.run(
         async_download_batch(
@@ -556,7 +532,7 @@ def download_batch(
 
 
 class _FileProgressAdapter:
-    """Adapts :class:`BatchDownloadProgress` to :class:`DownloadProgressCallback`."""
+    """Adapts `BatchDownloadProgress` to `DownloadProgressCallback`."""
 
     def __init__(self, filename: str, batch: BatchDownloadProgress) -> None:
         self._filename = filename
