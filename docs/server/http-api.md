@@ -2,7 +2,10 @@
 
 All endpoints live under `/v1`. When the server has an
 [auth provider](auth.md), every endpoint except `/v1/health` requires
-credentials.
+credentials. A server can instead require them only for uploads
+(`/v1/upload`, `/v1/transfer/{id}/status`) or only for downloads
+(`/v1/files`, `/v1/files/{filename}`); see
+[Protecting uploads or downloads only](auth.md#protecting-uploads-or-downloads-only).
 
 FastAPI also serves interactive docs at `/docs` and the OpenAPI schema at
 `/openapi.json`.

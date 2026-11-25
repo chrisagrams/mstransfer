@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import httpx
 import pytest
 
@@ -224,3 +226,124 @@ class TestAuthIntegration:
         )
         assert resp.status_code == 200
         assert resp.json()["state"] == "done"
+
+
+# ---------------------------------------------------------------------------
+# Per-direction auth (upload vs. download)
+# ---------------------------------------------------------------------------
+
+UPLOAD_ROUTES = [
+    ("POST", "/v1/upload"),
+    ("GET", "/v1/transfer/{transfer_id}/status"),
+]
+DOWNLOAD_ROUTES = [
+    ("GET", "/v1/files"),
+    ("GET", "/v1/files/{filename}"),
+]
+
+
+async def _unauthenticated_codes(app) -> dict[str, int]:
+    """Hit every protected-capable route without credentials."""
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        upload = await c.post(
+            "/v1/upload",
+            content=b"data",
+            headers={"X-Transfer-ID": "t1", "X-Original-Filename": "f.msz"},
+        )
+        return {
+            "upload": upload.status_code,
+            "status": (await c.get("/v1/transfer/nope/status")).status_code,
+            "list": (await c.get("/v1/files")).status_code,
+            "download": (await c.get("/v1/files/nope.msz")).status_code,
+        }
+
+
+def _documents_401(app, method: str, path: str) -> bool:
+    op = app.openapi()["paths"][path][method.lower()]
+    return "401" in op["responses"]
+
+
+class TestPerDirectionAuth:
+    @pytest.mark.asyncio
+    async def test_auth_protects_everything(self, tmp_output):
+        app = create_app(output_dir=str(tmp_output), auth=APIKeyAuthProvider("k"))
+        codes = await _unauthenticated_codes(app)
+        assert codes == {"upload": 401, "status": 401, "list": 401, "download": 401}
+
+    @pytest.mark.asyncio
+    async def test_upload_only(self, tmp_output):
+        app = create_app(
+            output_dir=str(tmp_output), upload_auth=APIKeyAuthProvider("k")
+        )
+        codes = await _unauthenticated_codes(app)
+        assert codes == {"upload": 401, "status": 401, "list": 200, "download": 404}
+
+    @pytest.mark.asyncio
+    async def test_download_only(self, tmp_output):
+        app = create_app(
+            output_dir=str(tmp_output), download_auth=APIKeyAuthProvider("k")
+        )
+        codes = await _unauthenticated_codes(app)
+        # Upload passes auth and fails on the bogus body instead.
+        assert codes["upload"] != 401
+        assert codes["status"] == 404
+        assert codes["list"] == 401
+        assert codes["download"] == 401
+
+    @pytest.mark.asyncio
+    async def test_separate_keys(self, tmp_output):
+        app = create_app(
+            output_dir=str(tmp_output),
+            upload_auth=APIKeyAuthProvider("up"),
+            download_auth=APIKeyAuthProvider("down"),
+        )
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+            up = {"Authorization": "Bearer up"}
+            down = {"Authorization": "Bearer down"}
+            assert (await c.get("/v1/files", headers=up)).status_code == 401
+            assert (await c.get("/v1/files", headers=down)).status_code == 200
+            status = "/v1/transfer/nope/status"
+            assert (await c.get(status, headers=down)).status_code == 401
+            assert (await c.get(status, headers=up)).status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_health_open_with_both(self, tmp_output):
+        app = create_app(
+            output_dir=str(tmp_output),
+            upload_auth=APIKeyAuthProvider("up"),
+            download_auth=APIKeyAuthProvider("down"),
+        )
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+            assert (await c.get("/v1/health")).status_code == 200
+
+    @pytest.mark.parametrize("kwarg", ["upload_auth", "download_auth"])
+    def test_auth_combined_with_per_direction_raises(self, tmp_output, kwarg):
+        kwargs: dict[str, Any] = {kwarg: APIKeyAuthProvider("k2")}
+        with pytest.raises(TypeError, match="can't be combined"):
+            create_app(
+                output_dir=str(tmp_output), auth=APIKeyAuthProvider("k"), **kwargs
+            )
+
+    @pytest.mark.parametrize("kwarg", ["auth", "upload_auth", "download_auth"])
+    def test_bad_type_names_argument(self, tmp_output, kwarg):
+        kwargs: dict[str, Any] = {kwarg: 42}
+        with pytest.raises(TypeError, match=f"^{kwarg} must be"):
+            create_app(output_dir=str(tmp_output), **kwargs)
+
+    def test_openapi_401_follows_dependency(self, tmp_output):
+        app = create_app(
+            output_dir=str(tmp_output), upload_auth=APIKeyAuthProvider("k")
+        )
+        for method, path in UPLOAD_ROUTES:
+            assert _documents_401(app, method, path), path
+        for method, path in DOWNLOAD_ROUTES:
+            assert not _documents_401(app, method, path), path
+        assert not _documents_401(app, "GET", "/v1/health")
+
+    def test_openapi_no_401_without_auth(self, tmp_output):
+        app = create_app(output_dir=str(tmp_output))
+        for method, path in UPLOAD_ROUTES + DOWNLOAD_ROUTES:
+            assert not _documents_401(app, method, path), path

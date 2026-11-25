@@ -166,3 +166,50 @@ def test_routes_in_parent_openapi(embedded_app: FastAPI) -> None:
     assert "/transfer/v1/health" in paths
     assert "/transfer/v1/upload" in paths
     assert "/transfer/v1/files" in paths
+
+
+# ---------------------------------------------------------------------------
+# Per-direction auth with make_router
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_make_router_upload_only_auth(embedded_state: AppState) -> None:
+    app = FastAPI()
+    dep = make_auth_dependency(APIKeyAuthProvider("secret"))
+    app.include_router(
+        make_router(state=embedded_state, upload_auth_dep=dep), prefix="/t"
+    )
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        assert (await c.get("/t/files")).status_code == 200
+        assert (await c.get("/t/files/missing.msz")).status_code == 404
+        assert (await c.get("/t/transfer/x/status")).status_code == 401
+        resp = await c.post(
+            "/t/upload",
+            content=b"data",
+            headers={"X-Transfer-ID": "t1", "X-Original-Filename": "f.msz"},
+        )
+        assert resp.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_make_router_download_only_auth(embedded_state: AppState) -> None:
+    app = FastAPI()
+    dep = make_auth_dependency(APIKeyAuthProvider("secret"))
+    app.include_router(
+        make_router(state=embedded_state, download_auth_dep=dep), prefix="/t"
+    )
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        assert (await c.get("/t/files")).status_code == 401
+        assert (await c.get("/t/files/missing.msz")).status_code == 401
+        assert (await c.get("/t/transfer/x/status")).status_code == 404
+
+
+def test_make_router_auth_dep_combined_raises() -> None:
+    dep = make_auth_dependency(APIKeyAuthProvider("secret"))
+    with pytest.raises(TypeError, match="can't be combined"):
+        make_router(auth_dep=dep, download_auth_dep=dep)
