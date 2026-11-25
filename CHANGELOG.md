@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.3.1](https://github.com/chrisagrams/mstransfer/compare/v0.3.0...v0.3.1) (2026-11-25)
+
+
+### Bug Fixes
+
+* allow protecting uploads and downloads separately ([#129](https://github.com/chrisagrams/mstransfer/issues/129)) ([53efab2](https://github.com/chrisagrams/mstransfer/commit/53efab26f4dc57f4344b61758bdbae5cc13461a7))
+
+
+### Dependencies
+
+* bump filelock from 4.2.12 to 4.3.0 in the production-dependencies group ([#126](https://github.com/chrisagrams/mstransfer/issues/126)) ([e334715](https://github.com/chrisagrams/mstransfer/commit/e3347157496f248cb6c4112a4b5a86ea7d053c3b))
+
 ## [0.3.0](https://github.com/chrisagrams/mstransfer/compare/v0.2.3...v0.3.0) (2026-11-23)
 
 
