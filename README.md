@@ -185,6 +185,7 @@ when the bytes are stored under another name, such as a content-addressed blob:
 ```python
 from mstransfer.server.models import ServedFile
 
+
 class BlobProvider:
     async def list_files(self): ...
 
