@@ -1,7 +1,8 @@
 # Authentication
 
 Auth is off by default. When enabled, it protects every endpoint except
-`GET /v1/health`.
+`GET /v1/health`. Uploads and downloads can also be protected separately; see
+[Protecting uploads or downloads only](#protecting-uploads-or-downloads-only).
 
 ## API key
 
@@ -59,3 +60,30 @@ app = create_app(auth=HeaderTokenProvider({"abc": "alice"}))
 `create_app(auth=...)` also accepts a plain FastAPI dependency callable, so
 you can reuse your app's existing auth dependency. For `make_router`, wrap a
 provider with `make_auth_dependency(provider)`.
+
+## Protecting uploads or downloads only
+
+`auth` protects every route except `/v1/health`. To protect the two
+directions separately, pass `upload_auth` and/or `download_auth` instead:
+
+| Group | Routes |
+|-------|--------|
+| upload | `POST /v1/upload`, `GET /v1/transfer/{id}/status` |
+| download | `GET /v1/files`, `GET /v1/files/{filename}` |
+
+A group with no auth is open. For example, a server that publishes files to
+anyone but only accepts uploads from trusted clients:
+
+```python
+from mstransfer import APIKeyAuthProvider, create_app
+
+app = create_app(upload_auth=APIKeyAuthProvider("s3cret"))
+```
+
+Each accepts the same values as `auth`, so the two directions can also use
+different keys or providers. `auth` can't be combined with either one;
+doing so raises `TypeError`.
+
+`make_router` takes the same split as `upload_auth_dep` and
+`download_auth_dep`, alongside `auth_dep`. The OpenAPI schema documents a
+401 response only on routes that have auth.
