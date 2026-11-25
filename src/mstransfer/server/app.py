@@ -17,7 +17,7 @@ from mstransfer.server.state import AppState
 
 
 def _resolve_auth(
-    name: str, auth: AuthProvider | Callable[..., Any] | None
+    auth: AuthProvider | Callable[..., Any] | None,
 ) -> Callable[..., Any] | None:
     """Turn an `AuthProvider`, callable, or *None* into a FastAPI dependency."""
     if auth is None:
@@ -26,7 +26,7 @@ def _resolve_auth(
         return make_auth_dependency(auth)
     if callable(auth):
         return auth
-    msg = f"{name} must be an AuthProvider, callable, or None — got {type(auth)}"
+    msg = f"auth must be an AuthProvider, callable, or None — got {type(auth)}"
     raise TypeError(msg)
 
 
@@ -45,9 +45,8 @@ def create_app(
         output_dir: Directory where received files are stored.
         store_as: Output format — "msz" or "mzml".
         auth: Authentication provider, raw FastAPI dependency, or *None*
-              (no auth, backward-compatible default).  Protects both uploads
-              and downloads.  Can't be combined with *upload_auth* or
-              *download_auth*.
+              (no auth).  Protects both uploads and downloads.  Can't be
+              combined with *upload_auth* or *download_auth*.
         file_provider: File discovery provider, or *None* to default to
               scanning *output_dir* on disk.
         upload_auth: Like *auth*, but only for `POST /v1/upload` and
@@ -66,10 +65,10 @@ def create_app(
         )
         raise TypeError(msg)
     if auth is not None:
-        upload_dep = download_dep = _resolve_auth("auth", auth)
+        upload_dep = download_dep = _resolve_auth(auth)
     else:
-        upload_dep = _resolve_auth("upload_auth", upload_auth)
-        download_dep = _resolve_auth("download_auth", download_auth)
+        upload_dep = _resolve_auth(upload_auth)
+        download_dep = _resolve_auth(download_auth)
 
     app = FastAPI(title="mstransfer")
     out = Path(output_dir)

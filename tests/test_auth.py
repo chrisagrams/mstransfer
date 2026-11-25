@@ -328,9 +328,9 @@ class TestPerDirectionAuth:
             )
 
     @pytest.mark.parametrize("kwarg", ["auth", "upload_auth", "download_auth"])
-    def test_bad_type_names_argument(self, tmp_output, kwarg):
+    def test_bad_type_raises(self, tmp_output, kwarg):
         kwargs: dict[str, Any] = {kwarg: 42}
-        with pytest.raises(TypeError, match=f"^{kwarg} must be"):
+        with pytest.raises(TypeError, match="must be an AuthProvider"):
             create_app(output_dir=str(tmp_output), **kwargs)
 
     def test_openapi_401_follows_dependency(self, tmp_output):
