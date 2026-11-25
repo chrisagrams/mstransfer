@@ -20,6 +20,8 @@ uvicorn.run(app, host="0.0.0.0", port=1319)
 | `store_as` | `"msz"` | `"msz"` or `"mzml"` |
 | `auth` | `None` | An [`AuthProvider`](auth.md), a raw FastAPI dependency, or `None` for no auth |
 | `file_provider` | `None` | A [`FileProvider`](file-providers.md); defaults to scanning `output_dir` |
+| `upload_auth` | `None` | Like `auth`, but only for upload and transfer status (keyword-only) |
+| `download_auth` | `None` | Like `auth`, but only for file list and download (keyword-only) |
 
 ## Mounting as a sub-application
 
@@ -57,7 +59,20 @@ app.include_router(make_router(state=state), prefix="/transfer/v1")
 ```
 
 `make_router(auth_dep=...)` takes a FastAPI dependency to protect every route
-except `/health`. Build one from a provider with `make_auth_dependency`; see
+except `/health`. To protect only one direction, pass `upload_auth_dep`
+(upload and transfer status) and/or `download_auth_dep` (file list and
+download) instead; a group without a dependency is left open:
+
+```python
+from mstransfer import APIKeyAuthProvider, make_auth_dependency
+
+auth = make_auth_dependency(APIKeyAuthProvider("s3cret"))
+app.include_router(
+    make_router(state=state, upload_auth_dep=auth), prefix="/transfer/v1"
+)
+```
+
+`auth_dep` can't be combined with the per-direction arguments. See
 [Authentication](auth.md).
 
 Uploads are written to `state.output_dir` regardless of the file provider,

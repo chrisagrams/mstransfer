@@ -36,17 +36,43 @@ logger = logging.getLogger(__name__)
 def make_router(
     auth_dep: Callable[..., Any] | None = None,
     state: AppState | None = None,
+    *,
+    upload_auth_dep: Callable[..., Any] | None = None,
+    download_auth_dep: Callable[..., Any] | None = None,
 ) -> APIRouter:
-    """Create the API router, optionally protecting routes with *auth_dep*.
+    """Create the API router, optionally protecting routes with auth dependencies.
+
+    Routes are split into two groups that can be protected separately:
+
+    - upload: `POST /upload` and `GET /transfer/{transfer_id}/status`
+    - download: `GET /files` and `GET /files/{filename}`
+
+    `GET /health` is never protected.
 
     Args:
-        auth_dep: Optional FastAPI dependency for authentication.
+        auth_dep: Optional FastAPI dependency applied to both groups.  Can't
+            be combined with *upload_auth_dep* or *download_auth_dep*.
         state: Optional `AppState` instance.  When provided the router uses
             it directly (via a closure) instead of reading
             `request.app.state`.  This allows the router to be included in
             a parent app with `app.include_router(...)` without requiring
             the parent to set up `app.state`.
+        upload_auth_dep: Optional dependency for the upload group only.
+        download_auth_dep: Optional dependency for the download group only.
+
+    Raises:
+        TypeError: If *auth_dep* is combined with *upload_auth_dep* or
+            *download_auth_dep*.
     """
+    if auth_dep is not None:
+        if upload_auth_dep is not None or download_auth_dep is not None:
+            msg = (
+                "auth_dep can't be combined with upload_auth_dep or "
+                "download_auth_dep; pass the per-direction dependencies instead"
+            )
+            raise TypeError(msg)
+        upload_auth_dep = download_auth_dep = auth_dep
+
     if state is not None:
         _fixed = state
 
@@ -58,9 +84,18 @@ def make_router(
         state_dep = Depends(_state_from_app)
 
     router = APIRouter()
-    protected: list[Any] = [Depends(auth_dep)] if auth_dep else []
     error: dict[str, Any] = {"model": ErrorResponse}
-    auth_errors: dict[int | str, dict[str, Any]] = {401: error} if auth_dep else {}
+
+    def _guard(
+        dep: Callable[..., Any] | None,
+    ) -> tuple[list[Any], dict[int | str, dict[str, Any]]]:
+        """Return the route dependencies and 401 response docs for *dep*."""
+        if dep is None:
+            return [], {}
+        return [Depends(dep)], {401: error}
+
+    upload_protected, upload_auth_errors = _guard(upload_auth_dep)
+    download_protected, download_auth_errors = _guard(download_auth_dep)
 
     @router.get("/health", response_model=HealthResponse)
     async def health(state: AppState = state_dep) -> HealthResponse:
@@ -74,8 +109,8 @@ def make_router(
     @router.get(
         "/transfer/{transfer_id}/status",
         response_model=TransferRecord,
-        dependencies=protected,
-        responses={**auth_errors, 404: error},
+        dependencies=upload_protected,
+        responses={**upload_auth_errors, 404: error},
     )
     async def transfer_status(
         transfer_id: str, state: AppState = state_dep
@@ -92,8 +127,8 @@ def make_router(
     @router.post(
         "/upload",
         response_model=UploadResponse,
-        dependencies=protected,
-        responses={**auth_errors, 400: error, 409: error, 500: error},
+        dependencies=upload_protected,
+        responses={**upload_auth_errors, 400: error, 409: error, 500: error},
     )
     async def upload(request: Request, state: AppState = state_dep) -> UploadResponse:
         """Receive a file streamed in the request body.
@@ -237,7 +272,9 @@ def make_router(
         finally:
             state.outputs.release(dest)
 
-    @router.get("/files", dependencies=protected, responses=auth_errors)
+    @router.get(
+        "/files", dependencies=download_protected, responses=download_auth_errors
+    )
     async def list_files(state: AppState = state_dep) -> FileListResponse:
         """List all files available for download.
 
@@ -251,8 +288,8 @@ def make_router(
 
     @router.get(
         "/files/{filename}",
-        dependencies=protected,
-        responses={**auth_errors, 404: error},
+        dependencies=download_protected,
+        responses={**download_auth_errors, 404: error},
     )
     async def download_file(filename: str, state: AppState = state_dep) -> FileResponse:
         """Download a single file by name.
