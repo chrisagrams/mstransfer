@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from pathlib import PurePath
 from typing import TYPE_CHECKING, Any
 
 import aiofiles
@@ -13,6 +14,7 @@ from mstransfer.server.models import (
     ErrorResponse,
     FileListResponse,
     HealthResponse,
+    ServedFile,
     TransferRecord,
     TransferState,
     UploadResponse,
@@ -298,19 +300,23 @@ def make_router(
         and sends `ETag` and `Last-Modified` validators, so an
         interrupted download can be resumed.
         """
-        path = await state.files.get_file(filename)
-        if path is None:
+        served = await state.files.get_file(filename)
+        if served is None:
             raise HTTPException(status_code=404, detail="File not found")
+        if isinstance(served, ServedFile):
+            path, name = served.path, served.name
+        else:
+            path, name = served, served.name
 
         stat = await aiofiles.os.stat(path)
         content_type = (
             "application/xml"
-            if path.suffix.lower() == ".mzml"
+            if PurePath(name).suffix.lower() == ".mzml"
             else "application/octet-stream"
         )
 
         return FileResponse(
-            path, media_type=content_type, filename=path.name, stat_result=stat
+            path, media_type=content_type, filename=name, stat_result=stat
         )
 
     return router

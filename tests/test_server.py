@@ -3,13 +3,19 @@
 from __future__ import annotations
 
 import asyncio
+from typing import TYPE_CHECKING
 
+import httpx
 import pytest
 from mscompress import MZMLFile
 
+from mstransfer.server.app import create_app
 from mstransfer.server.fileprovider import DirectoryFileProvider
-from mstransfer.server.models import TransferState
+from mstransfer.server.models import FileInfo, ServedFile, TransferState
 from mstransfer.server.state import OutputClaims, TransferRegistry
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 # ---------------------------------------------------------------------------
 # TransferRegistry unit tests
@@ -848,3 +854,68 @@ async def test_download_auth_required(authed_client):
     """File download requires auth when configured."""
     resp = await authed_client.get("/v1/files/test.msz")
     assert resp.status_code == 401
+
+
+# ---------------------------------------------------------------------------
+# ServedFile: serving a file under a name other than its stored name
+# ---------------------------------------------------------------------------
+
+
+class _BlobProvider:
+    """Serves files stored as extensionless blobs under their catalog names."""
+
+    def __init__(self, catalog: dict[str, Path]) -> None:
+        self._catalog = catalog
+
+    async def list_files(self) -> list[FileInfo]:
+        return []
+
+    async def get_file(self, filename: str) -> ServedFile | None:
+        path = self._catalog.get(filename)
+        return ServedFile(path=path, name=filename) if path else None
+
+
+@pytest.fixture()
+def blob_client(tmp_path, tmp_output, test_mzml):
+    blob = tmp_path / "blobs" / "sha256" / "ab" / "cdef0123"
+    blob.parent.mkdir(parents=True)
+    blob.write_bytes(test_mzml.read_bytes())
+    app = create_app(
+        output_dir=str(tmp_output),
+        file_provider=_BlobProvider({"run1.mzML": blob}),
+    )
+    transport = httpx.ASGITransport(app=app)
+    return httpx.AsyncClient(transport=transport, base_url="http://test")
+
+
+@pytest.mark.asyncio
+async def test_download_served_file_uses_served_name(blob_client, test_mzml):
+    """A ServedFile is sent under its name, with the media type of that name."""
+    resp = await blob_client.get("/v1/files/run1.mzML")
+    assert resp.status_code == 200
+    assert resp.content == test_mzml.read_bytes()
+    assert resp.headers["content-disposition"] == 'attachment; filename="run1.mzML"'
+    assert resp.headers["content-type"].startswith("application/xml")
+
+
+@pytest.mark.asyncio
+async def test_download_served_file_range(blob_client, test_mzml):
+    """Range and If-Range work for a ServedFile."""
+    payload = test_mzml.read_bytes()
+    full = await blob_client.get("/v1/files/run1.mzML")
+    etag = full.headers["etag"]
+    assert "last-modified" in full.headers
+
+    resp = await blob_client.get(
+        "/v1/files/run1.mzML", headers={"Range": "bytes=10-", "If-Range": etag}
+    )
+    assert resp.status_code == 206
+    assert resp.content == payload[10:]
+    assert resp.headers["etag"] == etag
+    assert resp.headers["content-disposition"] == 'attachment; filename="run1.mzML"'
+
+
+@pytest.mark.asyncio
+async def test_download_served_file_unknown_is_404(blob_client):
+    resp = await blob_client.get("/v1/files/missing.mzML")
+    assert resp.status_code == 404

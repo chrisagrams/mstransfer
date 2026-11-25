@@ -178,6 +178,26 @@ app = create_app(upload_auth=APIKeyAuthProvider("secret"))
 
 `make_router` takes the same split as `upload_auth_dep=` / `download_auth_dep=`.
 
+`file_provider=` controls what `/v1/files` lists and serves (default: the
+output directory). A provider's `get_file` returns a `Path`, or a `ServedFile`
+when the bytes are stored under another name, such as a content-addressed blob:
+
+```python
+from mstransfer.server.models import ServedFile
+
+
+class BlobProvider:
+    async def list_files(self): ...
+
+    async def get_file(self, filename):
+        blob = lookup_blob(filename)  # e.g. blobs/sha256/ab/cdef...
+        return ServedFile(path=blob, name=filename) if blob else None
+```
+
+The download is streamed from `path` but sent as `name`, which sets the
+`Content-Disposition` filename and the media type. See
+[File providers](docs/server/file-providers.md).
+
 ## How it works
 
 ```mermaid

@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.2](https://github.com/chrisagrams/mstransfer/compare/v0.3.1...v0.3.2) (2026-11-25)
+
+
+### Bug Fixes
+
+* let file providers set the download name separately from the stored path ([#133](https://github.com/chrisagrams/mstransfer/issues/133)) ([c8107da](https://github.com/chrisagrams/mstransfer/commit/c8107da461973aee5d60fb88823ba28b04fb7f4e))
+
 ## [0.3.1](https://github.com/chrisagrams/mstransfer/compare/v0.3.0...v0.3.1) (2026-11-25)
 
 

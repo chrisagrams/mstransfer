@@ -3,8 +3,10 @@ from __future__ import annotations
 from collections.abc import (
     Sequence,  # noqa: TC003 (Pydantic resolves annotations at runtime)
 )
+from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
+from pathlib import Path  # noqa: TC003 (dataclass field type)
 from typing import Literal
 
 from pydantic import BaseModel, Field, SerializeAsAny
@@ -68,6 +70,25 @@ class FileInfo(BaseModel):
     name: str
     size_bytes: int
     format: MSFormat
+
+
+@dataclass(frozen=True)
+class ServedFile:
+    """A file to serve under a name other than its on-disk name.
+
+    Return this from `FileProvider.get_file` when the bytes are stored at
+    a path whose name is not the one the client asked for (a
+    content-addressed blob, a cache entry keyed by ID, a temp file).
+
+    Attributes:
+        path: Where the bytes are stored.  Range requests and the `ETag`
+            and `Last-Modified` validators come from this file.
+        name: The name to serve the file as.  It is sent in
+            `Content-Disposition` and its suffix picks the media type.
+    """
+
+    path: Path
+    name: str
 
 
 class FileListResponse(BaseModel):
