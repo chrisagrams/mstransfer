@@ -10,6 +10,8 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
     from pathlib import Path
 
+    from mstransfer.server.models import ServedFile
+
 from mstransfer.server.models import FileInfo
 from mstransfer.store import MSFormat
 
@@ -21,11 +23,17 @@ class FileProvider(Protocol):
     Implementations may return `FileInfo` subclasses from
     `list_files`; the return type is `Sequence`
     so that subclass lists are accepted without type errors.
+
+    `get_file` returns the file to serve for *filename*, or `None` for a
+    404.  A `Path` is served under its own name.  When the file is
+    stored under a different name (e.g. a content-addressed blob with no
+    extension), return a `ServedFile` instead: its `path` is streamed and
+    its `name` is used for `Content-Disposition` and the media type.
     """
 
     async def list_files(self) -> Sequence[FileInfo]: ...
 
-    async def get_file(self, filename: str) -> Path | None: ...
+    async def get_file(self, filename: str) -> Path | ServedFile | None: ...
 
 
 class DirectoryFileProvider:
