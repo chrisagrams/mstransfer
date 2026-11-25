@@ -52,3 +52,32 @@ app = create_app(file_provider=CatalogProvider({...}))
 Return `None` from `get_file` for unknown names to produce a 404. Fields added
 by a `FileInfo` subclass (like `sha256` above) appear in the `/v1/files`
 response.
+
+## Serving a file under a different name
+
+`get_file` may return a `ServedFile` instead of a `Path` when the bytes are not
+stored under the name the client asked for: a content-addressed blob, a cache
+entry keyed by ID, or a temp file fetched from object storage.
+
+```python
+from pathlib import Path
+
+from mstransfer.server.models import ServedFile
+
+
+class BlobProvider:
+    def __init__(self, index: dict[str, Path]) -> None:
+        self._index = index  # "run1.mzML" -> blobs/sha256/ab/cdef...
+
+    async def list_files(self) -> Sequence[FileInfo]: ...
+
+    async def get_file(self, filename: str) -> Path | ServedFile | None:
+        blob = self._index.get(filename)
+        return ServedFile(path=blob, name=filename) if blob else None
+```
+
+The response streams `path` and uses `name` for the `Content-Disposition`
+filename and the content type (`application/xml` for `.mzML`,
+`application/octet-stream` otherwise). Range requests, `If-Range`, `ETag` and
+`Last-Modified` still come from the stored file, so interrupted downloads
+resume as usual. A plain `Path` is served under its own name.

@@ -30,6 +30,7 @@ from mstransfer.client.downloader import (
     download_file,
 )
 from mstransfer.server.app import create_app
+from mstransfer.server.models import ServedFile
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -2026,4 +2027,60 @@ class TestResume:
         assert dest.read_bytes() == BODY
         assert requests[-1].headers["range"] == "bytes=4000-"
         assert statuses == [200, 206]
+        assert list(dest.parent.iterdir()) == [dest]
+
+    def test_resumes_served_file_from_mstransfer_server(self, tmp_path):
+        """A ServedFile stored as an extensionless blob resumes under its name."""
+        blob = tmp_path / "blobs" / "cdef0123"
+        blob.parent.mkdir()
+        blob.write_bytes(BODY)
+
+        class BlobProvider:
+            async def list_files(self) -> list:
+                return []
+
+            async def get_file(self, filename: str) -> ServedFile | None:
+                if filename != "run.msz":
+                    return None
+                return ServedFile(path=blob, name=filename)
+
+        app = httpx.ASGITransport(
+            app=create_app(output_dir=tmp_path / "out", file_provider=BlobProvider())
+        )
+        cut = [4000]
+        responses: list[httpx.Response] = []
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            resp = await app.handle_async_request(request)
+            responses.append(resp)
+            body = await resp.aread()
+            fail_after = cut.pop() if cut else None
+            return httpx.Response(
+                resp.status_code, headers=resp.headers, stream=_Body(body, fail_after)
+            )
+
+        dest = tmp_path / "dl" / "run.msz"
+
+        async def _run() -> None:
+            async with httpx.AsyncClient(
+                transport=httpx.MockTransport(handler)
+            ) as client:
+                with pytest.raises(httpx.ReadError):
+                    await async_download_file(
+                        "http://test/v1/files/run.msz",
+                        dest,
+                        chunk_size=1000,
+                        client=client,
+                    )
+                await async_download_file(
+                    "http://test/v1/files/run.msz", dest, client=client
+                )
+
+        asyncio.run(_run())
+        assert dest.read_bytes() == BODY
+        assert [r.status_code for r in responses] == [200, 206]
+        assert all(
+            r.headers["content-disposition"] == 'attachment; filename="run.msz"'
+            for r in responses
+        )
         assert list(dest.parent.iterdir()) == [dest]
