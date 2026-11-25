@@ -165,6 +165,19 @@ main_app = FastAPI()
 main_app.mount("/transfer", create_app())
 ```
 
+`auth=` protects every route except `/v1/health`. To protect one direction
+only, pass `upload_auth=` (upload and transfer status) and/or `download_auth=`
+(file list and download) instead; a direction without auth is left open:
+
+```python
+from mstransfer import APIKeyAuthProvider, create_app
+
+# Anyone can download; only key holders can upload
+app = create_app(upload_auth=APIKeyAuthProvider("secret"))
+```
+
+`make_router` takes the same split as `upload_auth_dep=` / `download_auth_dep=`.
+
 ## How it works
 
 ```mermaid
